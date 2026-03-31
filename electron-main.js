@@ -230,25 +230,76 @@ app.whenReady().then(async () => {
 
   // 起動から5秒後にアップデートチェック（初回ロードの邪魔をしない）
   setTimeout(() => checkForUpdates(), 5000);
+
+  // ダッシュボードの「今すぐ再起動」ボタンからの install-update フラグ監視
+  const installFlagFile = path.join(__dirname, 'data', 'install-update.flag');
+  setInterval(() => {
+    try {
+      if (fs.existsSync(installFlagFile)) {
+        fs.unlinkSync(installFlagFile);
+        autoUpdater.quitAndInstall();
+      }
+    } catch (e) { /* ignore */ }
+  }, 2000);
 });
 
 // ─── 自動更新 ─────────────────────────────────────────────────
-function checkForUpdates() {
-  autoUpdater.checkForUpdates().catch(() => { /* オフライン時は無視 */ });
+const UPDATE_STATUS_FILE = path.join(__dirname, 'data', 'update-status.json');
+
+function writeUpdateStatus(status) {
+  try {
+    fs.writeFileSync(UPDATE_STATUS_FILE, JSON.stringify({ ...status, ts: Date.now() }));
+  } catch (e) { /* ignore */ }
 }
 
+function checkForUpdates() {
+  writeUpdateStatus({ state: 'checking' });
+  autoUpdater.checkForUpdates().catch((err) => {
+    console.error('[AutoUpdater] checkForUpdates error:', err?.message || err);
+    writeUpdateStatus({ state: 'error', message: err?.message || String(err) });
+  });
+}
+
+autoUpdater.on('checking-for-update', () => {
+  console.log('[AutoUpdater] checking for update...');
+  writeUpdateStatus({ state: 'checking' });
+});
+
+autoUpdater.on('update-not-available', (info) => {
+  console.log('[AutoUpdater] already up to date:', info?.version);
+  writeUpdateStatus({ state: 'up-to-date', version: info?.version });
+});
+
 autoUpdater.on('update-available', (info) => {
-  dialog.showMessageBox({
+  console.log('[AutoUpdater] update available:', info.version);
+  writeUpdateStatus({ state: 'available', version: info.version });
+  dialog.showMessageBox(mainWindow, {
     type: 'info',
-    title: 'アップデート',
+    title: 'Sales Claw アップデート',
     message: `新しいバージョン ${info.version} が見つかりました`,
     detail: 'バックグラウンドでダウンロードします。完了後に通知します。',
     buttons: ['OK'],
+  }).catch(() => {
+    // mainWindow が null の場合は parent なしで再試行
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Sales Claw アップデート',
+      message: `新しいバージョン ${info.version} が見つかりました`,
+      detail: 'バックグラウンドでダウンロードします。',
+      buttons: ['OK'],
+    });
   });
 });
 
+autoUpdater.on('download-progress', (progress) => {
+  writeUpdateStatus({ state: 'downloading', percent: Math.round(progress.percent), version: progress.version || '' });
+});
+
 autoUpdater.on('update-downloaded', (info) => {
-  dialog.showMessageBox({
+  console.log('[AutoUpdater] update downloaded:', info.version);
+  writeUpdateStatus({ state: 'downloaded', version: info.version });
+  const win = mainWindow || null;
+  dialog.showMessageBox(win, {
     type: 'info',
     title: 'アップデート準備完了',
     message: `Sales Claw ${info.version} の準備ができました`,
@@ -257,19 +308,23 @@ autoUpdater.on('update-downloaded', (info) => {
     defaultId: 0,
   }).then((result) => {
     if (result.response === 0) autoUpdater.quitAndInstall();
+  }).catch(() => {
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'アップデート準備完了',
+      message: `Sales Claw ${info.version} の準備ができました`,
+      detail: '今すぐ再起動してインストールしますか？',
+      buttons: ['今すぐ再起動', '後で'],
+      defaultId: 0,
+    }).then((result) => {
+      if (result.response === 0) autoUpdater.quitAndInstall();
+    });
   });
 });
 
 autoUpdater.on('error', (err) => {
   console.error('[AutoUpdater] error:', err?.message || err);
-});
-
-autoUpdater.on('checking-for-update', () => {
-  console.log('[AutoUpdater] checking for update...');
-});
-
-autoUpdater.on('update-not-available', (info) => {
-  console.log('[AutoUpdater] already up to date:', info?.version);
+  writeUpdateStatus({ state: 'error', message: err?.message || String(err) });
 });
 
 // 全ウィンドウが閉じられてもアプリを終了しない（トレイに常駐）

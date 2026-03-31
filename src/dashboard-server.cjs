@@ -623,6 +623,9 @@ tr.updated{animation:rowFlash .8s}
   </div>
 </aside>
 
+<!-- Auto-update banner (shown by pollUpdateStatus) -->
+<div id="updateBanner" style="display:none;position:fixed;top:48px;left:0;right:0;z-index:49;background:#0043ce;color:#fff;padding:6px 16px;font-size:.75rem;font-weight:600;align-items:center;gap:8px;justify-content:center"></div>
+
 <div class="status-banner-wrap" style="margin-left:240px;margin-top:48px">
   <div class="status-banner hidden" id="statusBanner"></div>
 </div>
@@ -2259,6 +2262,37 @@ connectEvents();
 pollClaudeStatus();
 _claudeStatusTimer = setInterval(pollClaudeStatus, 10000);
 
+// Auto-update status polling
+async function pollUpdateStatus() {
+  try {
+    const res = await fetch('/api/update-status');
+    const d = await res.json();
+    const banner = document.getElementById('updateBanner');
+    if (!banner) return;
+    if (d.state === 'available') {
+      banner.style.display = 'flex';
+      banner.style.background = '#0043ce';
+      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">system_update</span> <b>v' + esc(d.version) + '</b> が利用可能です — バックグラウンドでダウンロード中...';
+    } else if (d.state === 'downloading') {
+      banner.style.display = 'flex';
+      banner.style.background = '#0043ce';
+      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">downloading</span> アップデートダウンロード中 <b>' + (d.percent || 0) + '%</b>...';
+    } else if (d.state === 'downloaded') {
+      banner.style.display = 'flex';
+      banner.style.background = '#198038';
+      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">check_circle</span> v' + esc(d.version) + ' の準備完了 — <b style="cursor:pointer;text-decoration:underline" onclick="fetch(\\'/api/install-update\\',{method:\\'POST\\'})">今すぐ再起動してインストール</b>';
+    } else if (d.state === 'error') {
+      banner.style.display = 'flex';
+      banner.style.background = '#da1e28';
+      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">error</span> 自動更新エラー: ' + esc(d.message || '');
+    } else {
+      banner.style.display = 'none';
+    }
+  } catch(e) { /* ignore */ }
+}
+pollUpdateStatus();
+setInterval(pollUpdateStatus, 15000);
+
 // CLI log stream
 const cliColors={info:'#8bc5ed',action:'#3fb950',error:'#f85149',warn:'#e3b341',step:'#d2a8ff'};
 const cliLabels={info:'INF',action:'ACT',error:'ERR',warn:'WRN',step:'STP'};
@@ -3448,6 +3482,34 @@ const server = http.createServer(async (req, res) => {
       }
     } catch (e) {
       jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/install-update — write flag file for electron-main to call quitAndInstall
+  if (req.url === '/api/install-update' && req.method === 'POST') {
+    try {
+      const flagFile = path.join(PROJECT_ROOT, 'data', 'install-update.flag');
+      fs.writeFileSync(flagFile, Date.now().toString());
+      jsonResponse(res, 200, { ok: true });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
+  // GET /api/update-status — read update status written by electron-main.js
+  if (req.url === '/api/update-status' && req.method === 'GET') {
+    try {
+      const statusFile = path.join(PROJECT_ROOT, 'data', 'update-status.json');
+      if (fs.existsSync(statusFile)) {
+        const raw = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+        jsonResponse(res, 200, { ok: true, ...raw, appVersion: APP_VERSION });
+      } else {
+        jsonResponse(res, 200, { ok: true, state: 'unknown', appVersion: APP_VERSION });
+      }
+    } catch (e) {
+      jsonResponse(res, 200, { ok: true, state: 'unknown', appVersion: APP_VERSION });
     }
     return;
   }
