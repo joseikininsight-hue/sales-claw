@@ -3,6 +3,55 @@
 Claude Code CLI を活用した企業問い合わせフォーム自動営業ツール。
 ターゲット企業のWebサイトを分析し、カスタマイズされたメッセージを生成し、問い合わせフォームに自動入力します。
 
+## ダウンロード・インストール
+
+### Step 1 — アプリをダウンロード
+
+[Releases ページ](https://github.com/joseikininsight-hue/sales-claw/releases/latest) から OS に合ったファイルをダウンロードしてください。
+
+| OS | ダウンロードするファイル |
+|----|----------------------|
+| **Windows** | `Sales Claw Setup x.x.x.exe` |
+| **macOS (M1/M2/M3)** | `Sales Claw-x.x.x-arm64.dmg` |
+| **macOS (Intel)** | `Sales Claw-x.x.x.dmg` |
+| **Linux** | `Sales Claw-x.x.x.AppImage` |
+
+> **Source code (zip/tar.gz) は開発者向けです。一般ユーザーは不要です。**
+
+ダウンロードしたファイルを実行してインストールしてください。
+
+### Step 2 — Claude Code CLI をインストール（必須・別途）
+
+Sales Claw の AI 機能は [Claude Code CLI](https://docs.anthropic.com/claude-code)（Anthropic 製）を使用します。
+アプリとは別にインストールが必要です。
+
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+> Node.js 18+ が必要です。[nodejs.org](https://nodejs.org/) からインストールしてください。
+
+### Step 3 — 初期設定
+
+1. Sales Claw を起動する
+2. **Settings タブ**を開く
+3. 自社情報（社名・担当者名・連絡先など）を入力して保存
+
+### Step 4 — ターゲットリストを用意する
+
+Excel (.xlsx) または CSV にターゲット企業を記載し、Settings タブの「ターゲットリスト」でファイルを指定します。
+
+### Step 5 — 営業開始
+
+別ターミナルで `claude` を起動し、指示するだけです。
+
+```
+> 3社確認待ちまで進めて
+> 企業Aに問い合わせを送って
+```
+
+---
+
 ## Architecture
 
 ```

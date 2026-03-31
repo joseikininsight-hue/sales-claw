@@ -84,20 +84,39 @@ jobs:
             dist-all/*.dmg
             dist-all/*.AppImage
           body: |
-            ## インストール方法
+            ## ダウンロード方法
 
-            | OS | ダウンロード |
-            |----|------------|
-            | Windows | `Sales Claw Setup *.exe` |
-            | macOS | `Sales Claw-*.dmg` |
-            | Linux | `Sales Claw-*.AppImage` |
+            お使いの OS に合ったファイルをダウンロードしてください。
 
-            ## 前提条件（別途インストールが必要）
+            | OS | ダウンロードするファイル |
+            |----|----------------------|
+            | **Windows** | `Sales Claw Setup *.exe` ← Windowsはこれ |
+            | **macOS (M1/M2/M3)** | `Sales Claw-*-arm64.dmg` |
+            | **macOS (Intel)** | `Sales Claw-*.dmg`（arm64 なし） |
+            | **Linux** | `Sales Claw-*.AppImage` |
 
-            1. **Claude Code CLI**
-               ```
-               npm install -g @anthropic-ai/claude-code
-               ```
-            2. アプリ起動後、Settings タブで自社情報を設定してください。
+            > `Source code (zip/tar.gz)` は開発者向けです。一般ユーザーは不要です。
+
+            ## セットアップ手順
+
+            ### 1. Claude Code CLI をインストール（必須・別途）
+
+            Sales Claw の AI 機能には [Claude Code CLI](https://docs.anthropic.com/claude-code) が必要です。
+
+            ```bash
+            npm install -g @anthropic-ai/claude-code
+            ```
+
+            Node.js 18+ が必要です → https://nodejs.org/
+
+            ### 2. Sales Claw を起動 → Settings タブで自社情報を設定
+
+            ### 3. ターゲットリスト（Excel/CSV）を用意して Settings で指定
+
+            ### 4. `claude` を起動して指示するだけ
+
+            ```
+            > 3社確認待ちまで進めて
+            ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
