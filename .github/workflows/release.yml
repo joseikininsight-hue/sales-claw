@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false   # 1プラットフォームが失敗しても他を続行
       matrix:
         include:
           - os: windows-latest
@@ -27,6 +28,19 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            rpm \
+            fakeroot \
+            dpkg
+
       - name: Install dependencies
         run: npm ci
 
@@ -44,6 +58,7 @@ jobs:
 
   release:
     needs: build
+    if: always() && contains(needs.build.result, 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
