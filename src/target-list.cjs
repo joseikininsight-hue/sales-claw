@@ -74,7 +74,7 @@ function getColumnMapping() {
 function getFileTypeFromPath(targetPath, fallback = 'xlsx') {
   const ext = path.extname(targetPath || '').toLowerCase();
   if (ext === '.csv') return 'csv';
-  if (ext === '.xlsx') return 'xlsx';
+  if (ext === '.xlsx' || ext === '.xls') return 'xlsx';
   return fallback === 'csv' ? 'csv' : 'xlsx';
 }
 
@@ -273,9 +273,12 @@ function getNextCompanyNo(companies) {
   return numericIds.length > 0 ? Math.max(...numericIds) + 1 : 1;
 }
 
-function buildCompanyRow(companyData, columnMapping, currentLength) {
+function buildCompanyRow(companyData, columnMapping, currentLength, seedRow) {
   const rowLength = Math.max(currentLength || 0, Math.max(...Object.values(columnMapping)) + 1);
-  const row = Array.from({ length: rowLength }, () => '');
+  const row = Array.from({ length: rowLength }, (_, index) => {
+    if (seedRow && seedRow[index] !== undefined) return seedRow[index];
+    return '';
+  });
   const values = {
     no: companyData.no,
     status: companyData.status || '',
@@ -372,7 +375,7 @@ function updateCompany(companyNo, patch) {
 
   const current = mapRow(workbookData.rows[rowIndex], workbookData.columnMapping, rowIndex);
   const nextCompany = { ...current, ...patch, no: current.no };
-  const nextRow = buildCompanyRow(nextCompany, workbookData.columnMapping, workbookData.rows[rowIndex].length);
+  const nextRow = buildCompanyRow(nextCompany, workbookData.columnMapping, workbookData.rows[rowIndex].length, workbookData.rows[rowIndex]);
   workbookData.rows[rowIndex] = nextRow;
   saveRows(workbookData, workbookData.rows);
 
@@ -386,8 +389,8 @@ function updateCompany(companyNo, patch) {
 function importTargetList({ fileName, buffer }) {
   const safeName = sanitizeImportFileName(fileName);
   const ext = path.extname(safeName).toLowerCase();
-  if (!['.xlsx', '.csv'].includes(ext)) {
-    return { ok: false, error: 'Only .xlsx and .csv files are supported.' };
+  if (!['.xlsx', '.xls', '.csv'].includes(ext)) {
+    return { ok: false, error: 'Only .xlsx, .xls, and .csv files are supported.' };
   }
 
   ensureDirectory(IMPORT_DIR);

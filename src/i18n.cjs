@@ -39,6 +39,7 @@ const translations = {
     // Filters
     'filter.all': 'All',
     'filter.target': 'Target',
+    'filter.targeted': 'Targeted',
     'filter.hasForm': 'Has Form',
     'filter.noForm': 'No Form',
     'filter.sent': 'Sent',
@@ -65,6 +66,11 @@ const translations = {
     'action.bulkSent': 'Mark Selected as Sent',
     'action.bulkAiSubmit': 'AI Submit Selected',
     'action.bulkSkip': 'Skip Selected',
+    'action.importTargets': 'Import Excel/CSV',
+    'action.addCompany': 'Add Company',
+    'action.markTarget': 'Mark Target',
+    'action.unmarkTarget': 'Unmark Target',
+    'action.prepareOutreach': 'Prepare Outreach',
 
     // Awaiting tab
     'awaiting.description': 'After visual confirmation in the browser, click "Mark Sent" if submitted, or "Skip" if not.',
@@ -127,6 +133,24 @@ const translations = {
     'alert.failure': ', {fail} failed',
     'alert.error': 'Error',
     'alert.commError': 'Communication error',
+    'companyImport.success': 'Import complete',
+    'companyImport.failed': 'Import failed',
+    'target.badge': 'Target',
+    'target.updatedOn': 'Outreach targets updated.',
+    'target.updatedOff': 'Removed from outreach targets.',
+    'outreach.queueStarted': '{count} companies queued for outreach',
+    'outreach.prepareConfirm': 'Prepare outreach for {company}?',
+    'outreach.singleQueued': '{company} queued for outreach',
+    'outreach.status.pending': 'Queued',
+    'outreach.status.processing': 'Processing',
+    'outreach.status.awaiting': 'Awaiting',
+    'outreach.status.error': 'Error',
+    'companyModal.title': 'Add Company',
+    'companyModal.addToTarget': 'Add this company to outreach targets',
+    'companyModal.cancel': 'Cancel',
+    'companyModal.submit': 'Add Company',
+    'companyModal.companyRequired': 'Company name is required.',
+    'companyModal.added': 'Company added.',
 
     // AI Submit
     'ai.processing': '{company}: Processing...',
@@ -149,6 +173,7 @@ const translations = {
 
     // Settings fields - Company Profile
     'field.companyName': 'Company Name',
+    'field.type': 'Type',
     'field.companyNameEn': 'Company Name (English)',
     'field.companyNameKana': 'Company Name (Kana)',
     'field.representative': 'Representative',
@@ -402,6 +427,7 @@ const translations = {
     // Filters
     'filter.all': '全て',
     'filter.target': '対象',
+    'filter.targeted': '営業対象',
     'filter.hasForm': 'フォーム有',
     'filter.noForm': 'フォーム無',
     'filter.sent': '送信済',
@@ -428,6 +454,11 @@ const translations = {
     'action.bulkSent': '選択を送信済みに',
     'action.bulkAiSubmit': '選択をAIで送信',
     'action.bulkSkip': '選択をスキップ',
+    'action.importTargets': 'Excel/CSV取込',
+    'action.addCompany': '企業追加',
+    'action.markTarget': '営業対象にする',
+    'action.unmarkTarget': '対象から外す',
+    'action.prepareOutreach': '営業準備',
 
     // Awaiting tab
     'awaiting.description': 'ブラウザで目視確認後、送信した場合は「送信済み」、しなかった場合は「スキップ」を選択してください。',
@@ -490,6 +521,24 @@ const translations = {
     'alert.failure': '、{fail}社失敗',
     'alert.error': 'エラー',
     'alert.commError': '通信エラー',
+    'companyImport.success': '取込完了',
+    'companyImport.failed': '取込失敗',
+    'target.badge': '営業対象',
+    'target.updatedOn': '営業対象を更新しました',
+    'target.updatedOff': '営業対象から外しました',
+    'outreach.queueStarted': '{count}社を営業準備キューに追加しました',
+    'outreach.prepareConfirm': '{company} の営業準備を開始しますか？',
+    'outreach.singleQueued': '{company} を営業準備キューに追加しました',
+    'outreach.status.pending': 'キュー待ち',
+    'outreach.status.processing': '準備中',
+    'outreach.status.awaiting': '確認待ち',
+    'outreach.status.error': 'エラー',
+    'companyModal.title': '企業を追加',
+    'companyModal.addToTarget': '追加後すぐ営業対象にする',
+    'companyModal.cancel': 'キャンセル',
+    'companyModal.submit': '企業を追加',
+    'companyModal.companyRequired': '企業名は必須です',
+    'companyModal.added': '企業を追加しました',
 
     // AI Submit
     'ai.processing': '{company}: 送信処理中...',
@@ -512,6 +561,7 @@ const translations = {
 
     // Settings fields - Company Profile
     'field.companyName': '会社名',
+    'field.type': '種別',
     'field.companyNameEn': '会社名（英語）',
     'field.companyNameKana': '会社名（カナ）',
     'field.representative': '代表者名',

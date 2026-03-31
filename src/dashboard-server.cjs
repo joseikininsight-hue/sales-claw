@@ -228,7 +228,9 @@ function loadData() {
     const contactHist = getHistory(no);
     const contactCount = contactHist ? contactHist.contacts.length : 0;
     const targetMeta = outreachTargets.get(String(no)) || null;
-    const queueMeta = outreachQueue.get(String(no)) || null;
+    const queueMeta = ['submitted', 'skipped'].includes(lastLog ? lastLog.action : '')
+      ? null
+      : (outreachQueue.get(String(no)) || null);
 
     return {
       no, status, name: row.companyName || '', type: row.type || '',
@@ -622,7 +624,7 @@ tr.updated{animation:rowFlash .8s}
   </div>
 </div>
 
-<input type="file" id="companyImportInput" accept=".xlsx,.csv" style="display:none">
+<input type="file" id="companyImportInput" accept=".xlsx,.xls,.csv" style="display:none">
 
 <div id="companyFormModal" class="modal-shell">
   <div class="modal-panel">
@@ -1741,6 +1743,8 @@ function render(data){
 
   // Company table
   const body=document.getElementById('companyBody');
+  const validCompanyNos = new Set(companies.map((company) => String(company.no)));
+  selectedCompanyNos = new Set(Array.from(selectedCompanyNos).filter((companyNo) => validCompanyNos.has(companyNo)));
   const oldRows={};
   body.querySelectorAll('tr').forEach(tr=>oldRows[tr.dataset.no]=tr.dataset.la);
 
@@ -1751,7 +1755,7 @@ function render(data){
     const isNew=oldRows[c.no]!==undefined&&oldRows[c.no]!==(c.lastAction||'');
     const upd=isNew?' updated':'';
 
-    const display=currentFilter==='all'?'':currentFilter==='approachable'?(f!=='excluded'?'':'none'):(f===currentFilter?'':'none');
+    const display=currentFilter==='all'?'':currentFilter==='approachable'?(f!=='excluded'?'':'none'):currentFilter==='targeted'?(c.isOutreachTarget?'':'none'):(f===currentFilter?'':'none');
 
     const cnt=c.contactCount||0;
     const cntHtml=cnt===0?'<span class="text-muted">-</span>':cnt===1?'<span class="badge bg-success">1x</span>':'<span class="badge bg-info">'+cnt+'x</span>';
@@ -1762,6 +1766,11 @@ function render(data){
       msgHtml='<span class="text-muted" style="font-size:.75rem;cursor:pointer" title="Click to view full message" onclick="showMsg('+c.no+')">'+preview+'...</span>';
     }
 
+    const targetBadge=c.isOutreachTarget?'<span class="chip chip-primary">'+(t('target.badge')||'Target')+'</span>':'';
+    const queueBadge=outreachStatusBadge(c.outreachStatus,c.outreachDetail);
+    const companyUrlHtml=c.url?'<a href="'+esc(c.url)+'" target="_blank">'+esc(c.name)+'</a>':'<span>'+esc(c.name)+'</span>';
+    const progressHtml=(c.lastAction?actionBadge(c.lastAction):'<span class="text-muted">-</span>')+(queueBadge?'<div class="company-meta">'+queueBadge+'</div>':'');
+
     let actionHtml='';
     const cname=esc(c.name).replace(/'/g,"\\'");
     if(c.lastAction==='awaiting_approval'||c.lastAction==='confirm_reached'){
@@ -1769,13 +1778,18 @@ function render(data){
         +' <button class="btn btn-outline-secondary btn-sm py-0 px-1" style="font-size:.7rem" onclick="approveCompany('+c.no+',\\x27'+cname+'\\x27,\\x27skip\\x27)">'+t('action.skip')+'</button>';
     }else if(c.lastAction==='submitted'){
       actionHtml='<span style="font-size:.7rem;color:#198754">'+t('action.done')+'</span>';
+    }else if(c.outreachStatus==='pending'||c.outreachStatus==='processing'){
+      actionHtml='<small class="text-muted">'+esc(c.outreachDetail||'Processing')+'</small>';
+    }else if(c.isApproachable){
+      actionHtml='<button class="btn btn-outline-primary btn-sm" onclick="prepareOutreach('+c.no+',\\x27'+cname+'\\x27)">'+(t('action.prepareOutreach')||'Prepare')+'</button>';
     }
 
-    html+='<tr class="'+excl+upd+'" data-f="'+f+'" data-n="'+esc(c.name).toLowerCase()+'" data-no="'+c.no+'" data-la="'+(c.lastAction||'')+'" data-type="'+esc(c.type).toLowerCase()+'" data-cnt="'+cnt+'" data-progress="'+(c.lastAction||'')+'" style="display:'+display+'">'
+    html+='<tr class="'+excl+upd+'" data-f="'+f+'" data-targeted="'+(c.isOutreachTarget?'1':'0')+'" data-n="'+esc(c.name).toLowerCase()+'" data-no="'+c.no+'" data-la="'+(c.lastAction||'')+'" data-type="'+esc(c.type).toLowerCase()+'" data-cnt="'+cnt+'" data-progress="'+(c.lastAction||'')+'" style="display:'+display+'">'
+      +'<td class="checkbox-cell"><input type="checkbox" class="form-check-input company-select" data-no="'+c.no+'" onchange="toggleCompanySelection('+c.no+', this.checked)"></td>'
       +'<td>'+c.no+'</td>'
-      +'<td><a href="'+esc(c.url)+'" target="_blank">'+esc(c.name)+'</a></td>'
+      +'<td>'+companyUrlHtml+(targetBadge?'<div class="company-meta">'+targetBadge+'</div>':'')+'</td>'
       +'<td><small>'+esc(c.type)+'</small></td>'
-      +'<td>'+actionBadge(c.lastAction)+'</td>'
+      +'<td>'+progressHtml+'</td>'
       +'<td class="text-center">'+cntHtml+'</td>'
       +'<td class="furl">'+(c.formUrl?'<a href="'+esc(c.formUrl)+'" target="_blank" title="'+esc(c.formUrl)+'">'+esc(c.formUrl).substring(0,35)+'</a>':'-')+'</td>'
       +'<td>'+msgHtml+'</td>'
@@ -1783,6 +1797,8 @@ function render(data){
       +'</tr>';
   });
   body.innerHTML=html;
+  syncCompanySelectionUi();
+  applyCompanyFilters();
 
   // Log table
   const lbody=document.getElementById('logBody');
@@ -2145,29 +2161,18 @@ function appendCliLog(msg,type,time){
 }
 
 // Filters
-document.querySelectorAll('.fb').forEach(b=>{
+document.querySelectorAll('#tab-companies .fb').forEach(b=>{
   b.addEventListener('click',()=>{
-    document.querySelectorAll('.fb').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('#tab-companies .fb').forEach(x=>x.classList.remove('active'));
     b.classList.add('active');
     currentFilter=b.dataset.f;
-    document.querySelectorAll('#mt tbody tr').forEach(tr=>{
-      if(currentFilter==='all')tr.style.display='';
-      else if(currentFilter==='approachable')tr.style.display=tr.dataset.f!=='excluded'?'':'none';
-      else tr.style.display=tr.dataset.f===currentFilter?'':'none';
-    });
+    applyCompanyFilters();
   });
 });
 
 // Company search
 document.getElementById('q').addEventListener('input',e=>{
-  const q=e.target.value.toLowerCase();
-  document.querySelectorAll('#mt tbody tr').forEach(tr=>{
-    const matchQ=!q||(tr.dataset.n||'').includes(q);
-    const matchF=currentFilter==='all'||
-      (currentFilter==='approachable'&&tr.dataset.f!=='excluded')||
-      tr.dataset.f===currentFilter;
-    tr.style.display=(matchQ&&matchF)?'':'none';
-  });
+  applyCompanyFilters();
 });
 
 // Sort table
@@ -2194,6 +2199,7 @@ function sortTable(col){
     return sortAsc?va-vb:vb-va;
   });
   rows.forEach(r=>tbody.appendChild(r));
+  syncCompanySelectionUi();
 }
 
 // Sent tab filter

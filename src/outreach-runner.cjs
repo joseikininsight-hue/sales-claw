@@ -303,7 +303,22 @@ function acquireLock() {
     fs.writeFileSync(handle, String(process.pid), 'utf8');
     return handle;
   } catch {
-    return null;
+    try {
+      const existingPid = Number(fs.readFileSync(RUNNER_LOCK_FILE, 'utf8'));
+      if (Number.isFinite(existingPid)) {
+        try {
+          process.kill(existingPid, 0);
+          return null;
+        } catch (_) {
+          fs.unlinkSync(RUNNER_LOCK_FILE);
+        }
+      }
+      const handle = fs.openSync(RUNNER_LOCK_FILE, 'wx');
+      fs.writeFileSync(handle, String(process.pid), 'utf8');
+      return handle;
+    } catch {
+      return null;
+    }
   }
 }
 
