@@ -32,6 +32,20 @@ let serverStartPromise = null;
 let _claudeStatusCache = null;
 let _claudeStatusCacheTime = 0;
 
+// Managed Claude process
+let claudeProcess = null;
+let claudeProcessMode = 'default';
+const CLAUDE_MODE_FLAGS = {
+  'default':           [],
+  'acceptEdits':       ['--permission-mode', 'acceptEdits'],
+  'auto':              ['--enable-auto-mode'],
+  'bypassPermissions': ['--dangerously-skip-permissions', '--permission-mode', 'bypassPermissions'],
+};
+const APP_VERSION = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(PROJECT_ROOT, 'package.json'), 'utf8')).version; }
+  catch (e) { return '?'; }
+})();
+
 function notifyClients(payload) {
   const body = payload || { type: 'update', time: Date.now() };
   sseClients.forEach(res => {
@@ -535,6 +549,7 @@ tr.updated{animation:rowFlash .8s}
   <div style="display:flex;align-items:center;gap:8px;width:224px;flex-shrink:0;border-right:1px solid var(--outline-variant);height:100%;padding-right:16px">
     <img src="/assets/favicon.png" alt="" style="width:22px;height:22px;object-fit:contain">
     <span style="font-weight:800;font-size:.92rem;letter-spacing:-.3px;text-transform:uppercase;color:var(--on-surface)">Sales Claw</span>
+    <span style="font-size:.6rem;font-weight:700;background:var(--primary);color:#fff;padding:1px 6px;letter-spacing:.03em;margin-left:2px">v${APP_VERSION}</span>
   </div>
   <!-- Live status -->
   <div style="display:flex;align-items:center;gap:6px;margin-right:4px">
@@ -543,11 +558,26 @@ tr.updated{animation:rowFlash .8s}
     <span style="font-size:.65rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--on-surface-variant)" id="liveLabel">${_t['app.live'] || 'LIVE'}</span>
   </div>
   <small style="font-size:.65rem;color:var(--outline);margin-right:auto;font-family:var(--font-mono)" id="lastUpdate"></small>
-  <!-- Claude status widget -->
-  <div id="claudeStatusWidget" style="display:flex;align-items:center;gap:6px;background:var(--surface-low);border:1px solid var(--outline-variant);padding:4px 10px;font-size:.72rem">
-    <span id="claudeStatusDot" class="live-dot" style="width:7px;height:7px"></span>
-    <span id="claudeStatusLabel" style="color:var(--on-surface-variant);white-space:nowrap">${_t['claude.status.checking'] || 'Checking...'}</span>
-    <button id="claudeActionBtn" onclick="claudeAction()" style="display:none;background:var(--primary);border:none;color:#fff;font-size:.68rem;padding:2px 8px;cursor:pointer;font-weight:600;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em"></button>
+  <!-- Claude status + mode widget -->
+  <div style="display:flex;align-items:center;gap:0;background:var(--surface-low);border:1px solid var(--outline-variant);font-size:.72rem">
+    <!-- status -->
+    <div id="claudeStatusWidget" style="display:flex;align-items:center;gap:6px;padding:4px 10px;border-right:1px solid var(--outline-variant)">
+      <span id="claudeStatusDot" class="live-dot" style="width:7px;height:7px"></span>
+      <span id="claudeStatusLabel" style="color:var(--on-surface-variant);white-space:nowrap">Claude</span>
+    </div>
+    <!-- mode selector -->
+    <div style="position:relative">
+      <select id="claudeModeSelect" onchange="setClaudeMode(this.value)" style="background:var(--surface-low);border:none;font-size:.68rem;padding:4px 24px 4px 8px;cursor:pointer;color:var(--on-surface);font-weight:600;appearance:none;-webkit-appearance:none;outline:none;min-width:110px">
+        <option value="default">default</option>
+        <option value="acceptEdits">acceptEdits</option>
+        <option value="auto">auto ★</option>
+        <option value="bypassPermissions">bypassPermissions</option>
+      </select>
+      <span class="material-symbols-outlined" style="position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:14px;pointer-events:none;color:var(--outline)">expand_more</span>
+    </div>
+    <!-- action button -->
+    <button id="claudeActionBtn" onclick="claudeAction()" style="display:none;background:var(--primary);border:none;border-left:1px solid var(--outline-variant);color:#fff;font-size:.68rem;padding:4px 10px;cursor:pointer;font-weight:600;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em"></button>
+    <button id="claudeStopBtn" onclick="stopClaude()" style="display:none;background:#da1e28;border:none;border-left:1px solid var(--outline-variant);color:#fff;font-size:.68rem;padding:4px 10px;cursor:pointer;font-weight:600;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em">STOP</button>
   </div>
   <!-- Icon buttons -->
   <button onclick="showDocsModal()" title="${_t['app.docsTitle']}" style="display:flex;align-items:center;gap:4px;background:none;border:1px solid var(--outline-variant);padding:4px 10px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;color:var(--on-surface-variant);transition:all .12s" onmouseover="this.style.background='var(--surface-high)'" onmouseout="this.style.background='none'">
@@ -772,18 +802,30 @@ tr.updated{animation:rowFlash .8s}
   <!-- CLI Activity tab -->
   <div class="tab-content" id="tab-logs">
     <!-- Terminal -->
-    <div style="background:#0d1117;border:1px solid #21262d">
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;background:#161b22;border-bottom:1px solid #21262d">
+    <div id="terminalPanel" style="background:#0d1117;border:1px solid #21262d">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;background:#161b22;border-bottom:1px solid #21262d">
         <div style="display:flex;align-items:center;gap:10px">
           <span class="material-symbols-outlined" style="font-size:16px;color:#3fb950">terminal</span>
-          <span style="font-family:var(--font-mono);font-size:.7rem;font-weight:700;color:#e6edf3;letter-spacing:.06em">${_t['cli.stream']}</span>
+          <span style="font-family:var(--font-mono);font-size:.7rem;font-weight:700;color:#e6edf3;letter-spacing:.06em">CLAUDE TERMINAL</span>
+          <span id="termModeLabel" style="font-size:.6rem;background:#6e40c9;color:#fff;padding:1px 6px;font-weight:700;letter-spacing:.05em">default</span>
         </div>
-        <div style="display:flex;align-items:center;gap:12px">
+        <div style="display:flex;align-items:center;gap:8px">
           <span style="font-family:var(--font-mono);font-size:.65rem;color:#8b949e" id="cliLastEvent">—</span>
-          <button onclick="document.getElementById('cliStream').innerHTML=''" style="background:none;border:1px solid #30363d;color:#8b949e;font-size:.63rem;padding:2px 10px;cursor:pointer;font-family:var(--font-mono);letter-spacing:.05em">CLEAR</button>
+          <button onclick="toggleTerminal()" id="termToggleBtn" title="ターミナル表示切替" style="background:none;border:1px solid #30363d;color:#8b949e;font-size:.63rem;padding:2px 8px;cursor:pointer;font-family:var(--font-mono)">HIDE</button>
+          <button onclick="document.getElementById('cliStream').innerHTML=''" style="background:none;border:1px solid #30363d;color:#8b949e;font-size:.63rem;padding:2px 8px;cursor:pointer;font-family:var(--font-mono)">CLEAR</button>
         </div>
       </div>
-      <div id="cliStream" style="background:#0d1117;color:#c9d1d9;padding:14px 16px;font-family:var(--font-mono);font-size:.72rem;line-height:1.9;min-height:340px;max-height:440px;overflow-y:auto;white-space:pre-wrap"></div>
+      <div id="terminalBody">
+        <div id="cliStream" style="background:#0d1117;color:#c9d1d9;padding:12px 16px;font-family:var(--font-mono);font-size:.72rem;line-height:1.75;min-height:260px;max-height:380px;overflow-y:auto;white-space:pre-wrap"></div>
+        <!-- Chat input for Claude approvals/questions -->
+        <div style="display:flex;align-items:stretch;border-top:1px solid #21262d;background:#161b22">
+          <span class="material-symbols-outlined" style="font-size:16px;color:#3fb950;padding:8px 10px;align-self:center">chevron_right</span>
+          <input id="claudeInput" type="text" placeholder="Claudeへの返答・承認を入力… (Enter で送信)" onkeydown="if(event.key==='Enter')sendClaudeInput()" style="flex:1;background:transparent;border:none;color:#c9d1d9;font-family:var(--font-mono);font-size:.72rem;padding:8px 4px;outline:none">
+          <button onclick="sendClaudeInput()" style="background:#0f62fe;border:none;color:#fff;font-size:.68rem;font-weight:700;padding:0 16px;cursor:pointer;letter-spacing:.04em;text-transform:uppercase">SEND</button>
+          <button onclick="sendClaudeInput('y')" title="Yes / 承認" style="background:#198038;border:none;border-left:1px solid #21262d;color:#fff;font-size:.68rem;font-weight:700;padding:0 12px;cursor:pointer">YES</button>
+          <button onclick="sendClaudeInput('n')" title="No / 拒否" style="background:#da1e28;border:none;border-left:1px solid #21262d;color:#fff;font-size:.68rem;font-weight:700;padding:0 12px;cursor:pointer">NO</button>
+        </div>
+      </div>
     </div>
     <!-- Activity log table -->
     <div style="background:#fff;border:1px solid var(--outline-variant);border-top:none">
@@ -1346,20 +1388,77 @@ function showDocsModal(){const m=document.getElementById('docsModal');m.style.di
 function closeDocsModal(){document.getElementById('docsModal').style.display='none';}
 document.getElementById('docsModal').addEventListener('click',function(e){if(e.target===this)closeDocsModal();});
 
-// Launch Claude
+// Claude mode
+let _currentClaudeMode = 'default';
+function setClaudeMode(mode) {
+  _currentClaudeMode = mode;
+  const lbl = document.getElementById('termModeLabel');
+  if (lbl) lbl.textContent = mode;
+  const sel = document.getElementById('claudeModeSelect');
+  if (sel) sel.value = mode;
+}
+
+// Launch Claude (in-process spawn via API)
 async function launchClaude() {
   try {
-    const res = await fetch('/api/launch-claude', { method: 'POST' });
+    const res = await fetch('/api/launch-claude', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ mode: _currentClaudeMode })
+    });
     const data = await res.json();
     if (data.ok) {
-      showToast(t('app.launchClaude.success'), 'success');
-      setTimeout(pollClaudeStatus, 3000);
+      showToast('Claude 起動中 [' + _currentClaudeMode + ']', 'success');
+      // switch to CLI tab
+      document.querySelector('[data-tab="logs"]')?.click();
+      setTimeout(pollClaudeStatus, 1500);
     } else {
-      showToast(t('app.launchClaude.error') + ': ' + (data.error || ''), 'error');
+      showToast('起動失敗: ' + (data.error || ''), 'error');
     }
   } catch (e) {
-    showToast(t('app.launchClaude.error') + ': ' + e.message, 'error');
+    showToast('起動失敗: ' + e.message, 'error');
   }
+}
+
+async function stopClaude() {
+  try {
+    await fetch('/api/stop-claude', { method: 'POST' });
+    showToast('Claude を停止しました', 'info');
+    setTimeout(pollClaudeStatus, 800);
+  } catch(e) {}
+}
+
+// Send text to Claude stdin
+async function sendClaudeInput(text) {
+  const input = document.getElementById('claudeInput');
+  const msg = text !== undefined ? text : (input ? input.value : '');
+  if (!msg.trim()) return;
+  try {
+    await fetch('/api/claude-input', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text: msg + '\n' })
+    });
+    if (input && text === undefined) input.value = '';
+    // echo to terminal
+    const el = document.getElementById('cliStream');
+    if (el) {
+      el.innerHTML += '<span style="color:#58a6ff;user-select:none">▶ </span><span style="color:#e6edf3">' + esc(msg) + '</span>\n';
+      el.scrollTop = el.scrollHeight;
+    }
+  } catch(e) {
+    showToast('送信失敗: ' + e.message, 'error');
+  }
+}
+
+// Toggle terminal visibility
+function toggleTerminal() {
+  const body = document.getElementById('terminalBody');
+  const btn = document.getElementById('termToggleBtn');
+  if (!body || !btn) return;
+  const hidden = body.style.display === 'none';
+  body.style.display = hidden ? '' : 'none';
+  btn.textContent = hidden ? 'HIDE' : 'SHOW';
 }
 
 // Claude CLI status polling
@@ -1371,23 +1470,33 @@ async function pollClaudeStatus() {
     const dot = document.getElementById('claudeStatusDot');
     const label = document.getElementById('claudeStatusLabel');
     const btn = document.getElementById('claudeActionBtn');
+    const stopBtn = document.getElementById('claudeStopBtn');
     if (!dot) return;
-    if (data.running) {
+    if (data.managed) {
+      // we spawned it — definitely running
       dot.className = 'live-dot on';
-      label.textContent = t('claude.status.connected') + (data.version ? ' ' + data.version : '');
+      label.textContent = 'Claude [' + (data.mode || 'default') + ']';
       btn.style.display = 'none';
+      if (stopBtn) stopBtn.style.display = '';
+    } else if (data.running) {
+      dot.className = 'live-dot on';
+      label.textContent = 'Claude' + (data.version ? ' ' + data.version : '');
+      btn.style.display = 'none';
+      if (stopBtn) stopBtn.style.display = 'none';
     } else if (data.installed) {
       dot.className = 'live-dot warn';
-      label.textContent = t('claude.status.notRunning');
-      btn.textContent = t('claude.btn.launch');
+      label.textContent = '未起動';
+      btn.textContent = '起動';
       btn.style.display = '';
       btn._action = 'launch';
+      if (stopBtn) stopBtn.style.display = 'none';
     } else {
       dot.className = 'live-dot off';
-      label.textContent = t('claude.status.notInstalled');
-      btn.textContent = t('claude.btn.install');
+      label.textContent = '未インストール';
+      btn.textContent = 'インストール';
       btn.style.display = '';
       btn._action = 'install';
+      if (stopBtn) stopBtn.style.display = 'none';
     }
   } catch (e) {
     // network error — leave as-is
@@ -1402,8 +1511,8 @@ function claudeAction() {
     const cmd = 'npm install -g @anthropic-ai/claude-code';
     if (navigator.clipboard) {
       navigator.clipboard.writeText(cmd).then(() => {
-        showToast(t('claude.install.copied'), 'success');
-      }).catch(() => showToast(t('claude.install.error'), 'error'));
+        showToast('クリップボードにコピーしました', 'success');
+      }).catch(() => showToast(cmd, 'info'));
     } else {
       showToast(cmd, 'info');
     }
@@ -2097,6 +2206,11 @@ function connectEvents(){
       if(d.type==='cli-log'){
         appendCliLog(d.message,d.logType,d.time);
         if(d.logType==='action') refreshData();
+      }else if(d.type==='claude-stdout'){
+        appendRawTerminal(d.text, d.stream);
+      }else if(d.type==='claude-exit'){
+        appendRawTerminal('\n[Claude 終了 code=' + d.code + ']\n','system');
+        pollClaudeStatus();
       }else{
         refreshData();
       }
@@ -2158,6 +2272,17 @@ function appendCliLog(msg,type,time){
   document.getElementById('cliLastEvent').textContent=ts;
   const lines=el.innerHTML.split(String.fromCharCode(10));
   if(lines.length>500)el.innerHTML=lines.slice(-300).join(String.fromCharCode(10));
+}
+
+// Raw terminal output from Claude process
+function appendRawTerminal(text, stream){
+  const el=document.getElementById('cliStream');
+  if(!el)return;
+  const color = stream==='stderr'?'#f85149':stream==='system'?'#8b949e':'#c9d1d9';
+  el.innerHTML+='<span style="color:'+color+'">'+esc(text)+'</span>';
+  el.scrollTop=el.scrollHeight;
+  document.getElementById('cliLastEvent').textContent=new Date().toLocaleTimeString('ja-JP');
+  if(el.innerHTML.length>80000)el.innerHTML=el.innerHTML.slice(-50000);
 }
 
 // Filters
@@ -3209,8 +3334,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /api/claude-status — check if Claude CLI is installed and running
+  // GET /api/claude-status — check managed process first, then system-wide
   if (req.url === '/api/claude-status' && req.method === 'GET') {
+    // If we have a managed process, report immediately
+    if (claudeProcess && !claudeProcess.killed) {
+      jsonResponse(res, 200, { installed: true, running: true, managed: true, mode: claudeProcessMode, version: null });
+      return;
+    }
     const { exec } = require('child_process');
     const now = Date.now();
     if (_claudeStatusCache && now - _claudeStatusCacheTime < 8000) {
@@ -3219,27 +3349,28 @@ const server = http.createServer(async (req, res) => {
     }
     const isWin = process.platform === 'win32';
     const checkInstalled = isWin ? 'where claude' : 'which claude';
+    // Improved: check for claude.exe OR node running claude
     const checkRunning = isWin
-      ? 'tasklist /FI "IMAGENAME eq claude.exe" /NH'
-      : 'pgrep -x claude';
-    exec(checkInstalled, { timeout: 2000 }, (err1) => {
+      ? 'tasklist /FI "IMAGENAME eq claude.exe" /NH /FO CSV'
+      : 'pgrep -f "claude"';
+    exec(checkInstalled, { timeout: 3000 }, (err1) => {
       const installed = !err1;
       if (!installed) {
-        _claudeStatusCache = { installed: false, running: false, version: null };
+        _claudeStatusCache = { installed: false, running: false, managed: false, version: null };
         _claudeStatusCacheTime = Date.now();
         jsonResponse(res, 200, _claudeStatusCache);
         return;
       }
-      exec('claude --version', { timeout: 3000 }, (err2, stdout2) => {
+      exec('claude --version', { timeout: 5000 }, (err2, stdout2) => {
         const version = err2 ? null : (stdout2 || '').trim().split('\n')[0].trim() || null;
-        exec(checkRunning, { timeout: 2000 }, (err3, stdout3) => {
+        exec(checkRunning, { timeout: 3000 }, (err3, stdout3) => {
           let running = false;
           if (isWin) {
             running = !err3 && (stdout3 || '').toLowerCase().includes('claude');
           } else {
             running = !err3 && (stdout3 || '').trim().length > 0;
           }
-          _claudeStatusCache = { installed: true, running, version };
+          _claudeStatusCache = { installed: true, running, managed: false, version };
           _claudeStatusCacheTime = Date.now();
           jsonResponse(res, 200, _claudeStatusCache);
         });
@@ -3248,24 +3379,73 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /api/launch-claude — open new terminal with claude running
+  // POST /api/launch-claude — spawn Claude as child process with piped I/O
   if (req.url === '/api/launch-claude' && req.method === 'POST') {
     try {
-      const { exec } = require('child_process');
-      const projectDir = PROJECT_ROOT;
-      let cmd;
-      if (process.platform === 'win32') {
-        cmd = `start cmd /k "cd /d "${projectDir}" && claude"`;
-      } else if (process.platform === 'darwin') {
-        cmd = `osascript -e 'tell application "Terminal" to do script "cd \\"${projectDir}\\" && claude"'`;
-      } else {
-        cmd = `x-terminal-emulator -e bash -c 'cd "${projectDir}" && claude; exec bash' 2>/dev/null || xterm -e bash -c 'cd "${projectDir}" && claude; exec bash' &`;
+      const body = await parseJsonBody(req).catch(() => ({}));
+      const { mode = 'default' } = body;
+      // Kill existing managed process if any
+      if (claudeProcess && !claudeProcess.killed) {
+        claudeProcess.kill();
+        claudeProcess = null;
       }
-      exec(cmd, (err) => {
-        if (err) console.error('launch-claude error:', err.message);
-        _claudeStatusCache = null; // invalidate cache so next poll reflects new state
+      const { spawn } = require('child_process');
+      const flags = CLAUDE_MODE_FLAGS[mode] || [];
+      const child = spawn('claude', flags, {
+        cwd: PROJECT_ROOT,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: process.env,
+        shell: process.platform === 'win32',
       });
-      jsonResponse(res, 200, { ok: true });
+      claudeProcess = child;
+      claudeProcessMode = mode;
+      _claudeStatusCache = null;
+
+      child.stdout.on('data', (data) => {
+        notifyClients({ type: 'claude-stdout', text: data.toString(), stream: 'stdout', time: Date.now() });
+      });
+      child.stderr.on('data', (data) => {
+        notifyClients({ type: 'claude-stdout', text: data.toString(), stream: 'stderr', time: Date.now() });
+      });
+      child.on('exit', (code) => {
+        if (claudeProcess === child) claudeProcess = null;
+        _claudeStatusCache = null;
+        notifyClients({ type: 'claude-exit', code, time: Date.now() });
+      });
+      child.on('error', (err) => {
+        if (claudeProcess === child) claudeProcess = null;
+        notifyClients({ type: 'claude-stdout', text: '[ERROR] ' + err.message + '\n', stream: 'stderr', time: Date.now() });
+      });
+
+      jsonResponse(res, 200, { ok: true, mode });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/stop-claude — kill managed Claude process
+  if (req.url === '/api/stop-claude' && req.method === 'POST') {
+    if (claudeProcess && !claudeProcess.killed) {
+      claudeProcess.kill();
+      claudeProcess = null;
+    }
+    _claudeStatusCache = null;
+    jsonResponse(res, 200, { ok: true });
+    return;
+  }
+
+  // POST /api/claude-input — send text to Claude's stdin
+  if (req.url === '/api/claude-input' && req.method === 'POST') {
+    try {
+      const body = await parseJsonBody(req).catch(() => ({}));
+      const { text } = body;
+      if (claudeProcess && claudeProcess.stdin && !claudeProcess.killed) {
+        claudeProcess.stdin.write(text || '');
+        jsonResponse(res, 200, { ok: true });
+      } else {
+        jsonResponse(res, 409, { ok: false, error: 'Claude is not running (managed mode)' });
+      }
     } catch (e) {
       jsonResponse(res, 500, { ok: false, error: e.message });
     }
