@@ -1,0 +1,193 @@
+# Sales Claw
+
+Claude Code CLI を活用した企業問い合わせフォーム自動営業ツール。
+ターゲット企業のWebサイトを分析し、カスタマイズされたメッセージを生成し、問い合わせフォームに自動入力します。
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 Claude Code CLI                      │
+│  (企業分析・メッセージ生成・フォーム入力を指示)         │
+└────────────┬────────────────────────┬────────────────┘
+             │                        │
+     ┌───────▼───────┐       ┌───────▼────────┐
+     │  MCP Playwright │       │  Node.js Modules │
+     │  (ブラウザ操作)  │       │  (分析・生成)     │
+     └───────┬───────┘       └───────┬────────┘
+             │                        │
+     ┌───────▼────────────────────────▼────────┐
+     │          Dashboard (localhost:3456)       │
+     │  企業一覧 | 確認待ち | 送信済み | 設定     │
+     └─────────────────────────────────────────┘
+```
+
+## Prerequisites
+
+- **Node.js** 18+
+- **Claude Code CLI** (Anthropic) — `npm install -g @anthropic-ai/claude-code`
+- **Playwright** — `npx playwright install chromium`
+
+## Quick Start
+
+### 1. Install
+
+```bash
+git clone https://github.com/your-org/sales-claw.git
+cd sales-claw
+npm install
+npx playwright install chromium
+```
+
+### 2. Configure
+
+**Option A: Dashboard UI (推奨)**
+
+```bash
+# サンプル設定をコピー
+cp data/sample-settings.json data/settings.json
+
+# ダッシュボードを起動
+node dashboard-server.cjs
+
+# ブラウザで http://localhost:3456 を開き、「Settings」タブで設定
+```
+
+**Option B: テキストファイルで設定**
+
+```bash
+# サンプル設定をコピーして編集
+cp data/sample-settings.json data/settings.json
+# data/settings.json をエディタで開き、自社情報を入力
+```
+
+### 3. Prepare Target List
+
+Excel (.xlsx) または CSV ファイルにターゲット企業を記載します。
+
+| No. | ステータス | 企業名 | 種別 | WebサイトURL | 問い合わせフォームURL |
+|-----|----------|--------|------|-------------|-------------------|
+| 1   | 〇       | 企業A  | SIer | https://... | https://...       |
+| 2   |          | 企業B  | コンサル | https://... |               |
+
+ファイルパスをダッシュボードの「ターゲットリスト」設定で指定してください。
+
+### 4. Start Outreach
+
+```bash
+# Claude Code CLI で指示
+claude
+
+# 以下のように指示するだけ
+> 3社確認待ちまで進めて
+> 企業Aに問い合わせを送って
+```
+
+## Configuration
+
+### data/settings.json
+
+全設定を管理する単一ファイルです。ダッシュボードのSettingsタブから編集できます。
+
+| セクション | 内容 |
+|-----------|------|
+| `companyProfile` | 自社の会社情報（社名・担当者・連絡先・備考等） |
+| `valuePropositions` | 自社の強み・実績・業種別プロフィール・サービスURL・ドキュメント |
+| `targetList` | ターゲットリストのファイルパス・カラムマッピング |
+| `exclusionRules` | 競合・既存顧客・NGリスト・除外ステータス |
+| `messageTemplates` | メッセージのトーン・テンプレート・署名・書面設定 |
+| `preferences` | ポート・言語・タイムアウト・ブラウザ設定・ログ設定 |
+
+詳細は `data/sample-settings.json` を参照してください。
+
+## Dashboard
+
+`node dashboard-server.cjs` で起動。デフォルトは `http://localhost:3456`
+
+| タブ | 機能 |
+|------|------|
+| **企業一覧** | ターゲット企業の状態一覧（フィルタ・検索・ソート） |
+| **確認待ち** | フォーム入力済み → 人間の送信判断待ち |
+| **送信済み** | 送信完了企業の文面・スクショ・連絡履歴 |
+| **CLI Activity** | Claude Code からのリアルタイムログ |
+| **Settings** | 全設定をUIから管理 |
+
+## File Structure
+
+```
+sales-claw/
+├── dashboard-server.cjs      # ダッシュボード（メインサーバー）
+├── settings-manager.cjs      # 設定管理（Single Source of Truth）
+├── config.cjs                # 設定読み取りインターフェース
+├── company-analyzer.cjs      # 企業サイト分析
+├── form-finder.cjs           # フォームURL探索
+├── form-validator.cjs        # フォーム事前検証
+├── form-helpers.cjs          # フォーム操作ヘルパー
+├── message-builder.cjs       # メッセージ生成
+├── ai-submitter.cjs          # 自動送信ワーカー
+├── action-logger.cjs         # 操作ログ管理
+├── contact-history.cjs       # 連絡履歴管理
+├── email-fetcher.cjs         # Outlookメール取得
+├── cli-logger.cjs            # CLIログヘルパー
+├── data/
+│   ├── sample-settings.json  # 設定サンプル
+│   └── settings.json         # 実際の設定（.gitignore対象）
+├── screenshots/              # フォーム入力・確認画面のスクショ
+├── CLAUDE.md                 # Claude Code 用プロジェクト説明
+├── package.json
+├── LICENSE                   # MIT
+├── README.md                 # このファイル
+└── CONTRIBUTING.md           # コントリビューションガイド
+```
+
+## How It Works
+
+1. **企業分析**: `company-analyzer.cjs` がターゲット企業のWebサイトをPlaywrightで巡回し、事業領域・注力分野を分析
+2. **ギャップ検出**: 自社の強み（settings）とターゲットの弱みを比較し、協業ポイントを特定
+3. **メッセージ生成**: `message-builder.cjs` が分析結果に基づいてパーソナライズされたメッセージを生成
+4. **フォーム入力**: Claude Code CLI + MCP Playwright でフォームに自動入力
+5. **人間が確認**: ダッシュボードの「確認待ち」タブでスクショ・文面を確認し、送信判断
+6. **履歴管理**: 送信履歴・レスポンスを記録し、2回目以降のフォローに活用
+
+## Security
+
+- `data/settings.json` には会社情報が含まれます。`.gitignore` で除外済みですが、取り扱いに注意してください
+- メール機能は Outlook Web のセッションを使用します。セッション情報は `data/outlook-session/` に保存されます
+- 送信前の承認フローがデフォルトで有効です（`preferences.requireApprovalBeforeSend`）
+
+## Token Optimization with OMC（組み込み済み）
+
+[oh-my-claudecode (OMC)](https://github.com/Yeachan-Heo/oh-my-claudecode) によるモデルルーティングが**プロジェクトに組み込み済み**です。
+各処理ステップに最適なモデルを自動割り当てし、トークンコストを**70-75%削減**します。
+
+### セットアップ
+
+```bash
+# OMCプラグインをインストール（初回のみ）
+claude /install oh-my-claudecode
+# ルーティング設定は .claude/omc-routing.json に定義済み
+```
+
+### モデルルーティング
+
+| ステップ | モデル | トークン目安 | コスト比(vs全Opus) |
+|---------|--------|-----------|-----------------|
+| 企業サイト分析 | **Haiku** | ~10K/社 | 1/10 |
+| フォーム探索・検証 | **Haiku** | ~5K/社 | 1/10 |
+| メッセージ生成 | **Sonnet** | ~8K/社 | 1/5 |
+| フォーム入力+スクショ | **Sonnet** | ~15K/社 | 1/5 |
+| エラー対応 | **Opus** | ~20K/件 | 1x（低頻度） |
+
+### 3社アプローチの実コスト比較
+
+```
+全て Opus:  150K tokens — コスト 1.0x
+OMC適用:    99K tokens — コスト 0.25x（75%削減）
+```
+
+設定ファイル: `.claude/omc-routing.json`, `.claude/settings.local.json`
+詳細: [CLAUDE.md](./CLAUDE.md) のOMCセクション参照
+
+## License
+
+MIT License. See [LICENSE](./LICENSE).

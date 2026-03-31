@@ -1,0 +1,78 @@
+appId: com.sales-claw
+productName: Sales Claw
+copyright: MIT License
+
+# 自動更新: GitHub Releases から配信
+publish:
+  provider: github
+  owner: joseikininsight-hue
+  repo: sales-claw
+
+# asar無効でファイルパスをシンプルに
+asar: false
+
+directories:
+  output: dist
+  buildResources: assets
+
+# パッケージに含めるファイル
+files:
+  - "**/*"
+  - "!dist/**"
+  - "!.git/**"
+  - "!.github/**"
+  - "!screenshots/**"
+  - "!data/settings.json"
+  - "!data/action-log.json"
+  - "!data/contact-history.json"
+  - "!data/dashboard-runtime.json"
+  - "!data/*.csv"
+  - "data/sample-targets.csv"
+  - "!*.xlsx"
+  - "!*.log"
+  - "!tmp/**"
+  - "!temp/**"
+
+# Windows インストーラー (NSIS)
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: assets/icon.ico
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: assets/icon.ico
+  uninstallerIcon: assets/icon.ico
+  installerHeaderIcon: assets/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Sales Claw
+
+# macOS
+mac:
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+  icon: assets/icon.icns
+  category: public.app-category.business
+
+dmg:
+  title: Sales Claw Installer
+  contents:
+    - x: 410
+      y: 150
+      type: link
+      path: /Applications
+    - x: 130
+      y: 150
+      type: file
+
+# Linux
+linux:
+  target:
+    - target: AppImage
+      arch: [x64]
+  icon: assets/icon.png
+  category: Office

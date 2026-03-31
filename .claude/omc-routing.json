@@ -1,0 +1,101 @@
+{
+  "$schema": "OMC model routing for Sales Claw",
+  "version": "1.0.0",
+  "description": "各処理ステップに最適なモデルを割り当て、トークンコストを60-70%削減",
+
+  "agentMapping": {
+    "company-analyzer": {
+      "agent": "explore",
+      "model": "haiku",
+      "tasks": [
+        "企業サイトにアクセスしてテキスト抽出",
+        "事業領域の検出（キーワードマッチング）",
+        "フォームURL探索",
+        "フォーム構造の事前検証"
+      ],
+      "tokenBudget": "10K per company"
+    },
+    "message-builder": {
+      "agent": "executor",
+      "model": "sonnet",
+      "tasks": [
+        "ギャップ分析に基づくメッセージ生成",
+        "業種別テンプレート選択",
+        "署名・CTA組み立て"
+      ],
+      "tokenBudget": "8K per company"
+    },
+    "form-filler": {
+      "agent": "main",
+      "model": "sonnet",
+      "tasks": [
+        "MCP Playwrightでフォームにアクセス",
+        "browser_snapshotでフォーム構造解析",
+        "browser_fill_formでフィールド入力",
+        "browser_take_screenshotでスクショ撮影"
+      ],
+      "tokenBudget": "15K per company",
+      "note": "MCP共有のためメインが直接実行。並列不可"
+    },
+    "settings-manager": {
+      "agent": "executor-low",
+      "model": "haiku",
+      "tasks": [
+        "settings.jsonの読み書き",
+        "ダッシュボード設定変更",
+        "ターゲットリスト管理"
+      ],
+      "tokenBudget": "3K per operation"
+    },
+    "error-handler": {
+      "agent": "architect",
+      "model": "opus",
+      "tasks": [
+        "CAPTCHA検出時の対応判断",
+        "フォーム入力失敗の原因調査",
+        "iframe/外部フォームの特殊処理"
+      ],
+      "tokenBudget": "20K per incident",
+      "note": "頻度低い。問題発生時のみ起動"
+    }
+  },
+
+  "workflows": {
+    "single-company": {
+      "description": "1社のアプローチ（分析→メッセージ→フォーム入力→スクショ）",
+      "steps": [
+        { "step": 1, "name": "analyze",  "agent": "company-analyzer", "model": "haiku",  "parallel": false },
+        { "step": 2, "name": "message",  "agent": "message-builder",  "model": "sonnet", "parallel": false },
+        { "step": 3, "name": "form",     "agent": "form-filler",      "model": "sonnet", "parallel": false },
+        { "step": 4, "name": "log",      "agent": "settings-manager", "model": "haiku",  "parallel": false }
+      ],
+      "estimatedTokens": "33K",
+      "estimatedCost": "opus比 25%"
+    },
+    "batch-3-companies": {
+      "description": "3社同時アプローチ",
+      "steps": [
+        { "step": 1, "name": "analyze-all",  "agent": "company-analyzer", "model": "haiku",  "parallel": true, "count": 3 },
+        { "step": 2, "name": "message-all",  "agent": "message-builder",  "model": "sonnet", "parallel": true, "count": 3 },
+        { "step": 3, "name": "form-each",    "agent": "form-filler",      "model": "sonnet", "parallel": false, "sequential": true },
+        { "step": 4, "name": "log-all",      "agent": "settings-manager", "model": "haiku",  "parallel": false }
+      ],
+      "estimatedTokens": "99K",
+      "estimatedCost": "opus比 25-30%"
+    }
+  },
+
+  "costComparison": {
+    "allOpus": {
+      "perCompany": "50K tokens",
+      "3companies": "150K tokens",
+      "relativeCost": "1.0x"
+    },
+    "omcRouted": {
+      "perCompany": "33K tokens (haiku 10K + sonnet 23K)",
+      "3companies": "99K tokens",
+      "relativeCost": "0.25-0.30x",
+      "savings": "70-75%"
+    }
+  }
+}

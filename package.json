@@ -1,0 +1,38 @@
+{
+  "name": "sales-claw",
+  "version": "1.0.0",
+  "description": "Automated B2B company outreach via web contact forms, powered by Claude Code CLI + Playwright",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "electron .",
+    "dashboard": "node src/dashboard-server.cjs",
+    "electron": "electron .",
+    "dist": "electron-builder --win --mac --linux",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux",
+    "setup": "node -e \"const fs=require('fs');if(!fs.existsSync('data/settings.json'))fs.copyFileSync('data/sample-settings.json','data/settings.json');console.log('data/settings.json ready');\""
+  },
+  "keywords": [
+    "outreach",
+    "automation",
+    "playwright",
+    "claude-code",
+    "b2b",
+    "sales"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "electron-updater": "^6.8.3",
+    "playwright": "^1.58.2",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "electron": "^34.5.8",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "extends": "./electron-builder.yml"
+  }
+}

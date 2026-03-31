@@ -1,0 +1,152 @@
+{
+  "companyProfile": {
+    "companyName": "サンプル株式会社",
+    "companyNameEn": "Sample Inc.",
+    "companyNameKana": "サンプルカブシキガイシャ",
+    "representative": "山田 太郎",
+    "contactName": "佐藤 花子",
+    "contactNameKana": "さとう はなこ",
+    "contactTitle": "営業部 マネージャー",
+    "department": "営業部",
+    "email": "sato@example.com",
+    "phone": "03-1234-5678",
+    "fax": "03-1234-5679",
+    "mobile": "090-1234-5678",
+    "postalCode": "100-0001",
+    "address": "〒100-0001 東京都千代田区千代田1-1-1",
+    "addressEn": "1-1-1 Chiyoda, Chiyoda-ku, Tokyo 100-0001, Japan",
+    "website": "https://www.example.com/",
+    "partnerPage": "https://www.example.com/partner/",
+    "corporateProfile": "https://www.example.com/about/",
+    "established": "2010年4月",
+    "employeeCount": "150名",
+    "capital": "5,000万円",
+    "industry": "IT・ソフトウェア",
+    "businessDescription": "Webアプリケーション開発、クラウドソリューション、AIコンサルティング",
+    "notes": "毎月の営業目標: 20社へのアプローチ"
+  },
+  "valuePropositions": {
+    "companyUrl": "https://www.example.com/",
+    "serviceUrls": [
+      { "label": "Webアプリ開発サービス", "url": "https://www.example.com/services/web-app/" },
+      { "label": "クラウド移行サービス", "url": "https://www.example.com/services/cloud/" }
+    ],
+    "documentPaths": [
+      { "name": "会社紹介資料.pdf", "path": "docs/company-intro.pdf", "description": "会社紹介・実績一覧" }
+    ],
+    "strengths": [
+      {
+        "key": "web_dev",
+        "label": "Webアプリケーション開発",
+        "detail": "大規模Webアプリ・業務システムのフルスタック開発に強み。200件以上の納品実績",
+        "keywords": ["webアプリ", "システム開発", "フロントエンド", "バックエンド"]
+      },
+      {
+        "key": "cloud",
+        "label": "クラウドソリューション",
+        "detail": "AWS/Azure/GCPの設計・構築・移行を専門とし、コスト最適化にも対応",
+        "keywords": ["aws", "azure", "gcp", "クラウド", "インフラ"]
+      },
+      {
+        "key": "ai",
+        "label": "AI・データ活用",
+        "detail": "機械学習モデル構築からWebサービスへの組み込みまで一貫対応",
+        "keywords": ["ai", "機械学習", "データ分析", "生成ai"]
+      }
+    ],
+    "successPatterns": [
+      { "partner": "大手SIer A社", "proof": "顧客案件のWeb領域を技術パートナーとして支援", "type": "SIer" },
+      { "partner": "コンサルB社", "proof": "DX推進の実装フェーズを一括受託", "type": "コンサル" }
+    ],
+    "industryProfiles": {
+      "SIer": {
+        "opener": "貴社の顧客案件において、Web領域の構築や運用でお困りのことはございませんでしょうか。",
+        "point": "弊社はWebアプリケーション開発を専門としており、大手SIer様のWeb領域をお任せいただく形で多数の協業実績がございます。",
+        "examples": "大手SIer様との協業実績多数",
+        "strength": "Web領域の一括対応力（Webアプリ・システム連携・UI/UXデザイン）"
+      },
+      "コンサル": {
+        "opener": "DX推進やWebマーケティング戦略の実行フェーズにおいて、実装面での技術パートナーをお探しではないでしょうか。",
+        "point": "弊社は戦略を形にする実装力に強みがあり、複雑な要件にも対応しております。",
+        "examples": "コンサルファーム向け実装支援の実績",
+        "strength": "戦略をそのまま実装に落とせる技術力"
+      },
+      "default": {
+        "opener": "貴社の事業において、技術支援でお力添えできることがあるのではないかと思い、ご連絡いたしました。",
+        "point": "弊社はWebアプリケーション開発・クラウドソリューション・AI開発を専門としております。",
+        "examples": "多数の企業様との協業実績",
+        "strength": "Web・クラウド・AIの総合力"
+      }
+    }
+  },
+  "targetList": {
+    "filePath": "data/sample-targets.csv",
+    "fileType": "csv",
+    "sheetIndex": 0,
+    "columnMapping": {
+      "no": 0,
+      "status": 1,
+      "companyName": 2,
+      "type": 3,
+      "url": 4,
+      "formUrl": 5,
+      "notes": 6,
+      "captcha": 8,
+      "progress": 10
+    }
+  },
+  "exclusionRules": {
+    "competitors": [
+      { "pattern": "競合A社", "status": "競合" }
+    ],
+    "existingClients": [
+      { "pattern": "既存B社", "status": "既存契約" }
+    ],
+    "ngList": [
+      { "pattern": "NG会社", "reason": "過去にトラブルあり", "status": "NG" }
+    ],
+    "customRules": [],
+    "excludeStatuses": ["×", "web×", "競合", "規模×", "既存契約", "パイプ有", "提案辞退", "失注", "NG"]
+  },
+  "messageTemplates": {
+    "style": {
+      "tone": "formal",
+      "language": "ja",
+      "maxLength": 2000,
+      "signatureFormat": "full"
+    },
+    "inquiryTypes": ["その他", "お問い合わせ", "協業・パートナーシップ", "サービスについて"],
+    "closingLine": "もしご興味がございましたら、30分程度の情報交換の場をいただけないでしょうか。\n貴社のお取り組みについてもお伺いできればと存じます。",
+    "greetingLine": "お世話になります。",
+    "cta": "何卒よろしくお願いいたします。",
+    "referenceUrlText": "詳細はこちらをご覧いただけますと幸いです。",
+    "signatureTemplate": "{companyName}\n{contactName}\nTEL: {phone}\nMAIL: {email}",
+    "letterTemplate": {
+      "enabled": false,
+      "header": "",
+      "footer": "",
+      "format": "A4"
+    }
+  },
+  "preferences": {
+    "dashboardPort": 3765,
+    "dashboardHost": "127.0.0.1",
+    "language": "ja",
+    "timezone": "Asia/Tokyo",
+    "dateFormat": "YYYY-MM-DD HH:mm",
+    "screenshotDir": "screenshots",
+    "dataDir": "data",
+    "emailSearchKeyword": "",
+    "emailProvider": "outlook",
+    "maxRetries": 3,
+    "pageTimeout": 15000,
+    "formFillTimeout": 5000,
+    "headless": true,
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "locale": "ja-JP",
+    "logLevel": "info",
+    "maxLogEntries": 10000,
+    "requireApprovalBeforeSend": true,
+    "exportFilenamePrefix": "outreach_progress"
+  }
+}

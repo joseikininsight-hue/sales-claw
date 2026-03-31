@@ -1,0 +1,82 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node:*)",
+      "Bash(start:*)",
+      "Bash(curl -s http://localhost:*)",
+      "Bash(mkdir:*)",
+      "Bash(netstat:*)",
+      "Bash(taskkill:*)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_tabs"
+    ]
+  },
+  "omc": {
+    "modelRouting": {
+      "enabled": true,
+      "rules": {
+        "company-analysis": {
+          "model": "haiku",
+          "description": "企業サイト分析・事業領域検出・フォーム探索",
+          "patterns": [
+            "analyzeCompany",
+            "findContactForm",
+            "validateFormPage",
+            "site_analysis"
+          ]
+        },
+        "message-generation": {
+          "model": "sonnet",
+          "description": "パーソナライズされたメッセージ生成",
+          "patterns": [
+            "buildMessage",
+            "buildCustomMessage",
+            "message_draft"
+          ]
+        },
+        "form-interaction": {
+          "model": "sonnet",
+          "description": "フォーム構造解析・入力操作",
+          "patterns": [
+            "browser_fill_form",
+            "browser_snapshot",
+            "form_fill"
+          ]
+        },
+        "settings-crud": {
+          "model": "haiku",
+          "description": "設定の読み書き・ダッシュボード操作",
+          "patterns": [
+            "settings",
+            "config",
+            "dashboard"
+          ]
+        },
+        "error-debug": {
+          "model": "opus",
+          "description": "エラー対応・複雑なデバッグ（必要時のみ）",
+          "patterns": [
+            "error",
+            "debug",
+            "troubleshoot"
+          ]
+        }
+      }
+    },
+    "delegation": {
+      "enabled": true,
+      "defaultTier": "MEDIUM",
+      "overrides": {
+        "explore": "LOW",
+        "executor-low": "LOW",
+        "executor": "MEDIUM",
+        "architect": "HIGH"
+      }
+    }
+  },
+  "model": "claude-sonnet-4-6"
+}
