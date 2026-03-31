@@ -213,20 +213,23 @@ sales-claw/
 ├── CLAUDE.md                   # このファイル（プロジェクト説明）
 ├── settings-manager.cjs        # 設定管理（全設定のSingle Source of Truth）
 ├── config.cjs                  # 設定読み取りインターフェース
-├── dashboard-server.cjs        # ダッシュボード + 設定UI
-├── action-logger.cjs           # 操作ログ管理
-├── contact-history.cjs         # 連絡履歴管理
-├── company-analyzer.cjs        # 企業サイト分析
-├── form-validator.cjs          # フォーム事前検証
-├── form-finder.cjs             # フォームURL探索
-├── form-helpers.cjs            # フォーム操作ヘルパー
-├── message-builder.cjs         # メッセージ生成
-├── email-fetcher.cjs           # Outlookメール取得
-├── ai-submitter.cjs            # 自動送信ワーカー
-├── cli-logger.cjs              # ダッシュボードCLI Activity通知
+├── electron-main.js            # Electron メインプロセス
+├── src/
+│   ├── dashboard-server.cjs    # ダッシュボード + 設定UI
+│   ├── action-logger.cjs       # 操作ログ管理
+│   ├── contact-history.cjs     # 連絡履歴管理
+│   ├── company-analyzer.cjs    # 企業サイト分析
+│   ├── form-validator.cjs      # フォーム事前検証
+│   ├── form-finder.cjs         # フォームURL探索
+│   ├── form-helpers.cjs        # フォーム操作ヘルパー
+│   ├── message-builder.cjs     # メッセージ生成
+│   ├── email-fetcher.cjs       # Outlookメール取得
+│   ├── ai-submitter.cjs        # 自動送信ワーカー
+│   └── cli-logger.cjs          # ダッシュボードCLI Activity通知
 ├── data/
 │   ├── settings.json           # 全設定（.gitignore対象）
 │   ├── sample-settings.json    # 設定サンプル
+│   ├── sample-targets.csv      # 公開用サンプルターゲット
 │   ├── action-log.json         # 全操作ログ
 │   └── contact-history.json    # 連絡履歴
 └── screenshots/                # フォーム入力・確認画面のスクショ

@@ -279,7 +279,8 @@ function buildPage() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${_t['startup.title'] || 'Sales Claw Dashboard'}</title>
+<title>Sales Claw</title>
+<link rel="icon" type="image/png" href="/assets/favicon.png">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -421,7 +422,8 @@ tr.updated{animation:rowFlash .8s}
 
 <!-- Header -->
 <div class="header">
-  <h1>${_t['app.title'] || 'Outreach'}</h1>
+  <img src="/assets/favicon.png" alt="Sales Claw" style="width:28px;height:28px;object-fit:contain;margin-right:8px;vertical-align:middle">
+  <h1 style="display:inline;vertical-align:middle">Sales Claw</h1>
   <span class="live-dot on" id="liveDot"></span>
   <span style="color:rgba(255,255,255,.7);font-size:.7rem;font-weight:500;letter-spacing:.05em" id="liveLabel">${_t['app.live'] || 'LIVE'}</span>
   <small style="color:rgba(255,255,255,.5);margin-left:auto;font-size:.72rem" id="lastUpdate"></small>
@@ -983,7 +985,7 @@ tr.updated{animation:rowFlash .8s}
             </div>
             <div class="settings-group">
               <label>${_t['field.dashboardHost']}</label>
-              <input type="text" id="pf-dashboardHost" placeholder="0.0.0.0">
+              <input type="text" id="pf-dashboardHost" placeholder="127.0.0.1">
             </div>
           </div>
 
@@ -2227,7 +2229,7 @@ async function saveSection(section) {
       };
     } else if (section === 'preferences') {
       data = {
-        dashboardPort: parseInt(document.getElementById('pf-dashboardPort').value) || 3456,
+        dashboardPort: parseInt(document.getElementById('pf-dashboardPort').value) || 3765,
         dashboardHost: document.getElementById('pf-dashboardHost').value,
         language: document.getElementById('pf-language').value,
         timezone: document.getElementById('pf-timezone').value,
@@ -2307,6 +2309,22 @@ const server = http.createServer(async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
+    return;
+  }
+
+  // Assets serving (favicon, icons)
+  if (req.url.startsWith('/assets/')) {
+    const filename = path.basename(req.url);
+    const filepath = path.join(__dirname, '..', 'assets', filename);
+    try {
+      const data = fs.readFileSync(filepath);
+      const ext = path.extname(filename).toLowerCase();
+      const mime = ext === '.ico' ? 'image/x-icon' : ext === '.png' ? 'image/png' : 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' });
+      res.end(data);
+    } catch {
+      res.writeHead(404); res.end('Not found');
+    }
     return;
   }
 
@@ -2642,7 +2660,10 @@ async function startDashboardServer() {
     console.log(`${i18nT(_sl, 'startup.stop')}\n`);
 
     return dashboardRuntime;
-  })();
+  })().catch((error) => {
+    serverStartPromise = null;
+    throw error;
+  });
 
   return serverStartPromise;
 }

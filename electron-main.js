@@ -264,6 +264,7 @@ autoUpdater.on('error', () => { /* サイレント失敗 */ });
 
 // 全ウィンドウが閉じられてもアプリを終了しない（トレイに常駐）
 app.on('window-all-closed', () => { /* tray に常駐 */ });
+app.on('activate', () => { createWindow(); });
 
 app.on('before-quit', () => {
   app.isQuiting = true;

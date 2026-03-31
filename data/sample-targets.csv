@@ -1,4 +1,4 @@
-No.,ステータス,企業名,種別,WebサイトURL,問い合わせフォームURL,備考,,CAPTCHA,,進捗
-1,〇,サンプル総研株式会社,コンサルティング,https://example.com/company-a,https://example.com/company-a/contact,サンプルデータです,,,,
-2,〇,青空システムズ株式会社,SIer,https://example.com/company-b,https://example.com/company-b/contact,サンプルデータです,,,,
-3,×,テスト除外株式会社,SaaS,https://example.com/company-c,https://example.com/company-c/contact,除外サンプル,,,,
+No.,Status,Company,Type,Website URL,Form URL,Notes,,CAPTCHA,,Progress
+1,OK,Sample Analytics Co.,Consulting,https://example.com/company-a,https://example.com/company-a/contact,Sample data,,,,
+2,OK,Blue Sky Systems,SIer,https://example.com/company-b,https://example.com/company-b/contact,Sample data,,,,
+3,NG,Test Excluded Inc.,SaaS,https://example.com/company-c,https://example.com/company-c/contact,Excluded sample,,,,
