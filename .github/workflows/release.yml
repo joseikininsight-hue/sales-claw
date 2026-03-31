@@ -3,22 +3,25 @@ name: Build & Release
 on:
   push:
     tags:
-      - 'v*'   # v1.0.0 のようなタグをプッシュすると自動ビルド
+      - 'v*'
 
 jobs:
   build:
     strategy:
-      fail-fast: false   # 1プラットフォームが失敗しても他を続行
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             platform: win
           - os: macos-latest
             platform: mac
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             platform: linux
 
     runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -29,23 +32,16 @@ jobs:
           cache: npm
 
       - name: Install Linux system dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-22.04'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            rpm \
-            fakeroot \
-            dpkg
+          sudo apt-get update -y
+          sudo apt-get install -y rpm fakeroot dpkg
 
       - name: Install dependencies
         run: npm ci
 
       - name: Build Electron app
-        run: npm run dist:${{ matrix.platform }}
+        run: npx electron-builder --${{ matrix.platform }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -53,7 +49,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.platform }}
-          path: dist/
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+          if-no-files-found: warn
           retention-days: 7
 
   release:
@@ -70,6 +70,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist-all
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -77,10 +78,11 @@ jobs:
           name: Sales Claw ${{ github.ref_name }}
           draft: false
           prerelease: false
+          fail_on_unmatched_files: false
           files: |
-            dist-all/**/*.exe
-            dist-all/**/*.dmg
-            dist-all/**/*.AppImage
+            dist-all/*.exe
+            dist-all/*.dmg
+            dist-all/*.AppImage
           body: |
             ## インストール方法
 
@@ -92,11 +94,10 @@ jobs:
 
             ## 前提条件（別途インストールが必要）
 
-            1. **Claude Code CLI** — [インストール手順](https://docs.anthropic.com/claude-code)
+            1. **Claude Code CLI**
                ```
                npm install -g @anthropic-ai/claude-code
                ```
-
-            2. このアプリを起動後、Settings タブで自社情報を設定してください。
+            2. アプリ起動後、Settings タブで自社情報を設定してください。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
