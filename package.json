@@ -1,6 +1,6 @@
 {
   "name": "sales-claw",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Automated B2B company outreach via web contact forms, powered by Claude Code CLI + Playwright",
   "main": "electron-main.js",
   "scripts": {

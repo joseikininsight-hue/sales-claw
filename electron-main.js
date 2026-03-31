@@ -260,7 +260,17 @@ autoUpdater.on('update-downloaded', (info) => {
   });
 });
 
-autoUpdater.on('error', () => { /* サイレント失敗 */ });
+autoUpdater.on('error', (err) => {
+  console.error('[AutoUpdater] error:', err?.message || err);
+});
+
+autoUpdater.on('checking-for-update', () => {
+  console.log('[AutoUpdater] checking for update...');
+});
+
+autoUpdater.on('update-not-available', (info) => {
+  console.log('[AutoUpdater] already up to date:', info?.version);
+});
 
 // 全ウィンドウが閉じられてもアプリを終了しない（トレイに常駐）
 app.on('window-all-closed', () => { /* tray に常駐 */ });
