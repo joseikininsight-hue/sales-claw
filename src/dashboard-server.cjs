@@ -25,6 +25,8 @@ const activeWatchers = new Map();
 let heartbeatTimer = null;
 let dashboardRuntime = null;
 let serverStartPromise = null;
+let _claudeStatusCache = null;
+let _claudeStatusCacheTime = 0;
 
 function notifyClients(payload) {
   const body = payload || { type: 'update', time: Date.now() };
@@ -320,6 +322,7 @@ tr.updated{animation:rowFlash .8s}
 .live-dot{width:8px;height:8px;border-radius:50%;display:inline-block;animation:pulse 1.5s infinite}
 .live-dot.on{background:var(--success)}
 .live-dot.off{background:var(--error);animation:none}
+.live-dot.warn{background:var(--warning)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .badge{font-size:.65rem;font-weight:600;letter-spacing:.03em;padding:3px 8px;border-radius:var(--radius-md)}
 .badge.bg-success{background:var(--success)!important}.badge.bg-danger{background:var(--error)!important}
@@ -431,10 +434,11 @@ tr.updated{animation:rowFlash .8s}
     <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M1 2.828c.885-.37 2.154-.769 3.388-.893 1.33-.134 2.458.063 3.112.752v9.746c-.935-.53-2.12-.603-3.213-.493-1.18.12-2.37.461-3.287.811V2.828zm7.5-.141c.654-.689 1.782-.886 3.112-.752 1.234.124 2.503.523 3.388.893v9.923c-.918-.35-2.107-.692-3.287-.81-1.094-.111-2.278-.039-3.213.492V2.687zM8 1.783C7.015.936 5.587.81 4.287.94c-1.514.153-3.042.672-3.994 1.105A.5.5 0 0 0 0 2.5v11a.5.5 0 0 0 .707.455c.882-.4 2.303-.881 3.68-1.02 1.409-.142 2.59.087 3.223.877a.5.5 0 0 0 .78 0c.633-.79 1.814-1.019 3.222-.877 1.378.139 2.8.62 3.681 1.02A.5.5 0 0 0 16 13.5v-11a.5.5 0 0 0-.293-.455c-.952-.433-2.48-.952-3.994-1.105C10.413.809 8.985.936 8 1.783z"/></svg>
     ${_t['app.docs']}
   </button>
-  <button class="export-btn" onclick="launchClaude()" title="${_t['app.launchClaude']}" style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3)">
-    <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0zm0 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.5 4v3.5H4a.5.5 0 0 0 0 1h3.5V13a.5.5 0 0 0 1 0V9.5H12a.5.5 0 0 0 0-1H8.5V5a.5.5 0 0 0-1 0z"/></svg>
-    ${_t['app.launchClaude']}
-  </button>
+  <div id="claudeStatusWidget" style="display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:6px;padding:4px 10px;font-size:.75rem">
+    <span id="claudeStatusDot" class="live-dot" style="width:8px;height:8px;flex-shrink:0"></span>
+    <span id="claudeStatusLabel" style="color:rgba(255,255,255,.7);white-space:nowrap">${_t['claude.status.checking'] || 'Checking...'}</span>
+    <button id="claudeActionBtn" onclick="claudeAction()" style="display:none;background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.35);border-radius:4px;color:#fff;font-size:.72rem;padding:2px 8px;cursor:pointer;white-space:nowrap"></button>
+  </div>
   <button class="export-btn" onclick="location.href='/api/export'">
     <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/></svg>
     ${_t['app.export'] || 'Export Excel'}
@@ -1141,11 +1145,60 @@ async function launchClaude() {
     const data = await res.json();
     if (data.ok) {
       showToast(t('app.launchClaude.success'), 'success');
+      setTimeout(pollClaudeStatus, 3000);
     } else {
       showToast(t('app.launchClaude.error') + ': ' + (data.error || ''), 'error');
     }
   } catch (e) {
     showToast(t('app.launchClaude.error') + ': ' + e.message, 'error');
+  }
+}
+
+// Claude CLI status polling
+let _claudeStatusTimer = null;
+async function pollClaudeStatus() {
+  try {
+    const res = await fetch('/api/claude-status');
+    const data = await res.json();
+    const dot = document.getElementById('claudeStatusDot');
+    const label = document.getElementById('claudeStatusLabel');
+    const btn = document.getElementById('claudeActionBtn');
+    if (!dot) return;
+    if (data.running) {
+      dot.className = 'live-dot on';
+      label.textContent = t('claude.status.connected') + (data.version ? ' ' + data.version : '');
+      btn.style.display = 'none';
+    } else if (data.installed) {
+      dot.className = 'live-dot warn';
+      label.textContent = t('claude.status.notRunning');
+      btn.textContent = t('claude.btn.launch');
+      btn.style.display = '';
+      btn._action = 'launch';
+    } else {
+      dot.className = 'live-dot off';
+      label.textContent = t('claude.status.notInstalled');
+      btn.textContent = t('claude.btn.install');
+      btn.style.display = '';
+      btn._action = 'install';
+    }
+  } catch (e) {
+    // network error — leave as-is
+  }
+}
+function claudeAction() {
+  const btn = document.getElementById('claudeActionBtn');
+  if (!btn) return;
+  if (btn._action === 'launch') {
+    launchClaude();
+  } else if (btn._action === 'install') {
+    const cmd = 'npm install -g @anthropic-ai/claude-code';
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(cmd).then(() => {
+        showToast(t('claude.install.copied'), 'success');
+      }).catch(() => showToast(t('claude.install.error'), 'error'));
+    } else {
+      showToast(cmd, 'info');
+    }
   }
 }
 
@@ -1597,6 +1650,10 @@ function connectEvents(){
 // Initial data fetch
 refreshData({toastOnError:true});
 connectEvents();
+
+// Claude CLI status — initial check + periodic polling
+pollClaudeStatus();
+_claudeStatusTimer = setInterval(pollClaudeStatus, 10000);
 
 // CLI log stream
 const cliColors={info:'#8bc5ed',action:'#4ade80',error:'#f87171',warn:'#fbbf24',step:'#a78bfa'};
@@ -2548,13 +2605,61 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET /api/claude-status — check if Claude CLI is installed and running
+  if (req.url === '/api/claude-status' && req.method === 'GET') {
+    const { exec } = require('child_process');
+    const now = Date.now();
+    if (_claudeStatusCache && now - _claudeStatusCacheTime < 8000) {
+      jsonResponse(res, 200, _claudeStatusCache);
+      return;
+    }
+    const isWin = process.platform === 'win32';
+    const checkInstalled = isWin ? 'where claude' : 'which claude';
+    const checkRunning = isWin
+      ? 'tasklist /FI "IMAGENAME eq claude.exe" /NH'
+      : 'pgrep -x claude';
+    exec(checkInstalled, { timeout: 2000 }, (err1) => {
+      const installed = !err1;
+      if (!installed) {
+        _claudeStatusCache = { installed: false, running: false, version: null };
+        _claudeStatusCacheTime = Date.now();
+        jsonResponse(res, 200, _claudeStatusCache);
+        return;
+      }
+      exec('claude --version', { timeout: 3000 }, (err2, stdout2) => {
+        const version = err2 ? null : (stdout2 || '').trim().split('\n')[0].trim() || null;
+        exec(checkRunning, { timeout: 2000 }, (err3, stdout3) => {
+          let running = false;
+          if (isWin) {
+            running = !err3 && (stdout3 || '').toLowerCase().includes('claude');
+          } else {
+            running = !err3 && (stdout3 || '').trim().length > 0;
+          }
+          _claudeStatusCache = { installed: true, running, version };
+          _claudeStatusCacheTime = Date.now();
+          jsonResponse(res, 200, _claudeStatusCache);
+        });
+      });
+    });
+    return;
+  }
+
   // POST /api/launch-claude — open new terminal with claude running
   if (req.url === '/api/launch-claude' && req.method === 'POST') {
     try {
       const { exec } = require('child_process');
       const projectDir = PROJECT_ROOT;
-      exec(`start cmd /k "cd /d "${projectDir}" && claude"`, (err) => {
+      let cmd;
+      if (process.platform === 'win32') {
+        cmd = `start cmd /k "cd /d "${projectDir}" && claude"`;
+      } else if (process.platform === 'darwin') {
+        cmd = `osascript -e 'tell application "Terminal" to do script "cd \\"${projectDir}\\" && claude"'`;
+      } else {
+        cmd = `x-terminal-emulator -e bash -c 'cd "${projectDir}" && claude; exec bash' 2>/dev/null || xterm -e bash -c 'cd "${projectDir}" && claude; exec bash' &`;
+      }
+      exec(cmd, (err) => {
         if (err) console.error('launch-claude error:', err.message);
+        _claudeStatusCache = null; // invalidate cache so next poll reflects new state
       });
       jsonResponse(res, 200, { ok: true });
     } catch (e) {

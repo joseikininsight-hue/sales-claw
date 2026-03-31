@@ -187,6 +187,15 @@ const translations = {
     'app.launchClaude': 'Launch Claude',
     'app.launchClaude.success': 'Claude launched in a new terminal.',
     'app.launchClaude.error': 'Failed to launch Claude.',
+    'claude.status.connected': 'Claude Connected',
+    'claude.status.notRunning': 'Claude Not Running',
+    'claude.status.notInstalled': 'Claude Not Installed',
+    'claude.status.checking': 'Checking...',
+    'claude.btn.launch': 'Launch Claude',
+    'claude.btn.install': 'Install Claude CLI',
+    'claude.install.copied': 'Install command copied! Run it in your terminal.',
+    'claude.install.error': 'Could not copy install command.',
+    'claude.version': 'Version',
 
     // Settings placeholders & help
     'ph.companyName': 'Your company name',
@@ -541,6 +550,15 @@ const translations = {
     'app.launchClaude': 'Claude を起動',
     'app.launchClaude.success': '新しいターミナルで Claude を起動しました。',
     'app.launchClaude.error': 'Claude の起動に失敗しました。',
+    'claude.status.connected': 'Claude 接続中',
+    'claude.status.notRunning': 'Claude 未起動',
+    'claude.status.notInstalled': 'Claude CLI 未インストール',
+    'claude.status.checking': '確認中...',
+    'claude.btn.launch': 'Claude を起動',
+    'claude.btn.install': 'Claude CLI をインストール',
+    'claude.install.copied': 'インストールコマンドをコピーしました。ターミナルで実行してください。',
+    'claude.install.error': 'コマンドのコピーに失敗しました。',
+    'claude.version': 'バージョン',
 
     // Settings placeholders & help
     'ph.companyName': '例: 株式会社サンプル',
