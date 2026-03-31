@@ -38,11 +38,13 @@ files:
   - "!temp/**"
 
 # Windows インストーラー (NSIS)
+# artifactName でハイフン区切りに固定 → latest.yml と GitHub アセット名を一致させる
 win:
   target:
     - target: nsis
       arch: [x64]
   icon: assets/icon.ico
+  artifactName: "Sales-Claw-Setup-${version}.${ext}"
 
 nsis:
   oneClick: false
@@ -61,6 +63,7 @@ mac:
       arch: [x64, arm64]
   icon: assets/icon.png
   category: public.app-category.business
+  artifactName: "Sales-Claw-${version}-${arch}.${ext}"
 
 dmg:
   title: Sales Claw Installer
@@ -80,3 +83,4 @@ linux:
       arch: [x64]
   icon: assets/icon.png
   category: Office
+  artifactName: "Sales-Claw-${version}-${arch}.${ext}"
