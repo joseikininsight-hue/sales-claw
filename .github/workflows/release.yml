@@ -40,7 +40,86 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build & Publish Electron app
-        run: npx electron-builder --${{ matrix.platform }} --publish always
+      - name: Build Electron app
+        run: npx electron-builder --${{ matrix.platform }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+            dist/latest*.yml
+          if-no-files-found: warn
+          retention-days: 7
+
+  release:
+    needs: build
+    if: always() && contains(needs.build.result, 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Sales Claw ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          files: |
+            dist-all/*.exe
+            dist-all/*.dmg
+            dist-all/*.AppImage
+            dist-all/latest*.yml
+          body: |
+            ## ダウンロード方法
+
+            お使いの OS に合ったファイルをダウンロードしてください。
+
+            | OS | ダウンロードするファイル |
+            |----|----------------------|
+            | **Windows** | `Sales Claw Setup *.exe` ← Windowsはこれ |
+            | **macOS (M1/M2/M3)** | `Sales Claw-*-arm64.dmg` |
+            | **macOS (Intel)** | `Sales Claw-*.dmg`（arm64 なし） |
+            | **Linux** | `Sales Claw-*.AppImage` |
+
+            > `Source code (zip/tar.gz)` は開発者向けです。一般ユーザーは不要です。
+            > `latest*.yml` は自動アップデート用ファイルです。ダウンロード不要です。
+
+            ## セットアップ手順
+
+            ### 1. Claude Code CLI をインストール（必須・別途）
+
+            Sales Claw の AI 機能には [Claude Code CLI](https://docs.anthropic.com/claude-code) が必要です。
+
+            ```bash
+            npm install -g @anthropic-ai/claude-code
+            ```
+
+            Node.js 18+ が必要です → https://nodejs.org/
+
+            ### 2. Sales Claw を起動 → Settings タブで自社情報を設定
+
+            ### 3. ターゲットリスト（Excel/CSV）を用意して Settings で指定
+
+            ### 4. `claude` を起動して指示するだけ
+
+            ```
+            > 3社確認待ちまで進めて
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
