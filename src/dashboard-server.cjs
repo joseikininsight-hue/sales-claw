@@ -283,169 +283,277 @@ function buildPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sales Claw</title>
 <link rel="icon" type="image/png" href="/assets/favicon.png">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+<script>
+tailwind={config:{darkMode:'class',theme:{extend:{colors:{'primary':'#004ccd','primary-c':'#0f62fe','surface':'#f7f9fd','surface-low':'#f2f4f8','surface-lowest':'#ffffff','surface-container':'#eceef2','surface-high':'#e6e8ec','on-surface':'#191c1f','on-surface-v':'#424656','outline-v':'#c3c6d8','outline':'#737687','error':'#ba1a1a','tertiary':'#9e3100','secondary':'#445ba1'},fontFamily:{sans:['Inter','sans-serif'],mono:['"JetBrains Mono"','monospace']},borderRadius:{DEFAULT:'0',none:'0',sm:'0',md:'0',lg:'0',xl:'0','2xl':'0','full':'9999px'}}}}}
+</script>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <style>
 :root{
-  --surface:#f7f9fb;--surface-low:#f0f4f7;--surface-lowest:#ffffff;--surface-high:#e1e9ee;
-  --primary:#465f88;--primary-dim:#3a537c;--on-primary:#ffffff;
-  --on-surface:#2a3439;--on-surface-variant:#566166;--outline-variant:#a9b4b9;
-  --secondary-container:#dce4eb;--error:#9f403d;--error-container:#f5dedd;
-  --success:#2d7a4f;--success-container:#d4edda;--warning:#8a6700;--warning-container:#fff3cd;
-  --info:#3a6f9a;--info-container:#d0e8f7;
-  --font-display:'Manrope',sans-serif;--font-body:'Inter','Yu Gothic',sans-serif;
-  --radius-md:0.375rem;--radius-lg:0.5rem;
-  --shadow-ambient:0 2px 32px rgba(42,52,57,.06);
+  --primary:#004ccd;--primary-dim:#003da9;--on-primary:#ffffff;
+  --surface:#f7f9fd;--surface-low:#f2f4f8;--surface-lowest:#ffffff;--surface-high:#e6e8ec;--surface-container:#eceef2;
+  --on-surface:#191c1f;--on-surface-variant:#424656;--outline-variant:#c3c6d8;--outline:#737687;
+  --error:#ba1a1a;--error-container:#ffdad6;
+  --success:#1a7a4f;--success-container:#d4edda;
+  --warning:#8a5700;--warning-container:#fff0c8;
+  --info:#1a6f9a;--info-container:#d0e8f7;
+  --secondary-container:#dbe1ff;
+  --font-body:'Inter',sans-serif;--font-mono:'JetBrains Mono',monospace;
+  --radius-md:0;--radius-lg:0;
+  --shadow-ambient:0 1px 8px rgba(0,0,0,.06);
 }
-*{box-sizing:border-box}
+*{box-sizing:border-box;border-radius:0!important}
 body{font-family:var(--font-body);background:var(--surface);margin:0;color:var(--on-surface);font-size:.875rem;line-height:1.5}
-.header{background:linear-gradient(135deg,var(--primary) 0%,var(--primary-dim) 100%);color:var(--on-primary);padding:1rem 1.5rem;display:flex;align-items:center;gap:1rem}
-.header h1{font-family:var(--font-display);font-size:1.15rem;margin:0;font-weight:700;letter-spacing:.3px}
-.sc{background:var(--surface-lowest);border-radius:var(--radius-lg);box-shadow:var(--shadow-ambient);transition:transform .15s}
-.sc:hover{transform:translateY(-1px)}
-.sn{font-family:var(--font-display);font-size:1.6rem;font-weight:800;transition:color .3s}
+.mono{font-family:var(--font-mono)}
+.material-symbols-outlined{font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 20;vertical-align:middle;line-height:1}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:var(--surface-low)}
+::-webkit-scrollbar-thumb{background:var(--outline-variant)}
+
+/* Stat cards */
+.sn{font-family:var(--font-mono);font-size:1.6rem;font-weight:700;transition:color .3s;line-height:1}
 .sn.changed{animation:pop .4s}
-.sl{font-size:.7rem;color:var(--on-surface-variant);margin-top:2px;font-weight:500;text-transform:uppercase;letter-spacing:.05em}
-@keyframes pop{0%{transform:scale(1)}50%{transform:scale(1.1)}100%{transform:scale(1)}}
-.tc{background:var(--surface-lowest);border-radius:var(--radius-lg);box-shadow:var(--shadow-ambient)}
-.furl{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.log-entry{font-size:.75rem;color:var(--on-surface-variant);padding:4px 8px;margin:2px 0;background:var(--surface-low);border-radius:var(--radius-md)}
-.log-entry.error{background:var(--error-container)}
-.log-entry.success{background:var(--success-container)}
-.ts{font-size:.7rem;color:var(--outline-variant)}
-.fb{border-radius:var(--radius-md);font-size:.78rem;padding:5px 14px;border:none;background:var(--surface-high);color:var(--on-surface);cursor:pointer;transition:all .15s}
-.fb.active{background:var(--primary);color:var(--on-primary)}
-.fb:not(.active):hover{background:var(--secondary-container)}
-tr.excluded{opacity:.25}
-tr.updated{animation:rowFlash .8s}
-@keyframes rowFlash{0%{background:var(--success-container)}100%{background:transparent}}
-.live-dot{width:8px;height:8px;border-radius:50%;display:inline-block;animation:pulse 1.5s infinite}
-.live-dot.on{background:var(--success)}
-.live-dot.off{background:var(--error);animation:none}
-.live-dot.warn{background:var(--warning)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.badge{font-size:.65rem;font-weight:600;letter-spacing:.03em;padding:3px 8px;border-radius:var(--radius-md)}
-.badge.bg-success{background:var(--success)!important}.badge.bg-danger{background:var(--error)!important}
-.badge.bg-warning{background:var(--warning-container)!important;color:var(--warning)!important}
-.badge.bg-info{background:var(--info-container)!important;color:var(--info)!important}
-.badge.bg-secondary{background:var(--surface-high)!important;color:var(--on-surface-variant)!important}
-.badge.bg-primary{background:var(--primary)!important}
-.progress-pipeline{display:flex;gap:2px;align-items:center;margin:1rem 0}
-.pip-seg{height:6px;border-radius:3px;transition:width .5s}
-.table{--bs-table-bg:transparent}
-.table thead th{font-family:var(--font-body);font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--on-surface-variant);user-select:none;padding:.6rem .5rem;border-bottom:none!important;background:var(--surface-low)}
-.table thead th[onclick]:hover{background:var(--surface-high)}
-.table tbody td{padding:.55rem .5rem;border-bottom:none!important;font-size:.8rem}
-.table tbody tr{background:var(--surface-lowest)}
-.table tbody tr:nth-child(even){background:var(--surface-low)}
-.table tbody tr:hover{background:var(--surface-high)}
+.sl{font-size:.65rem;color:var(--on-surface-variant);margin-top:4px;font-weight:600;text-transform:uppercase;letter-spacing:.07em}
+@keyframes pop{0%{transform:scale(1)}50%{transform:scale(1.12)}100%{transform:scale(1)}}
+
+/* Table */
+.sc{background:var(--surface-lowest);box-shadow:var(--shadow-ambient)}
+.tc{background:var(--surface-lowest);box-shadow:var(--shadow-ambient);border:1px solid var(--outline-variant)}
+.furl{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sort-icon{font-size:.55rem;color:var(--primary);margin-left:2px}
-.table tbody td{font-size:.82rem;vertical-align:middle}
-.export-btn{background:var(--surface-lowest);border:none;border-radius:var(--radius-md);padding:6px 14px;font-size:.78rem;font-weight:500;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all .15s;color:var(--on-surface)}
-.export-btn:hover{background:var(--surface-high)}
-.tab-nav{display:flex;gap:0;margin-bottom:1.2rem;background:var(--surface-low);border-radius:var(--radius-lg);padding:3px;width:fit-content}
-.tab-btn{background:none;border:none;padding:8px 18px;font-size:.8rem;font-weight:500;color:var(--on-surface-variant);cursor:pointer;border-radius:var(--radius-md);transition:all .2s}
-.tab-btn.active{background:var(--surface-lowest);color:var(--on-surface);font-weight:600;box-shadow:var(--shadow-ambient)}
-.tab-btn:not(.active):hover{color:var(--on-surface)}
+.main-table{width:100%;border-collapse:collapse;font-size:.8rem}
+.main-table thead th{font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface-variant);user-select:none;padding:.55rem .6rem;background:var(--surface-high);border-bottom:2px solid var(--outline-variant);white-space:nowrap}
+.main-table thead th[onclick]:hover{background:var(--surface-container);cursor:pointer}
+.main-table tbody td{padding:.5rem .6rem;border-bottom:1px solid var(--surface-high);vertical-align:middle}
+.main-table tbody tr{background:var(--surface-lowest)}
+.main-table tbody tr:nth-child(even){background:var(--surface-low)}
+.main-table tbody tr:hover{background:#eef2ff}
+tr.excluded{opacity:.3}
+tr.updated{animation:rowFlash .8s}
+@keyframes rowFlash{0%{background:#d4edda}100%{background:transparent}}
+
+/* Filter buttons */
+.fb{font-size:.72rem;padding:4px 12px;border:1px solid var(--outline-variant);background:var(--surface-lowest);color:var(--on-surface-variant);cursor:pointer;transition:all .12s;font-weight:500}
+.fb.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+.fb:not(.active):hover{background:var(--surface-high);color:var(--on-surface)}
+
+/* Tab system */
 .tab-content{display:none}
 .tab-content.active{display:block}
-.btn-sm{font-size:.75rem;font-weight:500;border-radius:var(--radius-md);padding:4px 12px}
-.btn-success{background:var(--success);border-color:var(--success)}
-.btn-primary{background:var(--primary);border-color:var(--primary)}
-.btn-outline-danger{color:var(--error);border-color:var(--error)}
-.btn-outline-danger:hover{background:var(--error);color:var(--on-primary)}
-.form-control-sm{border:none;background:var(--surface-low);font-size:.8rem;border-radius:var(--radius-lg)}
-.form-control-sm:focus{background:var(--surface-lowest);box-shadow:0 0 0 2px rgba(70,95,136,.3);outline:none}
 
-/* Settings tab styles */
-.settings-layout{display:flex;gap:0;min-height:500px}
-.settings-sidebar{width:220px;background:var(--surface-low);border-radius:var(--radius-lg) 0 0 var(--radius-lg);padding:12px 0;flex-shrink:0}
-.settings-sidebar-btn{display:block;width:100%;text-align:left;background:none;border:none;padding:10px 20px;font-size:.82rem;color:var(--on-surface-variant);cursor:pointer;transition:all .15s;border-left:3px solid transparent}
-.settings-sidebar-btn:hover{background:var(--surface-high);color:var(--on-surface)}
-.settings-sidebar-btn.active{background:var(--surface-lowest);color:var(--primary);font-weight:600;border-left-color:var(--primary)}
-.settings-main{flex:1;padding:24px;background:var(--surface-lowest);border-radius:0 var(--radius-lg) var(--radius-lg) 0;overflow-y:auto;max-height:75vh}
-.settings-section{display:none}
-.settings-section.active{display:block}
-.settings-section h3{font-family:var(--font-display);font-size:1rem;font-weight:700;margin-bottom:4px;color:var(--on-surface)}
-.settings-section .section-desc{font-size:.78rem;color:var(--on-surface-variant);margin-bottom:20px}
-.settings-group{margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--surface-high)}
-.settings-group:last-child{border-bottom:none}
-.settings-group label{display:block;font-size:.78rem;font-weight:600;color:var(--on-surface);margin-bottom:4px}
-.settings-group .help-text{font-size:.7rem;color:var(--outline-variant);margin-top:2px}
-.settings-group input[type="text"],
-.settings-group input[type="number"],
-.settings-group input[type="email"],
-.settings-group input[type="tel"],
-.settings-group textarea,
-.settings-group select{width:100%;padding:8px 12px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.82rem;background:var(--surface-lowest);color:var(--on-surface);transition:border-color .15s}
-.settings-group input:focus,
-.settings-group textarea:focus,
-.settings-group select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(70,95,136,.15)}
-.settings-group textarea{min-height:80px;resize:vertical;font-family:var(--font-body)}
-.settings-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.settings-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
-.list-manager{border:1px solid var(--surface-high);border-radius:var(--radius-md);padding:12px;background:var(--surface)}
-.list-manager .list-item{display:flex;align-items:center;gap:8px;padding:6px 8px;background:var(--surface-lowest);border-radius:var(--radius-md);margin-bottom:4px;font-size:.8rem}
-.list-manager .list-item .remove-btn{background:none;border:none;color:var(--error);cursor:pointer;font-size:1rem;padding:0 4px;line-height:1}
-.list-manager .list-item .remove-btn:hover{opacity:.7}
-.list-manager .add-row{display:flex;gap:8px;margin-top:8px}
-.list-manager .add-row input{flex:1;padding:6px 10px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem}
-.list-manager .add-row button{padding:6px 14px;background:var(--primary);color:var(--on-primary);border:none;border-radius:var(--radius-md);font-size:.78rem;cursor:pointer}
-.list-manager .add-row button:hover{opacity:.9}
-.save-bar{position:sticky;bottom:0;background:var(--surface-lowest);border-top:1px solid var(--surface-high);padding:12px 0;display:flex;justify-content:flex-end;gap:8px;z-index:10}
-.save-bar .btn-save{padding:8px 24px;background:var(--primary);color:var(--on-primary);border:none;border-radius:var(--radius-md);font-size:.82rem;font-weight:600;cursor:pointer;transition:all .15s}
-.save-bar .btn-save:hover{opacity:.9}
-.toast-container{position:fixed;top:20px;right:20px;z-index:10000;display:flex;flex-direction:column;gap:8px}
-.toast-msg{padding:12px 20px;border-radius:var(--radius-md);font-size:.82rem;font-weight:500;box-shadow:0 4px 20px rgba(0,0,0,.15);animation:slideIn .3s}
+/* Sidebar tab buttons */
+.tab-btn{display:flex;align-items:center;gap:10px;width:100%;padding:11px 16px;font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;background:none;border:none;border-left:3px solid transparent;color:var(--on-surface-variant);cursor:pointer;transition:all .12s;text-align:left}
+.tab-btn:hover{background:var(--surface-container);color:var(--on-surface)}
+.tab-btn.active{background:var(--surface-lowest);color:var(--primary);border-left-color:var(--primary);font-weight:700}
+.tab-btn .tab-icon{font-size:18px;opacity:.8;flex-shrink:0}
+.tab-btn.active .tab-icon{opacity:1}
+
+/* Badges / chips */
+.badge,.chip{display:inline-block;font-size:.62rem;font-weight:700;letter-spacing:.04em;padding:2px 7px;text-transform:uppercase}
+.chip-success{background:var(--success-container);color:var(--success)}
+.chip-error{background:var(--error-container);color:var(--error)}
+.chip-warning{background:var(--warning-container);color:var(--warning)}
+.chip-info{background:var(--info-container);color:var(--info)}
+.chip-neutral{background:var(--surface-high);color:var(--on-surface-variant)}
+.chip-primary{background:var(--primary);color:#fff}
+/* keep legacy badge classes for JS-generated content */
+.badge.bg-success{background:var(--success-container)!important;color:var(--success)!important}
+.badge.bg-danger{background:var(--error-container)!important;color:var(--error)!important}
+.badge.bg-warning,.badge.bg-warning.text-dark{background:var(--warning-container)!important;color:var(--warning)!important}
+.badge.bg-info{background:var(--info-container)!important;color:var(--info)!important}
+.badge.bg-secondary{background:var(--surface-high)!important;color:var(--on-surface-variant)!important}
+.badge.bg-primary{background:var(--primary)!important;color:#fff!important}
+
+/* Live dot */
+.live-dot{width:8px;height:8px;border-radius:50%!important;display:inline-block;animation:pulse 1.5s infinite;flex-shrink:0}
+.live-dot.on{background:#1a7a4f}
+.live-dot.off{background:var(--error);animation:none}
+.live-dot.warn{background:#8a5700}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* Progress pipeline */
+.progress-pipeline{display:flex;gap:2px;align-items:center;margin:.6rem 0}
+.pip-seg{height:5px;transition:width .5s}
+.log-entry{font-size:.72rem;color:var(--on-surface-variant);padding:3px 8px;margin:2px 0;background:var(--surface-low);border-left:2px solid var(--outline-variant)}
+.log-entry.error{background:var(--error-container);border-left-color:var(--error)}
+.log-entry.success{background:var(--success-container);border-left-color:var(--success)}
+.ts{font-size:.65rem;color:var(--outline)}
+
+/* Toast */
+.toast-container{position:fixed;top:3.5rem;right:16px;z-index:10000;display:flex;flex-direction:column;gap:6px}
+.toast-msg{padding:10px 18px;font-size:.8rem;font-weight:500;box-shadow:0 4px 16px rgba(0,0,0,.18);animation:slideIn .25s;border-left:3px solid rgba(255,255,255,.4)}
 .toast-msg.success{background:var(--success);color:#fff}
 .toast-msg.error{background:var(--error);color:#fff}
+.toast-msg.info{background:var(--primary);color:#fff}
 @keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
-.status-banner-wrap{padding:14px 20px 0}
-.status-banner{background:var(--warning-container);color:var(--on-surface);border:1px solid rgba(138,103,0,.18);border-radius:var(--radius-lg);padding:12px 14px;box-shadow:var(--shadow-ambient)}
+
+/* Status banner */
+.status-banner-wrap{padding:8px 16px 0}
+.status-banner{background:var(--warning-container);color:var(--on-surface);border:1px solid rgba(138,87,0,.18);padding:10px 14px}
 .status-banner.hidden{display:none}
-.status-banner strong{font-family:var(--font-display);font-size:.82rem}
-.status-banner ul{margin:8px 0 0;padding-left:18px}
-.status-banner li{font-size:.8rem;line-height:1.5;margin-bottom:4px}
-.status-meta{font-size:.74rem;color:var(--on-surface-variant);margin-top:8px}
-.preview-table{font-size:.75rem;width:100%;border-collapse:collapse;margin-top:8px}
+.status-banner strong{font-size:.82rem;font-weight:700}
+.status-banner ul{margin:6px 0 0;padding-left:16px}
+.status-banner li{font-size:.78rem;line-height:1.5;margin-bottom:3px}
+.status-meta{font-size:.72rem;color:var(--on-surface-variant);margin-top:6px}
+
+/* Action buttons */
+.btn-act{display:inline-flex;align-items:center;gap:4px;padding:4px 11px;font-size:.73rem;font-weight:600;border:1px solid;cursor:pointer;transition:all .12s;text-transform:uppercase;letter-spacing:.04em}
+.btn-act-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-act-primary:hover{opacity:.88}
+.btn-act-success{background:var(--success);color:#fff;border-color:var(--success)}
+.btn-act-success:hover{opacity:.88}
+.btn-act-danger{background:none;color:var(--error);border-color:var(--error)}
+.btn-act-danger:hover{background:var(--error);color:#fff}
+.btn-act-neutral{background:none;color:var(--on-surface-variant);border-color:var(--outline-variant)}
+.btn-act-neutral:hover{background:var(--surface-high)}
+/* legacy Bootstrap compat — used in JS-generated table buttons */
+.btn{display:inline-flex;align-items:center;gap:3px;font-size:.73rem;font-weight:600;border:1px solid;cursor:pointer;transition:all .12s;padding:3px 10px}
+.btn-sm{padding:3px 9px;font-size:.7rem}
+.btn-success{background:var(--success);color:#fff;border-color:var(--success)}
+.btn-success:hover{opacity:.88}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-primary:hover{opacity:.88}
+.btn-outline-danger{background:none;color:var(--error);border-color:var(--error)}
+.btn-outline-danger:hover{background:var(--error);color:#fff}
+.btn-outline-primary{background:none;color:var(--primary);border-color:var(--primary)}
+.btn-outline-primary:hover{background:var(--primary);color:#fff}
+.btn-outline-secondary{background:none;color:var(--on-surface-variant);border-color:var(--outline-variant)}
+.btn-outline-secondary:hover{background:var(--surface-high)}
+.btn-close{background:none;border:none;font-size:1.2rem;cursor:pointer;color:var(--on-surface-variant);padding:0;line-height:1}
+
+/* Spinner */
+.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%!important;animation:spin .6s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Card containers for awaiting/sent */
+.awaiting-card{background:var(--surface-lowest);border:1px solid var(--outline-variant);border-left:3px solid var(--primary);margin-bottom:12px}
+.sent-card{background:var(--surface-lowest);border:1px solid var(--outline-variant);border-left:3px solid var(--success);margin-bottom:12px}
+.row-danger td{background:#fff0f0!important}
+.row-success td{background:#f0fff4!important}
+.row-warning td{background:#fffbeb!important}
+
+/* Bootstrap grid compat — used in render() JS */
+.row{display:flex;flex-wrap:wrap;gap:12px}.col-md-4{width:calc(33.333% - 8px);min-width:200px}.col-md-8{width:calc(66.666% - 4px)}.g-3,.row.g-3{gap:12px}
+.d-flex{display:flex}.align-items-center{align-items:center}.justify-content-between{justify-content:space-between}.flex-wrap{flex-wrap:wrap}.flex-column{flex-direction:column}.gap-1{gap:4px}.gap-2{gap:8px}.gap-3{gap:12px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-1{margin-top:4px}.mt-2{margin-top:8px}.ms-2{margin-left:8px}.ms-auto{margin-left:auto}.me-1{margin-right:4px}.me-2{margin-right:8px}.fw-bold{font-weight:700}.text-muted{color:var(--on-surface-variant)}.text-center{text-align:center}.py-4{padding:16px 0}.py-0{padding-top:0;padding-bottom:0}.px-1{padding-left:4px;padding-right:4px}.form-check-input{width:16px;height:16px;cursor:pointer}
+
+/* Form inputs */
+.form-control,.form-control-sm{width:100%;padding:6px 10px;border:1px solid var(--outline-variant);background:var(--surface-lowest);color:var(--on-surface);font-size:.82rem;font-family:var(--font-body);transition:border-color .15s}
+.form-control-sm{font-size:.78rem;padding:4px 9px}
+.form-control:focus,.form-control-sm:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(0,76,205,.12)}
+
+/* Settings */
+.settings-layout{display:flex;gap:0;min-height:500px}
+.settings-sidebar{width:210px;background:var(--surface-low);border-right:1px solid var(--outline-variant);padding:8px 0;flex-shrink:0}
+.settings-sidebar-btn{display:block;width:100%;text-align:left;background:none;border:none;border-left:3px solid transparent;padding:9px 18px;font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--on-surface-variant);cursor:pointer;transition:all .12s}
+.settings-sidebar-btn:hover{background:var(--surface-high);color:var(--on-surface)}
+.settings-sidebar-btn.active{background:var(--surface-lowest);color:var(--primary);font-weight:700;border-left-color:var(--primary)}
+.settings-main{flex:1;padding:20px 24px;background:var(--surface-lowest);overflow-y:auto;max-height:75vh}
+.settings-section{display:none}
+.settings-section.active{display:block}
+.settings-section h3{font-size:.95rem;font-weight:700;margin-bottom:4px;color:var(--on-surface);text-transform:uppercase;letter-spacing:.05em}
+.settings-section .section-desc{font-size:.78rem;color:var(--on-surface-variant);margin-bottom:18px}
+.settings-group{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--surface-high)}
+.settings-group:last-child{border-bottom:none}
+.settings-group label{display:block;font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--on-surface);margin-bottom:5px}
+.settings-group .help-text{font-size:.68rem;color:var(--outline);margin-top:3px}
+.settings-group input[type="text"],.settings-group input[type="number"],.settings-group input[type="email"],.settings-group input[type="tel"],.settings-group textarea,.settings-group select{width:100%;padding:7px 11px;border:1px solid var(--outline-variant);font-size:.82rem;background:var(--surface-lowest);color:var(--on-surface);transition:border-color .15s;font-family:var(--font-body)}
+.settings-group input:focus,.settings-group textarea:focus,.settings-group select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 2px rgba(0,76,205,.12)}
+.settings-group textarea{min-height:80px;resize:vertical}
+.settings-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.settings-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.list-manager{border:1px solid var(--outline-variant);padding:10px;background:var(--surface)}
+.list-manager .list-item{display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--surface-lowest);border:1px solid var(--surface-high);margin-bottom:4px;font-size:.78rem}
+.list-manager .list-item .remove-btn{background:none;border:none;color:var(--error);cursor:pointer;font-size:1rem;padding:0 4px;line-height:1}
+.list-manager .add-row{display:flex;gap:6px;margin-top:8px}
+.list-manager .add-row input{flex:1;padding:5px 9px;border:1px solid var(--outline-variant);font-size:.78rem}
+.list-manager .add-row button{padding:5px 13px;background:var(--primary);color:#fff;border:none;font-size:.75rem;cursor:pointer;font-weight:600}
+.save-bar{position:sticky;bottom:0;background:var(--surface-lowest);border-top:1px solid var(--surface-high);padding:10px 0;display:flex;justify-content:flex-end;gap:8px;z-index:10}
+.save-bar .btn-save{padding:7px 22px;background:var(--primary);color:#fff;border:none;font-size:.8rem;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.05em;transition:all .12s}
+.save-bar .btn-save:hover{opacity:.88}
+
+/* Preview/mapping tables */
+.preview-table{font-size:.72rem;width:100%;border-collapse:collapse;margin-top:8px}
 .preview-table th,.preview-table td{padding:4px 8px;border:1px solid var(--surface-high);text-align:left}
-.preview-table th{background:var(--surface-low);font-weight:600}
+.preview-table th{background:var(--surface-low);font-weight:700;text-transform:uppercase;letter-spacing:.04em;font-size:.65rem}
 .column-map-row{display:grid;grid-template-columns:1fr 80px;gap:8px;align-items:center;margin-bottom:6px}
-.column-map-row label{font-size:.78rem}
-.column-map-row input{width:80px;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem;text-align:center}
-.obj-list-item{border:1px solid var(--surface-high);border-radius:var(--radius-md);padding:10px;margin-bottom:8px;background:var(--surface-lowest)}
+.column-map-row label{font-size:.75rem}
+.column-map-row input{width:80px;padding:4px 8px;border:1px solid var(--outline-variant);font-size:.78rem;text-align:center}
+.obj-list-item{border:1px solid var(--surface-high);padding:10px;margin-bottom:8px;background:var(--surface-lowest)}
 .obj-list-item .obj-row{display:flex;gap:8px;margin-bottom:4px;align-items:center}
-.obj-list-item .obj-row label{font-size:.72rem;color:var(--on-surface-variant);min-width:60px}
-.obj-list-item .obj-row input{flex:1;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem}
+.obj-list-item .obj-row label{font-size:.7rem;color:var(--on-surface-variant);min-width:60px}
+.obj-list-item .obj-row input{flex:1;padding:4px 8px;border:1px solid var(--outline-variant);font-size:.78rem}
 </style>
 </head>
-<body>
+<body class="bg-[#f7f9fd] text-[#191c1f]">
 <!-- Toast container -->
 <div class="toast-container" id="toastContainer"></div>
 
-<!-- Header -->
-<div class="header">
-  <img src="/assets/favicon.png" alt="Sales Claw" style="width:28px;height:28px;object-fit:contain;margin-right:8px;vertical-align:middle">
-  <h1 style="display:inline;vertical-align:middle">Sales Claw</h1>
-  <span class="live-dot on" id="liveDot"></span>
-  <span style="color:rgba(255,255,255,.7);font-size:.7rem;font-weight:500;letter-spacing:.05em" id="liveLabel">${_t['app.live'] || 'LIVE'}</span>
-  <small style="color:rgba(255,255,255,.5);margin-left:auto;font-size:.72rem" id="lastUpdate"></small>
-  <button class="export-btn" onclick="showDocsModal()" title="${_t['app.docsTitle']}">
-    <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M1 2.828c.885-.37 2.154-.769 3.388-.893 1.33-.134 2.458.063 3.112.752v9.746c-.935-.53-2.12-.603-3.213-.493-1.18.12-2.37.461-3.287.811V2.828zm7.5-.141c.654-.689 1.782-.886 3.112-.752 1.234.124 2.503.523 3.388.893v9.923c-.918-.35-2.107-.692-3.287-.81-1.094-.111-2.278-.039-3.213.492V2.687zM8 1.783C7.015.936 5.587.81 4.287.94c-1.514.153-3.042.672-3.994 1.105A.5.5 0 0 0 0 2.5v11a.5.5 0 0 0 .707.455c.882-.4 2.303-.881 3.68-1.02 1.409-.142 2.59.087 3.223.877a.5.5 0 0 0 .78 0c.633-.79 1.814-1.019 3.222-.877 1.378.139 2.8.62 3.681 1.02A.5.5 0 0 0 16 13.5v-11a.5.5 0 0 0-.293-.455c-.952-.433-2.48-.952-3.994-1.105C10.413.809 8.985.936 8 1.783z"/></svg>
+<!-- Top App Bar -->
+<header style="position:fixed;top:0;left:0;right:0;height:48px;background:#fff;border-bottom:1px solid var(--outline-variant);display:flex;align-items:center;padding:0 16px;gap:12px;z-index:50">
+  <!-- Logo + wordmark (matches sidebar width) -->
+  <div style="display:flex;align-items:center;gap:8px;width:224px;flex-shrink:0;border-right:1px solid var(--outline-variant);height:100%;padding-right:16px">
+    <img src="/assets/favicon.png" alt="" style="width:22px;height:22px;object-fit:contain">
+    <span style="font-weight:800;font-size:.92rem;letter-spacing:-.3px;text-transform:uppercase;color:var(--on-surface)">Sales Claw</span>
+  </div>
+  <!-- Live status -->
+  <div style="display:flex;align-items:center;gap:6px;margin-right:4px">
+    <span class="material-symbols-outlined" style="font-size:16px;color:var(--outline)">sensors</span>
+    <span class="live-dot on" id="liveDot"></span>
+    <span style="font-size:.65rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--on-surface-variant)" id="liveLabel">${_t['app.live'] || 'LIVE'}</span>
+  </div>
+  <small style="font-size:.65rem;color:var(--outline);margin-right:auto;font-family:var(--font-mono)" id="lastUpdate"></small>
+  <!-- Claude status widget -->
+  <div id="claudeStatusWidget" style="display:flex;align-items:center;gap:6px;background:var(--surface-low);border:1px solid var(--outline-variant);padding:4px 10px;font-size:.72rem">
+    <span id="claudeStatusDot" class="live-dot" style="width:7px;height:7px"></span>
+    <span id="claudeStatusLabel" style="color:var(--on-surface-variant);white-space:nowrap">${_t['claude.status.checking'] || 'Checking...'}</span>
+    <button id="claudeActionBtn" onclick="claudeAction()" style="display:none;background:var(--primary);border:none;color:#fff;font-size:.68rem;padding:2px 8px;cursor:pointer;font-weight:600;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em"></button>
+  </div>
+  <!-- Icon buttons -->
+  <button onclick="showDocsModal()" title="${_t['app.docsTitle']}" style="display:flex;align-items:center;gap:4px;background:none;border:1px solid var(--outline-variant);padding:4px 10px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;color:var(--on-surface-variant);transition:all .12s" onmouseover="this.style.background='var(--surface-high)'" onmouseout="this.style.background='none'">
+    <span class="material-symbols-outlined" style="font-size:16px">description</span>
     ${_t['app.docs']}
   </button>
-  <div id="claudeStatusWidget" style="display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:6px;padding:4px 10px;font-size:.75rem">
-    <span id="claudeStatusDot" class="live-dot" style="width:8px;height:8px;flex-shrink:0"></span>
-    <span id="claudeStatusLabel" style="color:rgba(255,255,255,.7);white-space:nowrap">${_t['claude.status.checking'] || 'Checking...'}</span>
-    <button id="claudeActionBtn" onclick="claudeAction()" style="display:none;background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.35);border-radius:4px;color:#fff;font-size:.72rem;padding:2px 8px;cursor:pointer;white-space:nowrap"></button>
-  </div>
-  <button class="export-btn" onclick="location.href='/api/export'">
-    <svg width="14" height="14" fill="currentColor" viewBox="0 0 16 16"><path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/></svg>
-    ${_t['app.export'] || 'Export Excel'}
+  <button onclick="location.href='/api/export'" style="display:flex;align-items:center;gap:4px;background:none;border:1px solid var(--outline-variant);padding:4px 10px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;color:var(--on-surface-variant);transition:all .12s" onmouseover="this.style.background='var(--surface-high)'" onmouseout="this.style.background='none'">
+    <span class="material-symbols-outlined" style="font-size:16px">download</span>
+    ${_t['app.export'] || 'Export'}
   </button>
-</div>
+</header>
 
-<div class="status-banner-wrap">
+<!-- Left Sidebar -->
+<aside style="position:fixed;top:48px;left:0;width:240px;height:calc(100vh - 48px);background:#f8f9fb;border-right:1px solid var(--outline-variant);display:flex;flex-direction:column;z-index:40;overflow-y:auto">
+  <nav style="flex:1;padding:8px 0">
+    <button class="tab-btn active" data-tab="companies">
+      <span class="material-symbols-outlined tab-icon">table_view</span>
+      ${_t['tab.companies']}
+    </button>
+    <button class="tab-btn" data-tab="awaiting">
+      <span class="material-symbols-outlined tab-icon">pending_actions</span>
+      ${_t['tab.awaiting']}
+      <span style="margin-left:auto;background:var(--warning-container);color:var(--warning);font-size:.6rem;font-weight:700;padding:1px 6px;font-family:var(--font-mono)" id="awaitingCount">0</span>
+    </button>
+    <button class="tab-btn" data-tab="sent">
+      <span class="material-symbols-outlined tab-icon">mark_email_read</span>
+      ${_t['tab.sent']}
+    </button>
+    <button class="tab-btn" data-tab="logs">
+      <span class="material-symbols-outlined tab-icon">terminal</span>
+      ${_t['tab.logs']}
+      <span class="live-dot on" id="cliDot" style="margin-left:auto;width:7px;height:7px"></span>
+    </button>
+    <button class="tab-btn" data-tab="settings">
+      <span class="material-symbols-outlined tab-icon">settings</span>
+      ${_t['tab.settings']}
+    </button>
+  </nav>
+  <!-- Bottom status bar in sidebar -->
+  <div style="padding:10px 16px;border-top:1px solid var(--outline-variant);background:var(--surface-high)">
+    <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline);margin-bottom:4px">Last Update</div>
+    <div class="mono" style="font-size:.65rem;color:var(--on-surface-variant)" id="sidebarLastUpdate">—</div>
+  </div>
+</aside>
+
+<div class="status-banner-wrap" style="margin-left:240px;margin-top:48px">
   <div class="status-banner hidden" id="statusBanner"></div>
 </div>
 
@@ -476,49 +584,42 @@ tr.updated{animation:rowFlash .8s}
   </div>
 </div>
 
-<div class="container-fluid py-3">
+<!-- Main content area -->
+<main style="margin-left:240px;margin-top:48px;padding:16px;min-height:calc(100vh - 48px);background:var(--surface)">
+
   <!-- Stats cards -->
-  <div class="row mb-3 g-2" id="statsRow">
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:var(--primary)" id="s-approachable">-</div><div class="sl">${_t['stats.target']}</div></div></div>
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:var(--info)" id="s-hasFormUrl">-</div><div class="sl">${_t['stats.hasForm']}</div></div></div>
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:#6e5b9e" id="s-formFill">-</div><div class="sl">${_t['stats.filled']}</div></div></div>
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:var(--warning)" id="s-awaitingApproval">-</div><div class="sl">${_t['stats.awaiting']}</div></div></div>
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:var(--success)" id="s-submitted">-</div><div class="sl">${_t['stats.sent']}</div></div></div>
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:var(--error)" id="s-error">-</div><div class="sl">${_t['stats.error']}</div></div></div>
-    <div class="col"><div class="card sc p-2 text-center"><div class="sn" style="color:var(--outline-variant)" id="s-excluded">-</div><div class="sl">${_t['stats.excluded']}</div></div></div>
+  <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:12px" id="statsRow">
+    <div style="background:#fff;border-left:3px solid var(--primary);padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid var(--primary)"><div class="sn" style="color:var(--primary)" id="s-approachable">-</div><div class="sl">${_t['stats.target']}</div></div>
+    <div style="background:#fff;border-left:3px solid #0ea5e9;padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid #0ea5e9"><div class="sn" style="color:#0ea5e9" id="s-hasFormUrl">-</div><div class="sl">${_t['stats.hasForm']}</div></div>
+    <div style="background:#fff;border-left:3px solid #7c3aed;padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid #7c3aed"><div class="sn" style="color:#7c3aed" id="s-formFill">-</div><div class="sl">${_t['stats.filled']}</div></div>
+    <div style="background:#fff;padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid var(--warning)"><div class="sn" style="color:var(--warning)" id="s-awaitingApproval">-</div><div class="sl">${_t['stats.awaiting']}</div></div>
+    <div style="background:#fff;padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid var(--success)"><div class="sn" style="color:var(--success)" id="s-submitted">-</div><div class="sl">${_t['stats.sent']}</div></div>
+    <div style="background:#fff;padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid var(--error)"><div class="sn" style="color:var(--error)" id="s-error">-</div><div class="sl">${_t['stats.error']}</div></div>
+    <div style="background:#fff;padding:10px 12px;border:1px solid var(--outline-variant);border-left:3px solid var(--outline)"><div class="sn" style="color:var(--outline)" id="s-excluded">-</div><div class="sl">${_t['stats.excluded']}</div></div>
   </div>
 
   <!-- Progress pipeline -->
-  <div class="tc p-3 mb-3">
-    <div class="d-flex justify-content-between align-items-center mb-1">
-      <small class="fw-bold">${_t['progress.title']}</small>
-      <small class="text-muted" id="progressLabel">-</small>
+  <div style="background:#fff;border:1px solid var(--outline-variant);padding:10px 14px;margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <small style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface-variant)">${_t['progress.title']}</small>
+      <small style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="progressLabel">-</small>
     </div>
     <div class="progress-pipeline" id="pipeline">
-      <div class="pip-seg" style="background:#6c757d;flex:1"></div>
+      <div class="pip-seg" style="background:var(--outline-variant);flex:1"></div>
     </div>
-    <div class="d-flex gap-3 mt-1" style="font-size:.7rem;color:#888">
-      <span style="color:#0dcaf0">&#9632; ${_t['progress.hasForm']}</span>
+    <div style="display:flex;gap:12px;font-size:.62rem;color:var(--outline);flex-wrap:wrap">
+      <span style="color:#0ea5e9">&#9632; ${_t['progress.hasForm']}</span>
       <span style="color:#7c3aed">&#9632; ${_t['progress.filled']}</span>
       <span style="color:var(--warning)">&#9632; ${_t['progress.awaiting']}</span>
       <span style="color:var(--success)">&#9632; ${_t['progress.sent']}</span>
       <span style="color:var(--error)">&#9632; ${_t['progress.error']}</span>
-      <span style="color:var(--outline-variant)">&#9632; ${_t['progress.unprocessed']}</span>
+      <span style="color:var(--outline)">&#9632; ${_t['progress.unprocessed']}</span>
     </div>
-  </div>
-
-  <!-- Tabs -->
-  <div class="tab-nav">
-    <button class="tab-btn active" data-tab="companies">${_t['tab.companies']}</button>
-    <button class="tab-btn" data-tab="awaiting">${_t['tab.awaiting']} <span class="badge bg-warning text-dark" id="awaitingCount">0</span></button>
-    <button class="tab-btn" data-tab="sent">${_t['tab.sent']}</button>
-    <button class="tab-btn" data-tab="logs">${_t['tab.logs']}</button>
-    <button class="tab-btn" data-tab="settings">${_t['tab.settings']}</button>
   </div>
 
   <!-- Companies tab -->
   <div class="tab-content active" id="tab-companies">
-    <div class="mb-2 d-flex align-items-center flex-wrap gap-1">
+    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:8px">
       <button class="fb active" data-f="all">${_t['filter.all']}</button>
       <button class="fb" data-f="approachable">${_t['filter.target']}</button>
       <button class="fb" data-f="has-form">${_t['filter.hasForm']}</button>
@@ -526,11 +627,11 @@ tr.updated{animation:rowFlash .8s}
       <button class="fb" data-f="submitted">${_t['filter.sent']}</button>
       <button class="fb" data-f="error">${_t['filter.error']}</button>
       <button class="fb" data-f="excluded">${_t['filter.excluded']}</button>
-      <input type="text" id="q" class="form-control form-control-sm ms-2" style="width:200px;border-radius:20px" placeholder="${_t['filter.search']}">
+      <input type="text" id="q" class="form-control-sm" style="width:220px;margin-left:8px" placeholder="${_t['filter.search']}">
     </div>
-    <div class="tc p-3" style="overflow-x:auto">
-      <table class="table table-hover table-sm mb-0" id="mt">
-        <thead><tr style="border-bottom:2px solid #dee2e6"><th style="width:40px;cursor:pointer" onclick="sortTable('no')">${_t['th.no']} <span class="sort-icon" data-col="no"></span></th><th style="cursor:pointer" onclick="sortTable('name')">${_t['th.company']} <span class="sort-icon" data-col="name"></span></th><th style="cursor:pointer" onclick="sortTable('type')">${_t['th.type']} <span class="sort-icon" data-col="type"></span></th><th style="width:80px;cursor:pointer" onclick="sortTable('progress')">${_t['th.progress']} <span class="sort-icon" data-col="progress"></span></th><th style="width:60px;cursor:pointer" onclick="sortTable('sent')">${_t['th.sent']} <span class="sort-icon" data-col="sent"></span></th><th>${_t['th.formUrl']}</th><th style="width:200px">${_t['th.message']}</th><th style="width:100px">${_t['th.action']}</th></tr></thead>
+    <div style="background:#fff;border:1px solid var(--outline-variant);overflow-x:auto">
+      <table class="main-table" id="mt">
+        <thead><tr><th style="width:44px;cursor:pointer" onclick="sortTable('no')">${_t['th.no']} <span class="sort-icon" data-col="no"></span></th><th style="cursor:pointer" onclick="sortTable('name')">${_t['th.company']} <span class="sort-icon" data-col="name"></span></th><th style="cursor:pointer" onclick="sortTable('type')">${_t['th.type']} <span class="sort-icon" data-col="type"></span></th><th style="width:90px;cursor:pointer" onclick="sortTable('progress')">${_t['th.progress']} <span class="sort-icon" data-col="progress"></span></th><th style="width:64px;cursor:pointer" onclick="sortTable('sent')">${_t['th.sent']} <span class="sort-icon" data-col="sent"></span></th><th>${_t['th.formUrl']}</th><th style="width:200px">${_t['th.message']}</th><th style="width:110px">${_t['th.action']}</th></tr></thead>
         <tbody id="companyBody"></tbody>
       </table>
     </div>
@@ -538,10 +639,10 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- Awaiting tab -->
   <div class="tab-content" id="tab-awaiting">
-    <div class="tc p-3">
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <p class="text-muted mb-0" style="font-size:.85rem">${_t['awaiting.description']}</p>
-        <div class="d-flex gap-2 align-items-center">
+    <div style="background:#fff;border:1px solid var(--outline-variant);padding:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
+        <p style="font-size:.8rem;color:var(--on-surface-variant);margin:0">${_t['awaiting.description']}</p>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
           <button class="btn btn-sm btn-outline-primary" onclick="toggleAllAwaiting()">${_t['action.selectAll']}</button>
           <button class="btn btn-sm btn-success" onclick="bulkApprove('sent')">${_t['action.bulkSent']}</button>
           <button class="btn btn-sm btn-primary" onclick="bulkAiSubmit()">${_t['action.bulkAiSubmit']}</button>
@@ -554,13 +655,13 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- Sent tab -->
   <div class="tab-content" id="tab-sent">
-    <div class="tc p-3">
-      <div class="d-flex align-items-center flex-wrap gap-2 mb-3">
-        <input type="text" id="sentSearch" class="form-control form-control-sm" style="width:200px;border-radius:20px" placeholder="${_t['sent.search']}">
-        <button class="btn btn-sm btn-outline-secondary fb-sent active" data-sf="all">${_t['sent.all']}</button>
-        <button class="btn btn-sm btn-outline-success fb-sent" data-sf="1">${_t['sent.firstOnly']}</button>
-        <button class="btn btn-sm btn-outline-info fb-sent" data-sf="2+">${_t['sent.multipleOnly']}</button>
-        <small class="text-muted ms-auto" id="sentCount">0 items</small>
+    <div style="background:#fff;border:1px solid var(--outline-variant);padding:16px">
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:12px">
+        <input type="text" id="sentSearch" class="form-control-sm" style="width:220px" placeholder="${_t['sent.search']}">
+        <button class="fb-sent fb active" data-sf="all">${_t['sent.all']}</button>
+        <button class="fb-sent fb" data-sf="1">${_t['sent.firstOnly']}</button>
+        <button class="fb-sent fb" data-sf="2+">${_t['sent.multipleOnly']}</button>
+        <small style="margin-left:auto;font-size:.72rem;color:var(--outline);font-family:var(--font-mono)" id="sentCount">0 items</small>
       </div>
       <div id="sentList"></div>
     </div>
@@ -568,22 +669,22 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- CLI Activity tab -->
   <div class="tab-content" id="tab-logs">
-    <div class="tc p-3">
-      <div class="mb-3">
-        <div class="d-flex justify-content-between align-items-center mb-2">
-          <div class="d-flex align-items-center gap-2">
-            <span class="live-dot on" id="cliDot"></span>
-            <small style="font-weight:600;color:var(--on-surface)">${_t['cli.stream']}</small>
+    <div style="background:#fff;border:1px solid var(--outline-variant);padding:16px">
+      <div style="margin-bottom:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="material-symbols-outlined" style="font-size:16px;color:var(--outline)">terminal</span>
+            <small style="font-weight:700;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface)">${_t['cli.stream']}</small>
           </div>
-          <small class="text-muted" id="cliLastEvent">-</small>
+          <small style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="cliLastEvent">-</small>
         </div>
-        <div id="cliStream" style="background:var(--on-surface);color:#e0e0e0;border-radius:var(--radius-lg);padding:12px;font-family:var(--font-terminal,monospace);font-size:.72rem;line-height:1.6;max-height:250px;overflow-y:auto;white-space:pre-wrap"></div>
+        <div id="cliStream" style="background:#0d1117;color:#e6edf3;padding:12px;font-family:var(--font-mono);font-size:.72rem;line-height:1.6;max-height:260px;overflow-y:auto;white-space:pre-wrap;border:1px solid #21262d"></div>
       </div>
-      <div class="d-flex justify-content-between align-items-center mb-2">
-        <small style="font-weight:600;color:var(--on-surface)">${_t['cli.actionLog']}</small>
-        <small class="text-muted" id="logCount">0 items</small>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <small style="font-weight:700;font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface)">${_t['cli.actionLog']}</small>
+        <small style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="logCount">0 items</small>
       </div>
-      <table class="table table-sm mb-0">
+      <table class="main-table">
         <thead><tr><th>${_t['cli.datetime']}</th><th>${_t['th.no']}</th><th>${_t['cli.companyName']}</th><th>${_t['cli.actionType']}</th><th>${_t['cli.details']}</th></tr></thead>
         <tbody id="logBody"></tbody>
       </table>
@@ -592,7 +693,7 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- Settings tab -->
   <div class="tab-content" id="tab-settings">
-    <div class="tc settings-layout">
+    <div style="background:#fff;border:1px solid var(--outline-variant)" class="settings-layout">
       <div class="settings-sidebar">
         <button class="settings-sidebar-btn active" data-section="companyProfile">${_t['settings.companyProfile']}</button>
         <button class="settings-sidebar-btn" data-section="valuePropositions">${_t['settings.valuePropositions']}</button>
@@ -1121,7 +1222,7 @@ tr.updated{animation:rowFlash .8s}
       </div>
     </div>
   </div>
-</div>
+</main>
 
 <script>
 const LANG = '${_lang}';
@@ -1433,7 +1534,9 @@ function render(data){
     }).join('');
   }
 
-  document.getElementById('lastUpdate').textContent=t('app.lastUpdate')+': '+new Date().toLocaleString('ja-JP');
+  const _ts = new Date().toLocaleString('ja-JP');
+  document.getElementById('lastUpdate').textContent=t('app.lastUpdate')+': '+_ts;
+  const _sl=document.getElementById('sidebarLastUpdate');if(_sl)_sl.textContent=_ts;
   updatePipeline(stats);
 }
 
