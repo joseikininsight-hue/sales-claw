@@ -11,13 +11,17 @@ const { readRuntime, toClientHost, writeRuntime, clearRuntime } = require('./das
 const settings = require('./settings-manager.cjs');
 const { getTranslations, t: i18nT } = require('./i18n.cjs');
 const { findAvailablePort } = require('./port-utils.cjs');
-const { getTargetPreview, readTargetList } = require('./target-list.cjs');
+const { appendCompany, findCompaniesByNos, getTargetPreview, importTargetList, readTargetList } = require('./target-list.cjs');
+const { getTargetMap, setTargets } = require('./outreach-targets.cjs');
+const { enqueueCompanies, getQueueMap } = require('./outreach-queue.cjs');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const DATA_DIR = path.join(PROJECT_ROOT, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'action-log.json');
 const CONTACT_HISTORY_FILE = path.join(DATA_DIR, 'contact-history.json');
 const AI_QUEUE_FILE = path.join(DATA_DIR, 'ai-submit-queue.json');
+const OUTREACH_QUEUE_FILE = path.join(DATA_DIR, 'outreach-queue.json');
+const OUTREACH_TARGETS_FILE = path.join(DATA_DIR, 'outreach-targets.json');
 
 // SSE クライアント管理
 const sseClients = new Set();
@@ -94,6 +98,8 @@ function refreshWatchTargets() {
     { path: LOG_FILE, mode: 'file' },
     { path: CONTACT_HISTORY_FILE, mode: 'file' },
     { path: AI_QUEUE_FILE, mode: 'file' },
+    { path: OUTREACH_QUEUE_FILE, mode: 'file' },
+    { path: OUTREACH_TARGETS_FILE, mode: 'file' },
     { path: settingsPath, mode: 'file' },
     { path: screenshotDir, mode: 'dir' },
     ...(targetPath ? [{ path: targetPath, mode: 'file' }] : []),
@@ -164,6 +170,8 @@ function loadData() {
   const targetData = readTargetList();
   const data = targetData.ok ? targetData.companies : [];
   const allLogs = getAllLogs();
+  const outreachTargets = getTargetMap();
+  const outreachQueue = getQueueMap();
   const logsByCompany = {};
   const nameToNo = {};
   data.forEach(row => {
@@ -219,12 +227,19 @@ function loadData() {
     const confirmLog = getLatestLog(logs, 'confirm_reached');
     const contactHist = getHistory(no);
     const contactCount = contactHist ? contactHist.contacts.length : 0;
+    const targetMeta = outreachTargets.get(String(no)) || null;
+    const queueMeta = outreachQueue.get(String(no)) || null;
 
     return {
       no, status, name: row.companyName || '', type: row.type || '',
       url: row.url || '', formUrl: row.formUrl || '',
       captcha: row.captcha || '', progress: row.progress || '',
       isApproachable,
+      isOutreachTarget: !!targetMeta,
+      targetedAt: targetMeta ? targetMeta.addedAt : null,
+      outreachStatus: queueMeta ? queueMeta.status : null,
+      outreachDetail: queueMeta ? queueMeta.detail : null,
+      outreachUpdatedAt: queueMeta ? queueMeta.updatedAt : null,
       lastAction: lastLog ? lastLog.action : null,
       lastActionAt: lastLog ? lastLog.timestamp : null,
       lastLog,
@@ -270,6 +285,15 @@ function jsonResponse(res, statusCode, data) {
     'Cache-Control': 'no-store',
   });
   res.end(JSON.stringify(data));
+}
+
+function spawnDetachedWorker(scriptFileName) {
+  const { spawn } = require('child_process');
+  const child = spawn('node', [path.join(__dirname, scriptFileName)], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
 }
 
 // HTML テンプレート
@@ -483,6 +507,20 @@ tr.updated{animation:rowFlash .8s}
 .obj-list-item .obj-row{display:flex;gap:8px;margin-bottom:4px;align-items:center}
 .obj-list-item .obj-row label{font-size:.7rem;color:var(--on-surface-variant);min-width:60px}
 .obj-list-item .obj-row input{flex:1;padding:4px 8px;border:1px solid var(--outline-variant);font-size:.78rem}
+.company-toolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.bulk-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.company-meta{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.checkbox-cell{text-align:center;width:34px}
+.modal-shell{position:fixed;top:0;left:0;width:100%;height:100%;padding:18px;background:rgba(0,0,0,.5);z-index:9998;display:none;align-items:center;justify-content:center}
+.modal-shell.open{display:flex}
+.modal-panel{background:var(--surface-lowest);border:1px solid var(--outline-variant);width:min(760px,100%);max-height:90vh;overflow-y:auto;box-shadow:0 10px 28px rgba(0,0,0,.24)}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--surface-high)}
+.modal-head h3{margin:0;font-size:.92rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em}
+.modal-body{padding:18px}
+.modal-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.modal-grid-full{grid-column:1/-1}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;padding:0 18px 18px}
+@media (max-width: 840px){.modal-grid{grid-template-columns:1fr}.company-toolbar{flex-direction:column}.bulk-toolbar{justify-content:flex-start}}
 </style>
 </head>
 <body class="bg-[#f7f9fd] text-[#191c1f]">
@@ -584,6 +622,57 @@ tr.updated{animation:rowFlash .8s}
   </div>
 </div>
 
+<input type="file" id="companyImportInput" accept=".xlsx,.csv" style="display:none">
+
+<div id="companyFormModal" class="modal-shell">
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h3>${_t['companyModal.title'] || 'Add Company'}</h3>
+      <button class="btn-close" onclick="closeCompanyFormModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-grid">
+        <div class="settings-group">
+          <label>${_t['field.companyName']}</label>
+          <input type="text" id="new-companyName" placeholder="${_t['ph.companyName']}">
+        </div>
+        <div class="settings-group">
+          <label>${_t['field.type'] || (_lang === 'ja' ? '種別' : 'Type')}</label>
+          <input type="text" id="new-type" placeholder="${_lang === 'ja' ? '例: SIer / SaaS / 製造' : 'e.g. SIer / SaaS / Manufacturing'}">
+        </div>
+        <div class="settings-group">
+          <label>${_t['field.website']}</label>
+          <input type="text" id="new-url" placeholder="https://example.com">
+        </div>
+        <div class="settings-group">
+          <label>${_t['field.colFormUrl']}</label>
+          <input type="text" id="new-formUrl" placeholder="https://example.com/contact">
+        </div>
+        <div class="settings-group">
+          <label>${_t['field.colStatus']}</label>
+          <input type="text" id="new-status" placeholder="${_lang === 'ja' ? '例: ○ / 空欄' : 'e.g. target'}">
+        </div>
+        <div class="settings-group">
+          <label>${_t['field.colProgress']}</label>
+          <input type="text" id="new-progress" placeholder="${_lang === 'ja' ? '任意' : 'Optional'}">
+        </div>
+        <div class="settings-group modal-grid-full">
+          <label>${_t['field.colNotes']}</label>
+          <textarea id="new-notes" placeholder="${_lang === 'ja' ? '社内メモや補足' : 'Internal note'}"></textarea>
+        </div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:.8rem;font-weight:600;color:var(--on-surface)">
+        <input type="checkbox" id="new-addTarget" checked style="width:16px;height:16px">
+        ${_t['companyModal.addToTarget'] || 'Add this company to outreach targets'}
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline-secondary" onclick="closeCompanyFormModal()">${_t['companyModal.cancel'] || 'Cancel'}</button>
+      <button class="btn btn-primary" onclick="submitCompanyForm()">${_t['companyModal.submit'] || 'Add Company'}</button>
+    </div>
+  </div>
+</div>
+
 <!-- Main content area -->
 <main style="margin-left:240px;margin-top:48px;padding:16px;min-height:calc(100vh - 48px);background:var(--surface)">
 
@@ -619,19 +708,30 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- Companies tab -->
   <div class="tab-content active" id="tab-companies">
-    <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:8px">
-      <button class="fb active" data-f="all">${_t['filter.all']}</button>
-      <button class="fb" data-f="approachable">${_t['filter.target']}</button>
-      <button class="fb" data-f="has-form">${_t['filter.hasForm']}</button>
-      <button class="fb" data-f="no-form">${_t['filter.noForm']}</button>
-      <button class="fb" data-f="submitted">${_t['filter.sent']}</button>
-      <button class="fb" data-f="error">${_t['filter.error']}</button>
-      <button class="fb" data-f="excluded">${_t['filter.excluded']}</button>
-      <input type="text" id="q" class="form-control-sm" style="width:220px;margin-left:8px" placeholder="${_t['filter.search']}">
+    <div class="company-toolbar">
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+        <button class="fb active" data-f="all">${_t['filter.all']}</button>
+        <button class="fb" data-f="approachable">${_t['filter.target']}</button>
+        <button class="fb" data-f="targeted">${_t['filter.targeted'] || '営業対象'}</button>
+        <button class="fb" data-f="has-form">${_t['filter.hasForm']}</button>
+        <button class="fb" data-f="no-form">${_t['filter.noForm']}</button>
+        <button class="fb" data-f="submitted">${_t['filter.sent']}</button>
+        <button class="fb" data-f="error">${_t['filter.error']}</button>
+        <button class="fb" data-f="excluded">${_t['filter.excluded']}</button>
+        <input type="text" id="q" class="form-control-sm" style="width:220px;margin-left:8px" placeholder="${_t['filter.search']}">
+      </div>
+      <div class="bulk-toolbar">
+        <button class="btn btn-outline-primary btn-sm" onclick="triggerCompanyImport()">${_t['action.importTargets'] || 'Import Excel/CSV'}</button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="openCompanyFormModal()">${_t['action.addCompany'] || 'Add Company'}</button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="toggleAllCompanies()">${_t['action.selectAll']}</button>
+        <button class="btn btn-outline-primary btn-sm" onclick="markSelectedTargets(true)">${_t['action.markTarget'] || 'Mark Target'}</button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="markSelectedTargets(false)">${_t['action.unmarkTarget'] || 'Unmark Target'}</button>
+        <button class="btn btn-primary btn-sm" onclick="prepareSelectedOutreach()">${_t['action.prepareOutreach'] || 'Prepare Outreach'}</button>
+      </div>
     </div>
     <div style="background:#fff;border:1px solid var(--outline-variant);overflow-x:auto">
       <table class="main-table" id="mt">
-        <thead><tr><th style="width:44px;cursor:pointer" onclick="sortTable('no')">${_t['th.no']} <span class="sort-icon" data-col="no"></span></th><th style="cursor:pointer" onclick="sortTable('name')">${_t['th.company']} <span class="sort-icon" data-col="name"></span></th><th style="cursor:pointer" onclick="sortTable('type')">${_t['th.type']} <span class="sort-icon" data-col="type"></span></th><th style="width:90px;cursor:pointer" onclick="sortTable('progress')">${_t['th.progress']} <span class="sort-icon" data-col="progress"></span></th><th style="width:64px;cursor:pointer" onclick="sortTable('sent')">${_t['th.sent']} <span class="sort-icon" data-col="sent"></span></th><th>${_t['th.formUrl']}</th><th style="width:200px">${_t['th.message']}</th><th style="width:110px">${_t['th.action']}</th></tr></thead>
+        <thead><tr><th class="checkbox-cell"><input type="checkbox" id="companySelectAll" class="form-check-input" onclick="toggleAllCompanies(this.checked)"></th><th style="width:44px;cursor:pointer" onclick="sortTable('no')">${_t['th.no']} <span class="sort-icon" data-col="no"></span></th><th style="cursor:pointer" onclick="sortTable('name')">${_t['th.company']} <span class="sort-icon" data-col="name"></span></th><th style="cursor:pointer" onclick="sortTable('type')">${_t['th.type']} <span class="sort-icon" data-col="type"></span></th><th style="width:120px;cursor:pointer" onclick="sortTable('progress')">${_t['th.progress']} <span class="sort-icon" data-col="progress"></span></th><th style="width:64px;cursor:pointer" onclick="sortTable('sent')">${_t['th.sent']} <span class="sort-icon" data-col="sent"></span></th><th>${_t['th.formUrl']}</th><th style="width:220px">${_t['th.message']}</th><th style="width:150px">${_t['th.action']}</th></tr></thead>
         <tbody id="companyBody"></tbody>
       </table>
     </div>
@@ -639,50 +739,55 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- Awaiting tab -->
   <div class="tab-content" id="tab-awaiting">
-    <div style="background:#fff;border:1px solid var(--outline-variant);padding:16px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
-        <p style="font-size:.8rem;color:var(--on-surface-variant);margin:0">${_t['awaiting.description']}</p>
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-sm btn-outline-primary" onclick="toggleAllAwaiting()">${_t['action.selectAll']}</button>
-          <button class="btn btn-sm btn-success" onclick="bulkApprove('sent')">${_t['action.bulkSent']}</button>
-          <button class="btn btn-sm btn-primary" onclick="bulkAiSubmit()">${_t['action.bulkAiSubmit']}</button>
-          <button class="btn btn-sm btn-outline-danger" onclick="bulkSkipWithFeedback()">${_t['action.bulkSkip']}</button>
-        </div>
+    <div style="background:#fff;border:1px solid var(--outline-variant);border-bottom:2px solid var(--primary);padding:10px 16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="material-symbols-outlined" style="font-size:16px;color:var(--primary)">pending_actions</span>
+        <span style="font-size:.75rem;color:var(--on-surface-variant)">${_t['awaiting.description']}</span>
       </div>
-      <div id="awaitingList"></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-sm btn-outline-primary" onclick="toggleAllAwaiting()">${_t['action.selectAll']}</button>
+        <button class="btn btn-sm btn-success" onclick="bulkApprove('sent')">${_t['action.bulkSent']}</button>
+        <button class="btn btn-sm btn-primary" onclick="bulkAiSubmit()">${_t['action.bulkAiSubmit']}</button>
+        <button class="btn btn-sm btn-outline-danger" onclick="bulkSkipWithFeedback()">${_t['action.bulkSkip']}</button>
+      </div>
     </div>
+    <div id="awaitingList" style="padding:16px;background:var(--surface-low)"></div>
   </div>
 
   <!-- Sent tab -->
   <div class="tab-content" id="tab-sent">
-    <div style="background:#fff;border:1px solid var(--outline-variant);padding:16px">
-      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:12px">
-        <input type="text" id="sentSearch" class="form-control-sm" style="width:220px" placeholder="${_t['sent.search']}">
-        <button class="fb-sent fb active" data-sf="all">${_t['sent.all']}</button>
-        <button class="fb-sent fb" data-sf="1">${_t['sent.firstOnly']}</button>
-        <button class="fb-sent fb" data-sf="2+">${_t['sent.multipleOnly']}</button>
-        <small style="margin-left:auto;font-size:.72rem;color:var(--outline);font-family:var(--font-mono)" id="sentCount">0 items</small>
-      </div>
-      <div id="sentList"></div>
+    <div style="background:#fff;border:1px solid var(--outline-variant);border-bottom:2px solid #198038;padding:10px 16px;display:flex;align-items:center;flex-wrap:wrap;gap:8px">
+      <span class="material-symbols-outlined" style="font-size:16px;color:#198038">mark_email_read</span>
+      <input type="text" id="sentSearch" class="form-control-sm" style="width:200px" placeholder="${_t['sent.search']}">
+      <button class="fb-sent fb active" data-sf="all">${_t['sent.all']}</button>
+      <button class="fb-sent fb" data-sf="1">${_t['sent.firstOnly']}</button>
+      <button class="fb-sent fb" data-sf="2+">${_t['sent.multipleOnly']}</button>
+      <small style="margin-left:auto;font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="sentCount">0 items</small>
     </div>
+    <div id="sentList" style="padding:16px;background:var(--surface-low)"></div>
   </div>
 
   <!-- CLI Activity tab -->
   <div class="tab-content" id="tab-logs">
-    <div style="background:#fff;border:1px solid var(--outline-variant);padding:16px">
-      <div style="margin-bottom:14px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <div style="display:flex;align-items:center;gap:8px">
-            <span class="material-symbols-outlined" style="font-size:16px;color:var(--outline)">terminal</span>
-            <small style="font-weight:700;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface)">${_t['cli.stream']}</small>
-          </div>
-          <small style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="cliLastEvent">-</small>
+    <!-- Terminal -->
+    <div style="background:#0d1117;border:1px solid #21262d">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;background:#161b22;border-bottom:1px solid #21262d">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="material-symbols-outlined" style="font-size:16px;color:#3fb950">terminal</span>
+          <span style="font-family:var(--font-mono);font-size:.7rem;font-weight:700;color:#e6edf3;letter-spacing:.06em">${_t['cli.stream']}</span>
         </div>
-        <div id="cliStream" style="background:#0d1117;color:#e6edf3;padding:12px;font-family:var(--font-mono);font-size:.72rem;line-height:1.6;max-height:260px;overflow-y:auto;white-space:pre-wrap;border:1px solid #21262d"></div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span style="font-family:var(--font-mono);font-size:.65rem;color:#8b949e" id="cliLastEvent">—</span>
+          <button onclick="document.getElementById('cliStream').innerHTML=''" style="background:none;border:1px solid #30363d;color:#8b949e;font-size:.63rem;padding:2px 10px;cursor:pointer;font-family:var(--font-mono);letter-spacing:.05em">CLEAR</button>
+        </div>
       </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <small style="font-weight:700;font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface)">${_t['cli.actionLog']}</small>
-        <small style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="logCount">0 items</small>
+      <div id="cliStream" style="background:#0d1117;color:#c9d1d9;padding:14px 16px;font-family:var(--font-mono);font-size:.72rem;line-height:1.9;min-height:340px;max-height:440px;overflow-y:auto;white-space:pre-wrap"></div>
+    </div>
+    <!-- Activity log table -->
+    <div style="background:#fff;border:1px solid var(--outline-variant);border-top:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant)">
+        <span style="font-weight:700;font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface)">${_t['cli.actionLog']}</span>
+        <span style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="logCount">0 items</span>
       </div>
       <table class="main-table">
         <thead><tr><th>${_t['cli.datetime']}</th><th>${_t['th.no']}</th><th>${_t['cli.companyName']}</th><th>${_t['cli.actionType']}</th><th>${_t['cli.details']}</th></tr></thead>
@@ -1336,6 +1441,237 @@ function showToast(message, type) {
   setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity .3s'; setTimeout(() => toast.remove(), 300); }, 3000);
 }
 
+let selectedCompanyNos = new Set();
+
+function rowMatchesCurrentFilter(tr) {
+  if (currentFilter === 'all') return true;
+  if (currentFilter === 'approachable') return tr.dataset.f !== 'excluded';
+  if (currentFilter === 'targeted') return tr.dataset.targeted === '1';
+  return tr.dataset.f === currentFilter;
+}
+
+function applyCompanyFilters() {
+  const q = (document.getElementById('q').value || '').toLowerCase();
+  document.querySelectorAll('#mt tbody tr').forEach((tr) => {
+    const matchQ = !q || (tr.dataset.n || '').includes(q) || (tr.dataset.type || '').includes(q);
+    tr.style.display = (matchQ && rowMatchesCurrentFilter(tr)) ? '' : 'none';
+  });
+  syncCompanySelectionUi();
+}
+
+function syncCompanySelectionUi() {
+  document.querySelectorAll('.company-select').forEach((checkbox) => {
+    checkbox.checked = selectedCompanyNos.has(String(checkbox.dataset.no));
+  });
+
+  const visibleCheckboxes = Array.from(document.querySelectorAll('.company-select')).filter((checkbox) => {
+    const row = checkbox.closest('tr');
+    return row && row.style.display !== 'none';
+  });
+  const allVisibleChecked = visibleCheckboxes.length > 0 && visibleCheckboxes.every((checkbox) => selectedCompanyNos.has(String(checkbox.dataset.no)));
+  const master = document.getElementById('companySelectAll');
+  if (master) master.checked = allVisibleChecked;
+}
+
+function toggleCompanySelection(companyNo, checked) {
+  const key = String(companyNo);
+  if (checked) selectedCompanyNos.add(key);
+  else selectedCompanyNos.delete(key);
+  syncCompanySelectionUi();
+}
+
+function toggleAllCompanies(forceChecked) {
+  const visibleCheckboxes = Array.from(document.querySelectorAll('.company-select')).filter((checkbox) => {
+    const row = checkbox.closest('tr');
+    return row && row.style.display !== 'none';
+  });
+  const nextChecked = typeof forceChecked === 'boolean'
+    ? forceChecked
+    : !(visibleCheckboxes.length > 0 && visibleCheckboxes.every((checkbox) => checkbox.checked));
+  visibleCheckboxes.forEach((checkbox) => {
+    const key = String(checkbox.dataset.no);
+    if (nextChecked) selectedCompanyNos.add(key);
+    else selectedCompanyNos.delete(key);
+  });
+  syncCompanySelectionUi();
+}
+
+function getSelectedCompanyNos() {
+  return Array.from(selectedCompanyNos).map((value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : value;
+  });
+}
+
+function openCompanyFormModal() {
+  ['companyName', 'type', 'url', 'formUrl', 'status', 'progress', 'notes'].forEach((field) => {
+    const input = document.getElementById('new-' + field);
+    if (input) input.value = '';
+  });
+  const addTarget = document.getElementById('new-addTarget');
+  if (addTarget) addTarget.checked = true;
+  document.getElementById('companyFormModal').classList.add('open');
+}
+
+function closeCompanyFormModal() {
+  document.getElementById('companyFormModal').classList.remove('open');
+}
+
+document.getElementById('companyFormModal').addEventListener('click', function (event) {
+  if (event.target === this) closeCompanyFormModal();
+});
+
+async function submitCompanyForm() {
+  const companyName = (document.getElementById('new-companyName').value || '').trim();
+  if (!companyName) {
+    showToast(t('companyModal.companyRequired') || 'Company name is required.', 'error');
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/companies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        companyName,
+        type: document.getElementById('new-type').value,
+        url: document.getElementById('new-url').value,
+        formUrl: document.getElementById('new-formUrl').value,
+        status: document.getElementById('new-status').value,
+        progress: document.getElementById('new-progress').value,
+        notes: document.getElementById('new-notes').value,
+        addToTarget: document.getElementById('new-addTarget').checked,
+      }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to add company.');
+
+    closeCompanyFormModal();
+    showToast(t('companyModal.added') || 'Company added.', 'success');
+    refreshData();
+  } catch (e) {
+    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
+  }
+}
+
+function triggerCompanyImport() {
+  const input = document.getElementById('companyImportInput');
+  input.value = '';
+  input.click();
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+document.getElementById('companyImportInput').addEventListener('change', async (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+
+  try {
+    showToast((t('action.importTargets') || 'Importing') + ': ' + file.name, 'info');
+    const contentBase64 = arrayBufferToBase64(await file.arrayBuffer());
+    const res = await fetch('/api/target-list/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName: file.name, contentBase64 }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || 'Import failed.');
+
+    showToast((t('companyImport.success') || 'Imported') + ': ' + (result.companyCount || 0), 'success');
+    refreshData();
+    loadTargetPreview().catch(() => {});
+  } catch (e) {
+    showToast((t('companyImport.failed') || 'Import failed') + ': ' + e.message, 'error');
+  } finally {
+    event.target.value = '';
+  }
+});
+
+async function markSelectedTargets(active) {
+  const companyNos = getSelectedCompanyNos();
+  if (companyNos.length === 0) {
+    alert(t('alert.selectCompanies'));
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/outreach-targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ companyNos, active }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to update targets.');
+    showToast(active ? (t('target.updatedOn') || 'Outreach targets updated.') : (t('target.updatedOff') || 'Outreach targets removed.'), 'success');
+    refreshData();
+  } catch (e) {
+    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
+  }
+}
+
+async function prepareSelectedOutreach() {
+  const companyNos = getSelectedCompanyNos();
+  if (companyNos.length === 0) {
+    alert(t('alert.selectCompanies'));
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/outreach/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ companyNos }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to start outreach preparation.');
+    showToast(t('outreach.queueStarted', { count: result.queuedCount || 0 }), 'success');
+    refreshData();
+  } catch (e) {
+    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
+  }
+}
+
+async function prepareOutreach(companyNo, companyName) {
+  if (!confirm(t('outreach.prepareConfirm', { company: companyName }))) return;
+  selectedCompanyNos.add(String(companyNo));
+  syncCompanySelectionUi();
+  try {
+    const res = await fetch('/api/outreach/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ companyNos: [companyNo] }),
+    });
+    const result = await res.json();
+    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to queue outreach.');
+    showToast(t('outreach.singleQueued', { company: companyName }), 'success');
+    refreshData();
+  } catch (e) {
+    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
+  }
+}
+
+function outreachStatusBadge(status, detail) {
+  if (!status) return '';
+  const label = status === 'pending' ? (t('outreach.status.pending') || 'Queued')
+    : status === 'processing' ? (t('outreach.status.processing') || 'Processing')
+    : status === 'awaiting_approval' ? (t('outreach.status.awaiting') || 'Awaiting')
+    : status === 'error' ? (t('outreach.status.error') || 'Error')
+    : esc(status);
+  const className = status === 'error' ? 'chip chip-error'
+    : status === 'awaiting_approval' ? 'chip chip-warning'
+    : status === 'processing' ? 'chip chip-info'
+    : 'chip chip-primary';
+  return '<span class="' + className + '" title="' + esc(detail || label) + '">' + label + '</span>';
+}
+
 let renderVersion = 0;
 let refreshInFlight = false;
 let pendingRefresh = false;
@@ -1452,9 +1788,14 @@ function render(data){
   const lbody=document.getElementById('logBody');
   lbody.innerHTML=recentLogs.map(l=>{
     const t=new Date(l.timestamp).toLocaleString('ja-JP');
-    const cls=l.action==='error'?'table-danger':l.action==='submitted'?'table-success':l.action==='confirm_reached'?'table-warning':'';
+    const actionBg={error:'#da1e28',submitted:'#198038',confirm_reached:'#f59e0b',analyzing:'#0043ce',form_fill:'#6929c4',skip:'#6f6f6f'};
+    const bg=actionBg[l.action]||'#393939';
+    const fgDark=['confirm_reached'];
+    const fg=fgDark.includes(l.action)?'#000':'#fff';
     const d=typeof l.details==='object'?JSON.stringify(l.details):l.details||'';
-    return'<tr class="'+cls+'"><td class="ts">'+t+'</td><td>'+l.companyNo+'</td><td>'+esc(l.companyName)+'</td><td><code>'+esc(l.action)+'</code></td><td><small>'+esc(d).substring(0,120)+'</small></td></tr>';
+    return'<tr><td class="ts">'+t+'</td><td>'+l.companyNo+'</td><td>'+esc(l.companyName)+'</td>'
+      +'<td><span style="background:'+bg+';color:'+fg+';font-size:.62rem;font-weight:700;padding:1px 8px;letter-spacing:.04em;white-space:nowrap">'+esc(l.action)+'</span></td>'
+      +'<td><small style="color:var(--on-surface-variant)">'+esc(d).substring(0,120)+'</small></td></tr>';
   }).join('');
 
   // Awaiting list
@@ -1470,20 +1811,33 @@ function render(data){
     awEl.innerHTML=awaitingCompanies.map(c=>{
       const date=c.awaitingAt?new Date(c.awaitingAt).toLocaleString('ja-JP'):'-';
       const msg=esc(c.sentMessage||'').split(String.fromCharCode(10)).join('<br>');
-      const ssConfirm='<img src="'+screenshotUrl('ss-'+c.no+'-confirm.png')+'" style="width:140px;height:auto;object-fit:contain;border:1px solid #ddd;border-radius:4px;cursor:pointer" onclick="window.open(this.src)" onerror="this.src=\\x27'+screenshotUrl('ss-'+c.no+'-input.png')+'\\x27;this.onerror=function(){this.style.display=\\x27none\\x27}" alt="Confirm screenshot">';
+      const ssConfirm='<img src="'+screenshotUrl('ss-'+c.no+'-confirm.png')+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" onerror="this.src=\\x27'+screenshotUrl('ss-'+c.no+'-input.png')+'\\x27;this.onerror=function(){this.style.display=\\x27none\\x27}" alt="Confirm screenshot">';
       const cname=esc(c.name).replace(/'/g,"\\'");
-      return'<div class="mb-3 p-3 awaiting-card" data-no="'+c.no+'" data-name="'+cname+'" style="background:#fffbeb;border:1px solid #fbbf24;border-radius:8px">'
-        +'<div class="d-flex justify-content-between align-items-center mb-2">'
-        +'<div class="d-flex align-items-center gap-2"><input type="checkbox" class="form-check-input awaiting-check" data-no="'+c.no+'" style="width:18px;height:18px;cursor:pointer"><span class="badge bg-warning text-dark">'+t('awaiting.badge')+'</span><strong>'+esc(c.name)+'</strong> <small class="text-muted">'+esc(c.type)+'</small></div>'
-        +'<small class="text-muted">'+date+'</small></div>'
-        +'<div class="row g-3"><div class="col-md-4 mb-2">'+ssConfirm+'</div>'
-        +'<div class="col-md-8"><div style="font-size:.82rem;background:#fff;padding:12px;border-radius:6px;border:1px solid #e9ecef;white-space:pre-wrap;line-height:1.6;max-height:250px;overflow-y:auto">'+msg+'</div></div></div>'
-        +'<div class="mt-2 d-flex gap-2 align-items-center flex-wrap">'
+      return'<div class="awaiting-card" data-no="'+c.no+'" data-name="'+cname+'" style="background:#fff;border:1px solid var(--outline-variant);border-left:3px solid var(--primary);margin-bottom:12px">'
+        +'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant);background:var(--surface-low)">'
+        +'<div style="display:flex;align-items:center;gap:10px">'
+        +'<input type="checkbox" class="form-check-input awaiting-check" data-no="'+c.no+'" style="width:16px;height:16px;cursor:pointer">'
+        +'<span style="background:#f59e0b;color:#000;font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('awaiting.badge')+'</span>'
+        +'<strong style="font-size:.88rem">'+esc(c.name)+'</strong>'
+        +'<span style="font-size:.72rem;color:var(--on-surface-variant);background:var(--surface-container);padding:2px 8px">'+esc(c.type)+'</span>'
+        +'</div>'
+        +'<span style="font-size:.7rem;color:var(--on-surface-variant);font-family:var(--font-mono)">'+date+'</span>'
+        +'</div>'
+        +'<div style="display:flex">'
+        +'<div style="width:200px;min-width:200px;border-right:1px solid var(--outline-variant);overflow-y:auto;max-height:400px;padding:10px;background:var(--surface-lowest)">'
+        +ssConfirm
+        +'</div>'
+        +'<div style="flex:1;padding:14px 16px;display:flex;flex-direction:column;gap:12px">'
+        +'<div style="font-size:.82rem;background:var(--surface-low);padding:12px;white-space:pre-wrap;line-height:1.7;max-height:300px;overflow-y:auto;border:1px solid var(--outline-variant)">'+msg+'</div>'
+        +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--outline-variant)">'
         +'<button class="btn btn-success btn-sm" onclick="approveCompany('+c.no+',\\x27'+cname+'\\x27,\\x27sent\\x27)">'+t('action.markSent')+'</button>'
         +'<button class="btn btn-primary btn-sm" onclick="aiSubmit('+c.no+',\\x27'+cname+'\\x27)">'+t('action.aiSubmit')+'</button>'
         +'<button class="btn btn-outline-danger btn-sm" onclick="skipWithFeedback('+c.no+',\\x27'+cname+'\\x27)">'+t('action.skip')+'</button>'
-        +'<small class="text-muted ms-2">'+t('awaiting.sentTo')+': <a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></small>'
-        +'</div></div>';
+        +'<small style="margin-left:auto;font-size:.7rem;color:var(--outline)"><a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></small>'
+        +'</div>'
+        +'</div>'
+        +'</div>'
+        +'</div>';
     }).join('');
   }
 
@@ -1496,40 +1850,57 @@ function render(data){
   }else{
     sentEl.innerHTML=sentCompanies.map(c=>{
       const count=c.contactCount||1;
-      const countBadge=count>=2?'<span class="badge bg-info ms-1">'+count+'x</span>':'<span class="badge bg-secondary ms-1">1st</span>';
+      const countBadge=count>=2?'<span style="background:#0052dd;color:#fff;font-size:.62rem;font-weight:700;padding:1px 8px;margin-left:4px">'+count+'x</span>':'<span style="background:#6f6f6f;color:#fff;font-size:.62rem;font-weight:700;padding:1px 8px;margin-left:4px">1st</span>';
       let historyHtml='';
       if(c.contactHistory&&c.contactHistory.length>0){
-        historyHtml='<div class="mt-2" style="border-top:1px solid #e9ecef;padding-top:8px"><small class="fw-bold text-muted">'+t('sent.contactHistory')+'</small>';
+        historyHtml='<div style="margin-top:12px;border-top:1px solid var(--outline-variant);padding-top:10px">'
+          +'<div style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface-variant);margin-bottom:8px">'+t('sent.contactHistory')+'</div>'
+          +'<div style="position:relative;padding-left:20px">'
+          +'<div style="position:absolute;left:6px;top:4px;bottom:4px;width:1px;background:var(--outline-variant)"></div>';
         historyHtml+=c.contactHistory.map((h,i)=>{
           const d=new Date(h.date).toLocaleString('ja-JP');
-          const resp=h.response?'<span class="badge bg-'+(h.response==='replied'||h.response==='\\u8fd4\\u4fe1\\u3042\\u308a'?'success':h.response==='meeting'||h.response==='\\u5546\\u8ac7\\u8a2d\\u5b9a'?'primary':'secondary')+'">'+esc(h.response)+'</span>':'<span class="badge bg-light text-dark">'+t('sent.replyWaiting')+'</span>';
-          const msgPreview=esc(h.message||'').substring(0,100)+'...';
-          return'<div class="mt-1 p-2" style="background:#f8f9fa;border-radius:4px;font-size:.78rem">'
-            +'<div class="d-flex justify-content-between"><span><strong>#'+(i+1)+'</strong> '+d+'</span>'+resp+'</div>'
-            +'<div class="text-muted mt-1" style="cursor:pointer" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\\x27none\\x27?\\x27block\\x27:\\x27none\\x27">'+msgPreview+' <u>'+t('sent.showFull')+'</u></div>'
-            +'<div style="display:none;white-space:pre-wrap;background:#fff;padding:8px;border-radius:4px;border:1px solid #e9ecef;margin-top:4px;max-height:200px;overflow-y:auto">'+esc(h.message||'').split(String.fromCharCode(10)).join('<br>')+'</div>'
-            +(h.notes?'<div class="text-muted mt-1">Note: '+esc(h.notes)+'</div>':'')
+          let respBg='#6f6f6f',respText=t('sent.replyWaiting');
+          if(h.response==='replied'||h.response==='\u8fd4\u4fe1\u3042\u308a'){respBg='#198038';respText=h.response;}
+          else if(h.response==='meeting'||h.response==='\u5546\u8ac7\u8a2d\u5b9a'){respBg='#0052dd';respText=h.response;}
+          else if(h.response){respBg='#8a3800';respText=h.response;}
+          const resp='<span style="background:'+respBg+';color:#fff;font-size:.6rem;font-weight:700;padding:1px 7px;letter-spacing:.04em">'+esc(respText)+'</span>';
+          return'<div style="position:relative;margin-bottom:8px;background:var(--surface-low);border:1px solid var(--outline-variant);padding:8px 12px">'
+            +'<div style="position:absolute;left:-17px;top:50%;transform:translateY(-50%);width:8px;height:8px;background:var(--primary)"></div>'
+            +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+            +'<span style="font-size:.72rem;font-family:var(--font-mono);font-weight:700;color:var(--on-surface)">#'+(i+1)+'</span>'
+            +'<div style="display:flex;align-items:center;gap:8px">'+resp+'<span style="font-size:.65rem;color:var(--on-surface-variant);font-family:var(--font-mono)">'+d+'</span></div>'
+            +'</div>'
+            +'<div style="font-size:.75rem;color:var(--on-surface-variant);cursor:pointer" onclick="var n=this.nextElementSibling;n.style.display=n.style.display===\\x27none\\x27?\\x27block\\x27:\\x27none\\x27">'+esc(h.message||'').substring(0,80)+'... <span style="color:var(--primary)">'+t('sent.showFull')+'</span></div>'
+            +'<div style="display:none;white-space:pre-wrap;background:#fff;padding:8px;border:1px solid var(--outline-variant);margin-top:6px;font-size:.78rem;max-height:180px;overflow-y:auto">'+esc(h.message||'').split(String.fromCharCode(10)).join('<br>')+'</div>'
+            +(h.notes?'<div style="margin-top:4px;font-size:.7rem;color:var(--on-surface-variant)">Note: '+esc(h.notes)+'</div>':'')
             +'</div>';
         }).join('');
-        historyHtml+='</div>';
+        historyHtml+='</div></div>';
       }
       const date=new Date(c.sentAt).toLocaleString('ja-JP');
       const msg=esc(c.sentMessage||'').split(String.fromCharCode(10)).join('<br>');
-      const ssInput='<img src="'+screenshotUrl('ss-'+c.no+'-input.png')+'" style="width:120px;height:auto;object-fit:contain;border:1px solid #ddd;border-radius:4px;cursor:pointer" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Input screenshot">';
-      const ssConfirm='<img src="'+screenshotUrl('ss-'+c.no+'-confirm.png')+'" style="width:120px;height:auto;object-fit:contain;border:1px solid #ddd;border-radius:4px;cursor:pointer" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Confirm screenshot">';
-      return'<div class="mb-3 p-3 sent-card" data-sn="'+esc(c.name).toLowerCase()+' '+esc(c.type).toLowerCase()+'" data-sc="'+count+'" style="background:#f8fdf8;border:1px solid #c3e6cb;border-radius:8px">'
-        +'<div class="d-flex justify-content-between align-items-center mb-2">'
-        +'<div><span class="badge bg-success me-2">'+t('sent.badge')+'</span>'+countBadge+'<strong class="ms-1">'+esc(c.name)+'</strong> <small class="text-muted">'+esc(c.type)+'</small></div>'
-        +'<small class="text-muted">Last: '+date+'</small></div>'
-        +'<div class="row g-3"><div class="col-md-8">'
-        +'<div style="font-size:.82rem;background:#fff;padding:12px;border-radius:6px;border:1px solid #e9ecef;white-space:pre-wrap;line-height:1.6;max-height:300px;overflow-y:auto">'+msg+'</div>'
-        +'</div><div class="col-md-4">'
-        +'<div class="d-flex flex-column gap-1">'+ssInput+ssConfirm+'</div>'
-        +'</div></div>'
-        +'<div class="mt-2 d-flex justify-content-between align-items-center" style="font-size:.75rem;color:#888">'
-        +'<span>Target: <a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></span>'
+      const ssInput='<img src="'+screenshotUrl('ss-'+c.no+'-input.png')+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant);margin-bottom:6px" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Input screenshot">';
+      const ssConfirm='<img src="'+screenshotUrl('ss-'+c.no+'-confirm.png')+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Confirm screenshot">';
+      return'<div class="sent-card" data-sn="'+esc(c.name).toLowerCase()+' '+esc(c.type).toLowerCase()+'" data-sc="'+count+'" style="background:#fff;border:1px solid var(--outline-variant);border-left:3px solid #198038;margin-bottom:12px">'
+        +'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant);background:var(--surface-low)">'
+        +'<div style="display:flex;align-items:center;gap:6px">'
+        +'<span style="background:#198038;color:#fff;font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('sent.badge')+'</span>'
+        +countBadge
+        +'<strong style="font-size:.88rem;margin-left:4px">'+esc(c.name)+'</strong>'
+        +'<span style="font-size:.72rem;color:var(--on-surface-variant);background:var(--surface-container);padding:2px 8px">'+esc(c.type)+'</span>'
         +'</div>'
+        +'<span style="font-size:.7rem;color:var(--on-surface-variant);font-family:var(--font-mono)">Last: '+date+'</span>'
+        +'</div>'
+        +'<div style="display:flex">'
+        +'<div style="flex:1;padding:14px 16px">'
+        +'<div style="font-size:.82rem;background:var(--surface-low);padding:12px;white-space:pre-wrap;line-height:1.7;max-height:240px;overflow-y:auto;border:1px solid var(--outline-variant)">'+msg+'</div>'
         +historyHtml
+        +'<div style="margin-top:8px;font-size:.7rem;color:var(--outline)"><a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></div>'
+        +'</div>'
+        +'<div style="width:160px;min-width:160px;border-left:1px solid var(--outline-variant);padding:10px;background:var(--surface-lowest);overflow-y:auto;max-height:400px">'
+        +ssInput+ssConfirm
+        +'</div>'
+        +'</div>'
         +'</div>';
     }).join('');
   }
@@ -1759,15 +2130,16 @@ pollClaudeStatus();
 _claudeStatusTimer = setInterval(pollClaudeStatus, 10000);
 
 // CLI log stream
-const cliColors={info:'#8bc5ed',action:'#4ade80',error:'#f87171',warn:'#fbbf24',step:'#a78bfa'};
+const cliColors={info:'#8bc5ed',action:'#3fb950',error:'#f85149',warn:'#e3b341',step:'#d2a8ff'};
+const cliLabels={info:'INF',action:'ACT',error:'ERR',warn:'WRN',step:'STP'};
 function appendCliLog(msg,type,time){
   const el=document.getElementById('cliStream');
-  const t=time?new Date(time).toLocaleTimeString('ja-JP'):'';
-  const color=cliColors[type]||'#e0e0e0';
-  const prefix=type==='error'?'[ERROR] ':type==='action'?'[ACTION] ':type==='step'?'[STEP] ':type==='warn'?'[WARN] ':'';
-  el.innerHTML+='<span style="color:#666">'+t+'</span> <span style="color:'+color+'">'+prefix+esc(msg)+'</span>'+String.fromCharCode(10);
+  const ts=time?new Date(time).toLocaleTimeString('ja-JP'):'';
+  const color=cliColors[type]||'#c9d1d9';
+  const label=cliLabels[type]||'LOG';
+  el.innerHTML+='<span style="color:#484f58;user-select:none">'+ts+'</span> <span style="background:'+color+';color:#0d1117;font-size:.62rem;font-weight:700;padding:0 5px;vertical-align:middle">'+label+'</span> <span style="color:'+color+'">'+esc(msg)+'</span>'+String.fromCharCode(10);
   el.scrollTop=el.scrollHeight;
-  document.getElementById('cliLastEvent').textContent=t;
+  document.getElementById('cliLastEvent').textContent=ts;
   const lines=el.innerHTML.split(String.fromCharCode(10));
   if(lines.length>500)el.innerHTML=lines.slice(-300).join(String.fromCharCode(10));
 }
@@ -2584,6 +2956,129 @@ const server = http.createServer(async (req, res) => {
       jsonResponse(res, 200, { headers: preview.headers, rows: preview.rows });
     } catch (e) {
       jsonResponse(res, 200, { error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/target-list/import - import Excel/CSV and switch target list
+  if (req.url === '/api/target-list/import' && req.method === 'POST') {
+    try {
+      const data = await parseJsonBody(req);
+      const { fileName, contentBase64 } = data || {};
+      if (!fileName || !contentBase64) {
+        jsonResponse(res, 400, { ok: false, error: 'fileName and contentBase64 are required.' });
+        return;
+      }
+
+      const imported = importTargetList({
+        fileName,
+        buffer: Buffer.from(contentBase64, 'base64'),
+      });
+
+      if (!imported.ok) {
+        jsonResponse(res, 400, { ok: false, error: imported.error || 'Import failed.' });
+        return;
+      }
+
+      refreshWatchTargets();
+      notifyClients({ type: 'update', reason: 'target-list-imported', time: Date.now() });
+      jsonResponse(res, 200, { ok: true, ...imported });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/companies - add a company row to current target list
+  if (req.url === '/api/companies' && req.method === 'POST') {
+    try {
+      const data = await parseJsonBody(req);
+      const created = appendCompany(data || {});
+      if (!created.ok) {
+        jsonResponse(res, 400, { ok: false, error: created.error || 'Company add failed.' });
+        return;
+      }
+
+      if (data && data.addToTarget) {
+        setTargets([{
+          companyNo: created.company.no,
+          companyName: created.company.companyName,
+        }], true);
+      }
+
+      refreshWatchTargets();
+      notifyClients({ type: 'update', reason: 'company-added', time: Date.now() });
+      jsonResponse(res, 200, { ok: true, company: created.company, targetPath: created.targetPath });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/outreach-targets - persist outreach target selection
+  if (req.url === '/api/outreach-targets' && req.method === 'POST') {
+    try {
+      const data = await parseJsonBody(req);
+      const companyNos = Array.isArray(data && data.companyNos) ? data.companyNos : [];
+      const active = data && data.active !== false;
+      if (companyNos.length === 0) {
+        jsonResponse(res, 400, { ok: false, error: 'companyNos is required.' });
+        return;
+      }
+
+      const found = findCompaniesByNos(companyNos);
+      if (!found.ok) {
+        jsonResponse(res, 400, { ok: false, error: found.error || 'Target companies not found.' });
+        return;
+      }
+
+      const targets = found.companies.map((company) => ({
+        companyNo: company.no,
+        companyName: company.companyName,
+      }));
+      setTargets(targets, active);
+      notifyClients({ type: 'update', reason: 'outreach-targets-updated', time: Date.now() });
+      jsonResponse(res, 200, { ok: true, count: targets.length, active });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/outreach/prepare - queue selected companies for outreach preparation
+  if (req.url === '/api/outreach/prepare' && req.method === 'POST') {
+    try {
+      const data = await parseJsonBody(req);
+      const companyNos = Array.isArray(data && data.companyNos) ? data.companyNos : [];
+      if (companyNos.length === 0) {
+        jsonResponse(res, 400, { ok: false, error: 'companyNos is required.' });
+        return;
+      }
+
+      const found = findCompaniesByNos(companyNos);
+      if (!found.ok) {
+        jsonResponse(res, 400, { ok: false, error: found.error || 'Target companies not found.' });
+        return;
+      }
+
+      const companies = found.companies.map((company) => ({
+        companyNo: company.no,
+        companyName: company.companyName,
+      }));
+      setTargets(companies, true);
+      const queued = enqueueCompanies(companies);
+      if (queued.length > 0) {
+        spawnDetachedWorker('outreach-runner.cjs');
+      }
+
+      notifyClients({ type: 'update', reason: 'outreach-queued', time: Date.now() });
+      jsonResponse(res, 200, {
+        ok: true,
+        queuedCount: queued.length,
+        skippedCount: companies.length - queued.length,
+      });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
     }
     return;
   }

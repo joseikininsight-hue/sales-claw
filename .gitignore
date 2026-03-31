@@ -7,8 +7,12 @@ data/action-log.json
 data/contact-history.json
 data/emails.json
 data/ai-submit-queue.json
+data/outreach-queue.json
+data/outreach-targets.json
+data/outreach-runner.lock
 data/skip-feedback.json
 data/dashboard-runtime.json
+data/imports/
 data/outlook-session/
 data/batch*.json
 data/queue.json
