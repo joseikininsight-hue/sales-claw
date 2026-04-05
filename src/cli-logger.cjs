@@ -3,14 +3,28 @@
 const http = require('http');
 const { getRequestTarget } = require('./dashboard-runtime.cjs');
 
+function toLogRank(type) {
+  const key = String(type || 'info').toLowerCase();
+  if (key === 'debug') return 10;
+  if (key === 'info' || key === 'step' || key === 'action') return 20;
+  if (key === 'warn' || key === 'warning') return 30;
+  if (key === 'error') return 40;
+  return 20;
+}
+
 function log(message, type) {
   type = type || 'info';
 
   let target = { hostname: '127.0.0.1', port: 3765 };
+  let enabled = true;
   try {
     const settings = require('./settings-manager.cjs');
     target = getRequestTarget(settings.getHost(), settings.getPort());
+    const configured = settings.getSection('preferences').logLevel || 'info';
+    enabled = toLogRank(type) >= toLogRank(configured);
   } catch (e) {}
+
+  if (!enabled) return;
 
   const payload = JSON.stringify({ message, type });
   try {

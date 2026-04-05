@@ -2,18 +2,21 @@
 
 const fs = require('fs');
 const path = require('path');
+const { resolveDataPath } = require('./data-paths.cjs');
 
-const FILE_PATH = path.join(__dirname, '../data', 'outreach-targets.json');
+function getTargetsFile() {
+  return resolveDataPath('outreach-targets.json');
+}
 
 function ensureDataDir() {
-  const dir = path.dirname(FILE_PATH);
+  const dir = path.dirname(getTargetsFile());
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
 function loadTargets() {
   ensureDataDir();
   try {
-    const raw = JSON.parse(fs.readFileSync(FILE_PATH, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(getTargetsFile(), 'utf8'));
     if (Array.isArray(raw)) return raw;
     return [];
   } catch {
@@ -23,7 +26,7 @@ function loadTargets() {
 
 function saveTargets(entries) {
   ensureDataDir();
-  fs.writeFileSync(FILE_PATH, JSON.stringify(entries, null, 2), 'utf8');
+  fs.writeFileSync(getTargetsFile(), JSON.stringify(entries, null, 2), 'utf8');
 }
 
 function getTargetMap() {
@@ -61,7 +64,7 @@ function setTargets(companies, active = true) {
 }
 
 module.exports = {
-  FILE_PATH,
+  getTargetsFile,
   getTargetMap,
   loadTargets,
   saveTargets,

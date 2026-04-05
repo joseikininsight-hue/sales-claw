@@ -3,10 +3,11 @@ productName: Sales Claw
 copyright: MIT License
 
 # 自動更新: GitHub Releases から配信
+# Release CI で GH_OWNER / GH_REPO を設定して、fork 先に誤配信しないようにする
 publish:
   provider: github
-  owner: joseikininsight-hue
-  repo: sales-claw
+  owner: ${env.GH_OWNER}
+  repo: ${env.GH_REPO}
 
 # asar無効でファイルパスをシンプルに
 asar: false
@@ -14,6 +15,15 @@ asar: false
 directories:
   output: dist
   buildResources: assets
+
+extraResources:
+  - from: assets
+    to: assets
+    filter:
+      - favicon.png
+      - icon.png
+      - icon.ico
+      - tray.png
 
 # パッケージに含めるファイル
 files:
@@ -26,9 +36,11 @@ files:
   - "!data/action-log.json"
   - "!data/contact-history.json"
   - "!data/dashboard-runtime.json"
-  - "!data/outreach-queue.json"
+  - "!data/dashboard-start.*"
+  - "!data/live-monitor.json"
+  - "!data/update-status.json"
   - "!data/outreach-targets.json"
-  - "!data/outreach-runner.lock"
+  - "!data/claude-prompts/**"
   - "!data/imports/**"
   - "!data/*.csv"
   - "data/sample-targets.csv"
@@ -36,6 +48,10 @@ files:
   - "!*.log"
   - "!tmp/**"
   - "!temp/**"
+  - "!launch-silent.vbs"
+  - "!launch.sh"
+  - "!.claude/settings.local.json"
+  - "!assets/名称未設定のデザイン.png"
 
 # Windows インストーラー (NSIS)
 # artifactName でハイフン区切りに固定 → latest.yml と GitHub アセット名を一致させる

@@ -3,9 +3,23 @@
 // ダッシュボードUI・各モジュールがここを通じて設定を読み書きする
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
-const SETTINGS_FILE = path.join(__dirname, '../data', 'settings.json');
+const PROJECT_ROOT = path.join(__dirname, '..');
+const STATIC_DATA_DIR = path.join(__dirname, '../data');
+const LEGACY_SETTINGS_FILE = path.join(STATIC_DATA_DIR, 'settings.json');
+const SAMPLE_SETTINGS_FILE = path.join(STATIC_DATA_DIR, 'sample-settings.json');
+const DEFAULT_SETTINGS_DIR = path.join(getRuntimeRoot(), 'data');
+const SETTINGS_FILE = path.join(DEFAULT_SETTINGS_DIR, 'settings.json');
+
+function getRuntimeRoot() {
+  const configured = typeof process.env.SALES_CLAW_USER_DATA_DIR === 'string'
+    ? process.env.SALES_CLAW_USER_DATA_DIR.trim()
+    : '';
+  const base = configured || path.join(os.homedir(), '.sales-claw');
+  return path.resolve(base);
+}
 
 const DEFAULT_SETTINGS = {
   // === 会社プロフィール（詳細） ===
@@ -106,6 +120,9 @@ const DEFAULT_SETTINGS = {
     },
     // 問い合わせ種別（フォームのドロップダウン値候補）
     inquiryTypes: ['その他', 'お問い合わせ', '協業・パートナーシップ', 'サービスについて', 'その他のお問い合わせ'],
+    // 営業アプローチ方針（AI への内部指示）
+    approachObjective: '',
+    approachGuardrails: '',
     // 締め文
     closingLine: 'もしご興味がございましたら、30分程度の情報交換の場をいただけないでしょうか。\n貴社のお取り組みについてもお伺いできればと存じます。',
     // 挨拶文
@@ -148,6 +165,13 @@ const DEFAULT_SETTINGS = {
     headless: true,               // ヘッドレスモード
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     locale: 'ja-JP',
+    aiProvider: 'claude',
+    aiModels: {
+      claude: 'claude-sonnet-4-6',
+      codex: '',
+      gemini: '',
+    },
+    claudeModel: 'claude-sonnet-4-6',
     // ログ
     logLevel: 'info',             // 'debug' | 'info' | 'warn' | 'error'
     maxLogEntries: 10000,         // ログの最大保持件数
@@ -160,25 +184,76 @@ const DEFAULT_SETTINGS = {
 
 // --- Core Functions ---
 
-function ensureDataDir() {
-  const dir = path.join(__dirname, '../data');
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+function ensureDataDir(dirPath = DEFAULT_SETTINGS_DIR) {
+  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function load() {
-  ensureDataDir();
+function readSettingsFile(filePath) {
   try {
-    const raw = fs.readFileSync(SETTINGS_FILE, 'utf-8');
-    const saved = JSON.parse(raw);
-    return deepMerge(structuredClone(DEFAULT_SETTINGS), saved);
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   } catch {
-    return structuredClone(DEFAULT_SETTINGS);
+    return null;
   }
 }
 
+function readLegacyClaudeModel() {
+  try {
+    const legacySettingsPath = path.join(PROJECT_ROOT, '.claude', 'settings.local.json');
+    const parsed = JSON.parse(fs.readFileSync(legacySettingsPath, 'utf-8'));
+    const model = typeof parsed.model === 'string' ? parsed.model.trim() : '';
+    return model || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveConfiguredDataDir(configured) {
+  const value = typeof configured === 'string' ? configured.trim() : '';
+  if (!value) return DEFAULT_SETTINGS_DIR;
+  return path.isAbsolute(value) ? value : path.join(getRuntimeRoot(), value);
+}
+
+function getBootstrapSettings() {
+  return readSettingsFile(SETTINGS_FILE) || readSettingsFile(LEGACY_SETTINGS_FILE);
+}
+
+function getActiveSettingsFile() {
+  const bootstrap = getBootstrapSettings();
+  const dataDir = resolveConfiguredDataDir(bootstrap && bootstrap.preferences && bootstrap.preferences.dataDir);
+  return path.join(dataDir, 'settings.json');
+}
+
+function load() {
+  ensureDataDir(DEFAULT_SETTINGS_DIR);
+  const activeSettingsFile = getActiveSettingsFile();
+  const saved = readSettingsFile(activeSettingsFile)
+    || readSettingsFile(SETTINGS_FILE)
+    || readSettingsFile(LEGACY_SETTINGS_FILE)
+    || readSettingsFile(SAMPLE_SETTINGS_FILE);
+  const merged = normalizeSettings(deepMerge(structuredClone(DEFAULT_SETTINGS), saved || {}));
+  const legacyClaudeModel = readLegacyClaudeModel();
+  if (!merged.preferences.aiModels.claude && legacyClaudeModel) {
+    merged.preferences.aiModels.claude = legacyClaudeModel;
+  }
+  if (!merged.preferences.claudeModel && legacyClaudeModel) {
+    merged.preferences.claudeModel = legacyClaudeModel;
+  }
+  return merged;
+}
+
 function save(settings) {
-  ensureDataDir();
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
+  const normalized = normalizeSettings(settings);
+  const configuredDir = resolveConfiguredDataDir(normalized && normalized.preferences && normalized.preferences.dataDir);
+  const configuredFile = path.join(configuredDir, 'settings.json');
+  const payload = JSON.stringify(normalized, null, 2);
+
+  ensureDataDir(DEFAULT_SETTINGS_DIR);
+  ensureDataDir(configuredDir);
+
+  fs.writeFileSync(configuredFile, payload, 'utf-8');
+  if (path.resolve(configuredFile) !== path.resolve(SETTINGS_FILE)) {
+    fs.writeFileSync(SETTINGS_FILE, payload, 'utf-8');
+  }
 }
 
 function getAll() {
@@ -293,17 +368,59 @@ function getHost() {
 
 function getScreenshotDir() {
   const dir = getSection('preferences').screenshotDir || 'screenshots';
-  return path.isAbsolute(dir) ? dir : path.join(__dirname, '..', dir);
+  return path.isAbsolute(dir) ? dir : path.join(getRuntimeRoot(), dir);
+}
+
+function normalizeSettings(input) {
+  const settings = input && typeof input === 'object' ? input : structuredClone(DEFAULT_SETTINGS);
+  if (!settings.preferences || typeof settings.preferences !== 'object') {
+    settings.preferences = structuredClone(DEFAULT_SETTINGS.preferences);
+  }
+
+  const prefs = settings.preferences;
+  const aiProvider = typeof prefs.aiProvider === 'string' && prefs.aiProvider.trim()
+    ? prefs.aiProvider.trim().toLowerCase()
+    : 'claude';
+  prefs.aiProvider = ['claude', 'codex', 'gemini'].includes(aiProvider) ? aiProvider : 'claude';
+
+  const aiModels = prefs.aiModels && typeof prefs.aiModels === 'object' && !Array.isArray(prefs.aiModels)
+    ? { ...prefs.aiModels }
+    : {};
+  aiModels.claude = typeof aiModels.claude === 'string' ? aiModels.claude : '';
+  aiModels.codex = typeof aiModels.codex === 'string' ? aiModels.codex : '';
+  aiModels.gemini = typeof aiModels.gemini === 'string' ? aiModels.gemini : '';
+
+  if (!aiModels.claude && typeof prefs.claudeModel === 'string' && prefs.claudeModel.trim()) {
+    aiModels.claude = prefs.claudeModel.trim();
+  }
+  if (!aiModels.claude) {
+    aiModels.claude = DEFAULT_SETTINGS.preferences.aiModels.claude;
+  }
+
+  prefs.aiModels = aiModels;
+  prefs.claudeModel = aiModels.claude;
+
+  return settings;
 }
 
 function isConfigured() {
   const profile = getSection('companyProfile');
-  return !!(profile.companyName && profile.contactName && profile.email);
+  return !!(profile.companyName && profile.contactName && profile.email && profile.phone);
 }
 
 function getSignature() {
   const profile = getSection('companyProfile');
   const tmpl = getSection('messageTemplates');
+  const style = getMessageStyle();
+  const signatureFormat = style.signatureFormat || 'full';
+  if (signatureFormat === 'none') return '';
+  if (signatureFormat === 'minimal') {
+    return [
+      profile.companyName || '',
+      profile.contactName || '',
+      profile.email ? `MAIL: ${profile.email}` : '',
+    ].filter(Boolean).join('\n');
+  }
   const template = tmpl.signatureTemplate || '{companyName}\n{contactName}\nTEL: {phone}\nMAIL: {email}';
   return template
     .replace('{companyName}', profile.companyName || '')
@@ -319,6 +436,46 @@ function getSignature() {
     .replace('{address}', profile.address || '');
 }
 
+function getMessageStyle() {
+  const tmpl = getSection('messageTemplates');
+  return {
+    ...(tmpl.style || {}),
+  };
+}
+
+function getLetterTemplate() {
+  const tmpl = getSection('messageTemplates');
+  return {
+    enabled: !!(tmpl.letterTemplate && tmpl.letterTemplate.enabled),
+    header: tmpl.letterTemplate && typeof tmpl.letterTemplate.header === 'string' ? tmpl.letterTemplate.header : '',
+    footer: tmpl.letterTemplate && typeof tmpl.letterTemplate.footer === 'string' ? tmpl.letterTemplate.footer : '',
+    format: (tmpl.letterTemplate && tmpl.letterTemplate.format) || 'A4',
+  };
+}
+
+function getApprovalBeforeSend() {
+  return getSection('preferences').requireApprovalBeforeSend !== false;
+}
+
+function getFormFillTimeout() {
+  const timeout = Number(getSection('preferences').formFillTimeout);
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : 5000;
+}
+
+function getAiProvider() {
+  return (getSection('preferences').aiProvider || 'claude').trim() || 'claude';
+}
+
+function getAiModels() {
+  return { ...(getSection('preferences').aiModels || {}) };
+}
+
+function getAiModel(providerId = 'claude') {
+  const key = typeof providerId === 'string' ? providerId.trim().toLowerCase() : 'claude';
+  const models = getAiModels();
+  return typeof models[key] === 'string' ? models[key].trim() : '';
+}
+
 // --- Export ---
 
 module.exports = {
@@ -327,8 +484,10 @@ module.exports = {
   // Convenience
   getSender, getStrengths, getSuccessPatterns, getIndustryProfiles,
   getExcludeStatuses, getTargetListPath, getPort, getScreenshotDir,
-  getHost,
-  isConfigured, getSignature,
+  getHost, getRuntimeRoot,
+  isConfigured, getSignature, getMessageStyle, getLetterTemplate,
+  getApprovalBeforeSend, getFormFillTimeout, getActiveSettingsFile,
+  getAiProvider, getAiModels, getAiModel,
   // Constants
-  DEFAULT_SETTINGS, SETTINGS_FILE,
+  DEFAULT_SETTINGS, PROJECT_ROOT, SETTINGS_FILE, LEGACY_SETTINGS_FILE, SAMPLE_SETTINGS_FILE, STATIC_DATA_DIR,
 };

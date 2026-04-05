@@ -14,12 +14,25 @@ Thank you for your interest in contributing!
 ## Development Setup
 
 ```bash
-git clone https://github.com/your-username/sales-claw.git
+git clone https://github.com/<your-org>/sales-claw.git
 cd sales-claw
 npm install
-cp data/sample-settings.json data/settings.json
-node dashboard-server.cjs
+# Windows (PowerShell): Copy-Item data/sample-settings.json data/settings.json
+# macOS / Linux: cp data/sample-settings.json data/settings.json
+npx playwright install chromium
+npm start
 ```
+
+デスクトップ版の動作確認は `npm start`、ローカルダッシュボード単体の確認は `npm run dashboard` を使います。
+
+## Release
+
+- `package.json` の version を更新する
+- 必要な README / docs / release notes を更新する
+- `git tag v<version>` を作成して push する
+- `.github/workflows/release.yml` が GitHub Releases を作成する
+
+一般ユーザー向け成果物は GitHub Releases のインストーラー / DMG / AppImage です。
 
 ## Code Style
 

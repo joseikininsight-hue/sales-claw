@@ -3,7 +3,7 @@
 ## About This Project
 
 企業の問い合わせフォーム経由で営業アプローチを自動化するツール。
-ユーザーが設定した自社情報・ターゲットリスト・提供価値に基づいて、Claude Code CLIが企業分析→メッセージ生成→フォーム入力を実行する。
+ユーザーが設定した自社情報・ターゲットリスト・提供価値に基づいて、Codex CLIが企業分析→メッセージ生成→フォーム入力を実行する。
 
 ## 絶対ルール: フォーム入力+スクショなしで「確認待ち」にするな
 
@@ -45,10 +45,10 @@
 
 ## Architecture — CLI主体
 
-**重要: このプロジェクトはClaude Code CLIが主体で動く。**
+**重要: このプロジェクトはCodex CLIが主体で動く。**
 
-- Claude Codeがその場で企業を分析し、メッセージを作成し、Playwrightでフォームに入力する
-- フォームごとにClaude Codeが構造を見て専用ロジックを書く
+- Codexがその場で企業を分析し、メッセージを作成し、Playwrightでフォームに入力する
+- フォームごとにCodexが構造を見て専用ロジックを書く
 - ダッシュボード（localhost:設定ポート）はUI表示・操作・設定管理
 - **MCP Playwrightで1社ずつタブ切替・確実入力**
   - MCP Playwrightは1ブラウザ共有。並列エージェントから同時にMCPを呼んではいけない
@@ -110,12 +110,9 @@ Step 4: フォームに入力 ★ 絶対省略するな
   → 会社名・氏名・メール・電話・部署・本文を settings から読み取って入力
   → logAction(no, name, 'form_fill', '入力完了')
 
-Step 5: スクリーンショット ★ 絶対省略するな（ファイル名を厳守すること）
-  → フォーム入力後の画面を screenshots/ss-{No}-input.png に保存（入力確認用）
-  → 送信ボタンを押した後の確認/完了画面を screenshots/ss-{No}-confirm.png に保存（承認用）
-  → ★ input と confirm は別のスクショ。同じファイル名にしてはいけない
-  → ★ 承認システムは ss-{No}-confirm.png が存在しないと送信済みにできない
-  → logAction(no, name, 'confirm_reached', 'スクショ撮影完了: screenshots/ss-{No}-confirm.png')
+Step 5: スクリーンショット ★ 絶対省略するな
+  → browser_take_screenshot で screenshots/ss-{No}-input.png に保存
+  → logAction(no, name, 'confirm_reached', 'スクショ撮影完了')
 
 Step 6: 確認待ちに登録
   → logAction(no, name, 'awaiting_approval', 'ダッシュボードで確認待ち')
@@ -154,14 +151,14 @@ Step 6: 確認待ちに登録
 - 相手の事業に触れる（「貴社の〇〇事業を拝見」）
 - 相手の強み × 自社の強みの組み合わせ提案
 
-## OMC（oh-my-claudecode）モデルルーティング — トークン節約
+## OMC（oh-my-Codex）モデルルーティング — トークン節約
 
 このプロジェクトはOMCのモデルルーティングに対応。
 各ステップで最適なモデルを使い分けることで、**トークンコストを60-70%削減**できる。
 
 ### インストール（初回のみ）
 ```bash
-claude /install oh-my-claudecode
+Codex /install oh-my-Codex
 ```
 
 ### ステップ別モデル割り当て
@@ -226,7 +223,7 @@ OMCのultraworkモードで並列実行する場合:
 
 ```
 sales-claw/
-├── CLAUDE.md                   # このファイル（プロジェクト説明）
+├── AGENTS.md                   # このファイル（プロジェクト説明）
 ├── settings-manager.cjs        # 設定管理（全設定のSingle Source of Truth）
 ├── config.cjs                  # 設定読み取りインターフェース
 ├── electron-main.js            # Electron メインプロセス
@@ -253,11 +250,11 @@ sales-claw/
 
 ## Agent Orchestration
 
-このプロジェクトは **Claude（オーケストラ）+ CODEX（バックエンド実装）** の2エージェント体制で開発する。
+このプロジェクトは **Codex（オーケストラ）+ CODEX（バックエンド実装）** の2エージェント体制で開発する。
 
 | 担当 | エージェント | 対象 |
 |------|------------|------|
-| フロントエンド・UI設計・統合 | **Claude** | HTML/CSS/i18n/ダッシュボードUI |
+| フロントエンド・UI設計・統合 | **Codex** | HTML/CSS/i18n/ダッシュボードUI |
 | バックエンド実装 | **CODEX** | .cjs サーバーロジック・データ処理・ファイル操作 |
 
 ### CODEX 呼び出し

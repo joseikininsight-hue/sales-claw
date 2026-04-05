@@ -1,0 +1,480 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const settings = require('./settings-manager.cjs');
+
+const PROJECT_ROOT = path.join(__dirname, '..');
+const ARTIFACT_TIME_WINDOW_BEFORE_MS = 60 * 60 * 1000;
+const ARTIFACT_TIME_WINDOW_AFTER_MS = 5 * 60 * 1000;
+const screenshotDirCache = new Map();
+const fileStatCache = new Map();
+const MANUAL_REVIEW_RULES = [
+  {
+    code: 'direct_submit',
+    pattern: /確認ステップなし|すでに送信済み|直接送信|送信ボタンで直接送信完了|サンクスページ/i,
+    label: '確認画面なしで直接送信型です。',
+    confirmRequired: false,
+    allowInputOnly: true,
+    readyForManualSubmission: false,
+    alreadySubmitted: true,
+    requiresManualAction: false,
+    auditState: 'direct-submit',
+  },
+  {
+    code: 'captcha',
+    pattern: /recaptcha|hcaptcha|turnstile|captcha/i,
+    label: 'CAPTCHA の手動対応が必要です。',
+    confirmRequired: false,
+    allowInputOnly: true,
+    readyForManualSubmission: true,
+    alreadySubmitted: false,
+    requiresManualAction: true,
+    auditState: 'manual-send-pending',
+  },
+  {
+    code: 'manual_send',
+    pattern: /ユーザーが手動|手動解決後に送信可能|手動送信|手動実行要|手動対応|送信可能な状態|次へボタン未クリック/i,
+    label: 'ブラウザで手動送信してください。',
+    confirmRequired: false,
+    allowInputOnly: true,
+    readyForManualSubmission: true,
+    alreadySubmitted: false,
+    requiresManualAction: true,
+    auditState: 'manual-send-pending',
+  },
+];
+
+function getExpectedScreenshotPaths(companyNo) {
+  const dir = settings.getScreenshotDir();
+  return {
+    input: path.join(dir, `ss-${companyNo}-input.png`),
+    confirm: path.join(dir, `ss-${companyNo}-confirm.png`),
+    sent: path.join(dir, `ss-${companyNo}-sent.png`),
+    error: path.join(dir, `ss-${companyNo}-error.png`),
+  };
+}
+
+function getFileSignature(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function getDirectoryEntries(dirPath) {
+  const resolved = path.resolve(dirPath);
+  const signature = getFileSignature(resolved);
+  const cached = screenshotDirCache.get(resolved);
+  if (cached && cached.signature === signature) {
+    return cached.entries;
+  }
+
+  if (signature === null) {
+    const entries = new Set();
+    screenshotDirCache.set(resolved, { signature: null, entries });
+    return entries;
+  }
+
+  try {
+    const entries = new Set(fs.readdirSync(resolved));
+    screenshotDirCache.set(resolved, { signature, entries });
+    return entries;
+  } catch {
+    const entries = new Set();
+    screenshotDirCache.set(resolved, { signature: null, entries });
+    return entries;
+  }
+}
+
+function getCachedFileStat(filePath) {
+  const resolved = path.resolve(filePath);
+  const cached = fileStatCache.get(resolved);
+  let stat;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    fileStatCache.set(resolved, { signature: null, stat: null });
+    return null;
+  }
+
+  const signature = `${stat.mtimeMs}:${stat.size}`;
+  if (cached && cached.signature === signature) {
+    return cached.stat;
+  }
+
+  fileStatCache.set(resolved, { signature, stat });
+  return stat;
+}
+
+function getScreenshotSearchDirs() {
+  const dirs = [
+    settings.getScreenshotDir(),
+    PROJECT_ROOT,
+    path.join(PROJECT_ROOT, 'screenshots'),
+  ];
+
+  if (process.resourcesPath) {
+    dirs.push(
+      path.join(process.resourcesPath, 'app', 'screenshots'),
+      path.join(process.resourcesPath, 'screenshots'),
+    );
+  }
+
+  return Array.from(new Set(
+    dirs
+      .filter((dirPath) => !!dirPath)
+      .map((dirPath) => path.resolve(dirPath))
+  ));
+}
+
+function findScreenshotPath(fileName) {
+  if (!fileName) return null;
+  const safeName = path.basename(fileName);
+  const directories = getScreenshotSearchDirs();
+  for (const dirPath of directories) {
+    if (getDirectoryEntries(dirPath).has(safeName)) {
+      return path.join(dirPath, safeName);
+    }
+  }
+
+  const directPath = path.resolve(fileName);
+  if (getCachedFileStat(directPath)) return directPath;
+  return null;
+}
+
+function getScreenshotPaths(companyNo) {
+  const expected = getExpectedScreenshotPaths(companyNo);
+  return {
+    input: findScreenshotPath(expected.input) || expected.input,
+    confirm: findScreenshotPath(expected.confirm) || expected.confirm,
+    sent: findScreenshotPath(expected.sent) || expected.sent,
+    error: findScreenshotPath(expected.error) || expected.error,
+    expected,
+  };
+}
+
+function getScreenshotStatus(companyNo) {
+  const paths = getScreenshotPaths(companyNo);
+  const expected = paths.expected || getExpectedScreenshotPaths(companyNo);
+  const inputExists = !!getCachedFileStat(paths.input);
+  const confirmExists = !!getCachedFileStat(paths.confirm);
+  const sentExists = !!getCachedFileStat(paths.sent);
+  const errorExists = !!getCachedFileStat(paths.error);
+  return {
+    ...paths,
+    confirm: paths.confirm,
+    inputExists,
+    confirmExists,
+    sentExists,
+    errorExists,
+    expected,
+    confirmUsedFallback: confirmExists && path.resolve(paths.confirm) !== path.resolve(expected.confirm),
+    readyForApproval: inputExists && confirmExists,
+    readyForSubmission: inputExists && confirmExists,
+  };
+}
+
+function findLatestLog(logs, action) {
+  for (let i = (logs || []).length - 1; i >= 0; i -= 1) {
+    if (logs[i] && logs[i].action === action) return logs[i];
+  }
+  return null;
+}
+
+function toLogText(details) {
+  if (!details) return '';
+  if (typeof details === 'string') return details;
+  if (typeof details === 'object') {
+    const candidates = [
+      details.screenshot,
+      details.detail,
+      details.message,
+      details.text,
+      details.body,
+    ].filter((value) => typeof value === 'string' && value.trim());
+    if (candidates.length > 0) return candidates.join(' ');
+    try {
+      return JSON.stringify(details);
+    } catch (_) {
+      return '';
+    }
+  }
+  return String(details || '');
+}
+
+function resolveLogContext(options = {}) {
+  if (Array.isArray(options)) return options.filter(Boolean);
+  if (Array.isArray(options.logs) && options.logs.length > 0) return options.logs.filter(Boolean);
+  return [
+    options.formFillLog,
+    options.confirmLog,
+    options.awaitingLog,
+    options.submittedLog,
+  ].filter(Boolean);
+}
+
+function getManualApprovalMeta(input) {
+  const logs = resolveLogContext(input);
+  const matched = [];
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const log = logs[i];
+    const text = toLogText(log && log.details);
+    if (!text) continue;
+    MANUAL_REVIEW_RULES.forEach((rule) => {
+      if (rule.pattern.test(text)) {
+        matched.push({
+          code: rule.code,
+          label: rule.label,
+          detail: text,
+          action: log && log.action ? log.action : '',
+          timestamp: log && log.timestamp ? log.timestamp : '',
+          confirmRequired: rule.confirmRequired,
+          allowInputOnly: rule.allowInputOnly,
+          readyForManualSubmission: rule.readyForManualSubmission,
+          alreadySubmitted: rule.alreadySubmitted,
+          requiresManualAction: rule.requiresManualAction,
+          auditState: rule.auditState,
+        });
+      }
+    });
+  }
+
+  const unique = [];
+  const seen = new Set();
+  matched.forEach((entry) => {
+    const key = `${entry.code}:${entry.detail}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(entry);
+  });
+
+  const primary = unique[0] || null;
+  return {
+    requiresManualAction: primary ? !!primary.requiresManualAction : false,
+    reasonCode: primary ? primary.code : null,
+    reasonLabel: primary ? primary.label : '',
+    reasonDetail: primary ? primary.detail : '',
+    reasons: unique,
+    captchaDetected: unique.some((entry) => entry.code === 'captcha'),
+    directSubmitDetected: unique.some((entry) => entry.code === 'direct_submit'),
+    confirmRequired: primary ? !!primary.confirmRequired : true,
+    allowInputOnly: primary ? !!primary.allowInputOnly : false,
+    readyForManualSubmission: primary ? !!primary.readyForManualSubmission : false,
+    alreadySubmitted: primary ? !!primary.alreadySubmitted : false,
+    auditState: primary ? primary.auditState : 'standard',
+    sourceAction: primary ? primary.action : '',
+    sourceTimestamp: primary ? primary.timestamp : '',
+  };
+}
+
+function collectScreenshotHints(companyNo, logs, kind) {
+  const expectedName = `ss-${companyNo}-${kind}.png`;
+  const hints = new Set([expectedName]);
+
+  (logs || []).forEach((log) => {
+    if (!log) return;
+    if (log.details && typeof log.details === 'object') {
+      if (log.details.screenshots && typeof log.details.screenshots[kind] === 'string' && log.details.screenshots[kind].trim()) {
+        hints.add(log.details.screenshots[kind].trim());
+      }
+      if ((kind === 'confirm' || kind === 'input') && typeof log.details.screenshot === 'string' && log.details.screenshot.trim()) {
+        hints.add(log.details.screenshot.trim());
+      }
+    }
+    const text = toLogText(log.details);
+    if (text && text.includes(expectedName)) hints.add(expectedName);
+  });
+
+  return Array.from(hints);
+}
+
+function parseTimestampMs(value) {
+  const ms = Date.parse(value || '');
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function fileExistsWithinWindow(filePath, referenceTimes) {
+  const stat = filePath ? getCachedFileStat(filePath) : null;
+  if (!stat) return false;
+  if (!Array.isArray(referenceTimes) || referenceTimes.length === 0) return true;
+
+  const min = Math.min(...referenceTimes) - ARTIFACT_TIME_WINDOW_BEFORE_MS;
+  const max = Math.max(...referenceTimes) + ARTIFACT_TIME_WINDOW_AFTER_MS;
+  return stat.mtimeMs >= min && stat.mtimeMs <= max;
+}
+
+function resolveLogBoundArtifact(companyNo, kind, logs, referenceTimes) {
+  const hints = collectScreenshotHints(companyNo, logs, kind);
+  for (const hint of hints) {
+    const resolved = findScreenshotPath(hint);
+    if (resolved && fileExistsWithinWindow(resolved, referenceTimes)) return resolved;
+  }
+  return null;
+}
+
+function buildArtifactStatus(companyNo, expected, actual, manual) {
+  const exists = {
+    input: !!actual.input,
+    confirm: !!actual.confirm,
+    sent: !!actual.sent,
+    error: !!actual.error,
+  };
+  const requirements = {
+    input: true,
+    confirm: manual ? !!manual.confirmRequired : true,
+  };
+  const missing = [];
+  if (!exists.input) missing.push('input');
+  if (requirements.confirm && !exists.confirm) missing.push('confirm');
+
+  let auditState = 'missing';
+  if (exists.confirm) {
+    auditState = 'confirm';
+  } else if (exists.input && manual && manual.auditState === 'direct-submit') {
+    auditState = 'direct-submit';
+  } else if (exists.input && manual && manual.readyForManualSubmission) {
+    auditState = 'manual-send-pending';
+  } else if (exists.input) {
+    auditState = 'input-only';
+  }
+
+  return {
+    companyNo,
+    screenshots: {
+      input: actual.input || expected.input,
+      confirm: actual.confirm || expected.confirm,
+      sent: actual.sent || expected.sent,
+      error: actual.error || expected.error,
+    },
+    actual,
+    exists,
+    requirements,
+    missing,
+    manualActionRequired: manual ? manual.requiresManualAction : false,
+    manualActionReason: manual ? manual.reasonLabel : '',
+    manualActionDetail: manual ? manual.reasonDetail : '',
+    manualActionReasons: manual ? manual.reasons : [],
+    captchaDetected: manual ? manual.captchaDetected : false,
+    directSubmitDetected: manual ? manual.directSubmitDetected : false,
+    allowInputOnly: manual ? manual.allowInputOnly : false,
+    readyForManualApproval: exists.input && !exists.confirm && !!(manual && manual.readyForManualSubmission),
+    auditState,
+    approvalFlow: manual || null,
+    readyForApproval: missing.length === 0,
+    readyForSubmission: missing.length === 0,
+  };
+}
+
+function getExpectedApprovalArtifacts(companyNo, options = {}) {
+  const logs = resolveLogContext(options);
+  const manual = getManualApprovalMeta(logs);
+  const hasLogContext = logs.length > 0;
+  const referenceTimes = hasLogContext
+    ? [
+        options.formFillLog,
+        options.confirmLog,
+        options.awaitingLog,
+        options.submittedLog,
+      ]
+        .map((entry) => entry && entry.timestamp)
+        .map(parseTimestampMs)
+        .filter((value) => value !== null)
+    : [];
+
+  if (!hasLogContext) {
+    const status = getScreenshotStatus(companyNo);
+    return buildArtifactStatus(
+      companyNo,
+      status.expected || getExpectedScreenshotPaths(companyNo),
+      {
+        input: status.inputExists ? status.input : null,
+        confirm: status.confirmExists ? status.confirm : null,
+        sent: status.sentExists ? status.sent : null,
+        error: status.errorExists ? status.error : null,
+      },
+      manual,
+    );
+  }
+
+  const expected = getExpectedScreenshotPaths(companyNo);
+  const actual = {
+    input: resolveLogBoundArtifact(companyNo, 'input', logs, referenceTimes),
+    confirm: resolveLogBoundArtifact(companyNo, 'confirm', logs, referenceTimes),
+    sent: resolveLogBoundArtifact(companyNo, 'sent', logs, referenceTimes),
+    error: resolveLogBoundArtifact(companyNo, 'error', logs, referenceTimes),
+  };
+
+  return buildArtifactStatus(companyNo, expected, actual, manual);
+}
+
+function assertApprovalArtifacts(companyNo, options = {}) {
+  const status = getExpectedApprovalArtifacts(companyNo, options);
+  const missing = Array.isArray(status.missing) ? status.missing.slice() : [];
+
+  if (missing.length > 0) {
+    const error = new Error(
+      options.message || `承認用スクリーンショットが不足しています: ${missing.join(', ')}`
+    );
+    error.code = 'APPROVAL_ARTIFACTS_MISSING';
+    error.companyNo = companyNo;
+    error.missing = missing;
+    error.status = status;
+    throw error;
+  }
+
+  return status;
+}
+
+function buildApprovalLogDetails(input = {}) {
+  const companyNo = input.companyNo || null;
+  const status = companyNo ? getExpectedApprovalArtifacts(companyNo, input) : null;
+  return {
+    companyNo,
+    source: input.source || 'runner',
+    action: input.action || null,
+    mode: input.mode || null,
+    screenshot: input.screenshot || (status ? status.screenshots.confirm : null),
+    screenshots: status
+      ? {
+          input: status.screenshots.input,
+          confirm: status.screenshots.confirm,
+          sent: status.screenshots.sent,
+          error: status.screenshots.error,
+        }
+      : null,
+    exists: status
+      ? {
+          input: status.exists.input,
+          confirm: status.exists.confirm,
+          sent: status.exists.sent,
+          error: status.exists.error,
+        }
+      : null,
+    requirements: status ? status.requirements : null,
+    missing: status ? status.missing : null,
+    auditState: status ? status.auditState : null,
+    approvalFlow: status ? status.approvalFlow : null,
+    success: !!input.success,
+    verified: !!input.verified,
+    attempt: Number.isFinite(input.attempt) ? input.attempt : null,
+    messageLength: Number.isFinite(input.messageLength) ? input.messageLength : null,
+    detail: input.detail || '',
+    reason: input.reason || '',
+    approvalRequired: input.approvalRequired !== false,
+  };
+}
+
+module.exports = {
+  getManualApprovalMeta,
+  findScreenshotPath,
+  getExpectedScreenshotPaths,
+  getScreenshotSearchDirs,
+  getScreenshotPaths,
+  getScreenshotStatus,
+  getExpectedApprovalArtifacts,
+  assertApprovalArtifacts,
+  buildApprovalLogDetails,
+};

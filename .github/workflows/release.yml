@@ -102,21 +102,31 @@ jobs:
 
             ## セットアップ手順
 
-            ### 1. Claude Code CLI をインストール（必須・別途）
+            ### 1. 利用する AI CLI をインストール（必須・別途）
 
-            Sales Claw の AI 機能には [Claude Code CLI](https://docs.anthropic.com/claude-code) が必要です。
+            Sales Claw の AI 機能には以下のいずれか 1 つ以上が必要です。
 
             ```bash
+            # Claude
             npm install -g @anthropic-ai/claude-code
+
+            # Codex
+            npm install -g @openai/codex
+
+            # Gemini
+            npm install -g @google/gemini-cli
             ```
 
-            Node.js 18+ が必要です → https://nodejs.org/
+            > デスクトップ版を使うだけなら Node.js の追加インストールは不要です。
+            > CLI を npm で導入する場合は Node.js 18+ が必要です → https://nodejs.org/
 
             ### 2. Sales Claw を起動 → Settings タブで自社情報を設定
 
-            ### 3. ターゲットリスト（Excel/CSV）を用意して Settings で指定
+            ### 3. `AI Provider` を選択し、必要なら `営業アプローチ方針` を設定
 
-            ### 4. `claude` を起動して指示するだけ
+            ### 4. ターゲットリスト（Excel/CSV）を用意して Settings で指定
+
+            ### 5. `AI を起動` して指示するだけ
 
             ```
             > 3社確認待ちまで進めて

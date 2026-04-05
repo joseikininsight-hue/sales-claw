@@ -24,14 +24,21 @@ if %errorlevel% neq 0 (
 )
 
 REM --- Playwright ---
-echo [2/4] Playwright (Chromium) をインストール中...
+echo [2/5] Playwright (Chromium) をインストール中...
 call npx playwright install chromium
 if %errorlevel% neq 0 (
     echo [WARN] Playwright のインストールに失敗しました。後で手動で実行してください: npx playwright install chromium
 )
 
+REM --- Claude CLI ---
+echo [3/5] Claude Code CLI をインストール中...
+call npm install -g @anthropic-ai/claude-code
+if %errorlevel% neq 0 (
+    echo [WARN] Claude Code CLI のインストールに失敗しました。後で手動で実行してください: npm install -g @anthropic-ai/claude-code
+)
+
 REM --- settings.json ---
-echo [3/4] 設定ファイルを準備中...
+echo [4/5] 設定ファイルを準備中...
 if not exist "data\settings.json" (
     copy "data\sample-settings.json" "data\settings.json" >nul
     echo        data\settings.json を作成しました。
@@ -40,14 +47,7 @@ if not exist "data\settings.json" (
 )
 
 REM --- デスクトップショートカット生成 ---
-echo [4/4] デスクトップショートカットを作成中...
-
-REM launch-silent.vbs を動的生成（パスをこのディレクトリに固定）
-set "LAUNCH_BAT=%~dp0launch.bat"
-(
-    echo Set WshShell = CreateObject^("WScript.Shell"^)
-    echo WshShell.Run "cmd /c """"%LAUNCH_BAT%""""", 0, False
-) > "%~dp0launch-silent.vbs"
+echo [5/5] デスクトップショートカットを作成中...
 
 REM .lnk ショートカットを PowerShell で作成
 powershell -NoProfile -Command ^
@@ -70,6 +70,8 @@ echo =========================================
 echo  セットアップ完了！
 echo  デスクトップ起動: launch.bat または npm start
 echo  Webダッシュボード: npm run dashboard
+echo  Claude CLI が未導入なら: npm install -g @anthropic-ai/claude-code
+echo  Playwright が未導入なら: npx playwright install chromium
 echo =========================================
 echo.
 pause

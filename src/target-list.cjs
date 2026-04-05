@@ -4,13 +4,20 @@ const fs = require('fs');
 const path = require('path');
 const XLSX = require('xlsx');
 const settings = require('./settings-manager.cjs');
-
-const PROJECT_ROOT = path.join(__dirname, '..');
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const IMPORT_DIR = path.join(DATA_DIR, 'imports');
-const DEFAULT_TARGET_FILE = path.join(DATA_DIR, 'manual-targets.csv');
+const { PROJECT_ROOT, resolveDataPath } = require('./data-paths.cjs');
 
 const TARGET_FIELDS = ['no', 'status', 'companyName', 'type', 'url', 'formUrl', 'notes', 'captcha', 'progress'];
+const DEFAULT_COLUMN_MAPPING = {
+  no: 0,
+  status: 1,
+  companyName: 2,
+  type: 3,
+  url: 4,
+  formUrl: 5,
+  notes: 6,
+  captcha: 8,
+  progress: 10,
+};
 
 const HEADER_LABELS = {
   no: 'No.',
@@ -36,6 +43,40 @@ const HEADER_HINTS = {
   progress: ['progress', '進捗', '対応状況'],
 };
 
+const workbookCache = new Map();
+
+function getFileSignature(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function makeWorkbookCacheKey(targetPath, fileType, sheetIndex, columnMapping) {
+  return [
+    path.resolve(targetPath || ''),
+    fileType || '',
+    Number.isInteger(sheetIndex) ? sheetIndex : '',
+    JSON.stringify(columnMapping || {}),
+  ].join('|');
+}
+
+function storeWorkbookCache(workbookData) {
+  if (!workbookData || !workbookData.targetPath) return;
+  const cacheKey = makeWorkbookCacheKey(
+    workbookData.targetPath,
+    workbookData.fileType,
+    workbookData.sheetIndex,
+    workbookData.columnMapping,
+  );
+  workbookCache.set(cacheKey, {
+    signature: getFileSignature(workbookData.targetPath),
+    bundle: workbookData,
+  });
+}
+
 function normalizeValue(value) {
   if (value === undefined || value === null) return '';
   return String(value).trim();
@@ -58,15 +99,7 @@ function normalizeCompanyNo(value) {
 function getColumnMapping() {
   const targetList = settings.getSection('targetList');
   return {
-    no: 0,
-    status: 1,
-    companyName: 2,
-    type: 3,
-    url: 4,
-    formUrl: 5,
-    notes: 6,
-    captcha: 8,
-    progress: 10,
+    ...DEFAULT_COLUMN_MAPPING,
     ...(targetList.columnMapping || {}),
   };
 }
@@ -89,6 +122,19 @@ function ensureDirectory(dirPath) {
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
 }
 
+function getImportDir() {
+  return resolveDataPath('imports');
+}
+
+function getDefaultTargetFile() {
+  return resolveDataPath('manual-targets.csv');
+}
+
+function getCanonicalImportFile(baseName) {
+  const stem = path.basename(baseName || 'target-list', path.extname(baseName || ''));
+  return path.join(getImportDir(), `${Date.now()}-${stem}-target-list.xlsx`);
+}
+
 function buildDefaultHeaders(columnMapping) {
   const length = Math.max(...Object.values(columnMapping)) + 1;
   const headers = Array.from({ length }, () => '');
@@ -104,15 +150,18 @@ function createEmptyWorkbookBundle(targetPath, fileType, columnMapping, sheetNam
   const worksheet = XLSX.utils.aoa_to_sheet(rows);
   XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
   writeWorkbookBundle({ workbook, targetPath, fileType });
-  return {
+  const bundle = {
     workbook,
     rows,
     headers: rows[0],
     sheetName,
+    sheetIndex: 0,
     targetPath,
     fileType,
     columnMapping,
   };
+  storeWorkbookCache(bundle);
+  return bundle;
 }
 
 function writeWorkbookBundle({ workbook, targetPath, fileType }) {
@@ -129,12 +178,19 @@ function readWorkbookBundle(targetPath, options = {}) {
   const fileType = getFileTypeFromPath(targetPath, options.fileType || targetList.fileType || 'xlsx');
   const columnMapping = options.columnMapping || getColumnMapping();
   const sheetIndex = Number.isInteger(options.sheetIndex) ? options.sheetIndex : (targetList.sheetIndex || 0);
+  const cacheKey = makeWorkbookCacheKey(targetPath, fileType, sheetIndex, columnMapping);
 
   if (!targetPath) {
     return { ok: false, error: 'Target list file is not configured.' };
   }
 
-  if (!fs.existsSync(targetPath)) {
+  const signature = getFileSignature(targetPath);
+  const cached = workbookCache.get(cacheKey);
+  if (cached && cached.signature === signature) {
+    return { ok: true, ...cached.bundle };
+  }
+
+  if (!signature) {
     if (!options.createIfMissing) {
       return { ok: false, error: `Target list file not found: ${targetPath}`, targetPath };
     }
@@ -158,16 +214,19 @@ function readWorkbookBundle(targetPath, options = {}) {
     const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
     const normalizedRows = rows.length > 0 ? rows : [buildDefaultHeaders(columnMapping)];
 
-    return {
+    const bundle = {
       ok: true,
       workbook,
       rows: normalizedRows,
       headers: normalizedRows[0] || [],
       sheetName,
+      sheetIndex: sheetNames.indexOf(sheetName),
       targetPath,
       fileType,
       columnMapping,
     };
+    storeWorkbookCache(bundle);
+    return { ok: true, ...bundle };
   } catch (error) {
     return { ok: false, error: error.message, targetPath };
   }
@@ -261,6 +320,99 @@ function detectColumnMapping(headers) {
   return detected;
 }
 
+function hasImportableContent(row) {
+  if (!row) return false;
+  return !!(row.companyName || row.url || row.formUrl || row.type || row.status || row.progress);
+}
+
+function scoreImportSheet(headers, rows) {
+  const detected = detectColumnMapping(headers);
+  const mappedRows = (rows || []).slice(1).map((row, index) => mapRow(row, {
+    ...DEFAULT_COLUMN_MAPPING,
+    ...detected,
+  }, index + 1));
+  const populatedRows = mappedRows.filter(hasImportableContent);
+  let score = populatedRows.length;
+  if (detected.companyName !== undefined) score += 500;
+  if (detected.formUrl !== undefined) score += 120;
+  if (detected.url !== undefined) score += 80;
+  if (detected.type !== undefined) score += 40;
+  if (detected.status !== undefined) score += 20;
+  if (detected.no !== undefined) score += 10;
+  return { detected, populatedRows, score };
+}
+
+function selectImportSheet(workbook) {
+  const sheetNames = workbook.SheetNames || [];
+  let best = null;
+
+  sheetNames.forEach((sheetName, sheetIndex) => {
+    const worksheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+    const headers = rows[0] || [];
+    const scored = scoreImportSheet(headers, rows);
+    const candidate = {
+      sheetName,
+      sheetIndex,
+      headers,
+      rows,
+      detected: scored.detected,
+      populatedRows: scored.populatedRows,
+      score: scored.score,
+    };
+    if (!best || candidate.score > best.score) {
+      best = candidate;
+    }
+  });
+
+  return best;
+}
+
+function normalizeImportedCompanies(rows, columnMapping) {
+  const normalized = [];
+  const usedNos = new Set();
+  let nextGeneratedNo = 1;
+
+  function allocateNo() {
+    while (usedNos.has(String(nextGeneratedNo))) nextGeneratedNo += 1;
+    const value = nextGeneratedNo;
+    usedNos.add(String(value));
+    nextGeneratedNo += 1;
+    return value;
+  }
+
+  (rows || []).slice(1).forEach((row, index) => {
+    const mapped = mapRow(row, columnMapping, index + 1);
+    if (!hasImportableContent(mapped)) return;
+
+    let normalizedNo = mapped.no;
+    if (normalizedNo === null || normalizedNo === '' || usedNos.has(String(normalizedNo))) {
+      normalizedNo = allocateNo();
+    } else {
+      usedNos.add(String(normalizedNo));
+      const numeric = Number(normalizedNo);
+      if (Number.isFinite(numeric) && numeric >= nextGeneratedNo) {
+        nextGeneratedNo = numeric + 1;
+      }
+    }
+
+    normalized.push({
+      ...mapped,
+      no: normalizedNo,
+    });
+  });
+
+  return normalized;
+}
+
+function buildCanonicalWorkbookRows(companies, columnMapping) {
+  const rows = [buildDefaultHeaders(columnMapping)];
+  (companies || []).forEach((company) => {
+    rows.push(buildCompanyRow(company, columnMapping, rows[0].length));
+  });
+  return rows;
+}
+
 function sanitizeImportFileName(fileName) {
   const baseName = path.basename(fileName || 'target-list.xlsx');
   return baseName.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_');
@@ -310,6 +462,12 @@ function saveRows(workbookData, rows) {
     targetPath: workbookData.targetPath,
     fileType: workbookData.fileType,
   });
+  workbookData.workbook = workbook;
+  workbookData.rows = rows;
+  if (!workbookData.sheetIndex && workbookData.sheetIndex !== 0) {
+    workbookData.sheetIndex = 0;
+  }
+  storeWorkbookCache(workbookData);
 }
 
 function ensureEditableTargetList() {
@@ -318,7 +476,7 @@ function ensureEditableTargetList() {
   let fileType = getFileTypeFromPath(targetPath, targetList.fileType || 'csv');
 
   if (!targetPath) {
-    targetPath = DEFAULT_TARGET_FILE;
+    targetPath = getDefaultTargetFile();
     fileType = 'csv';
     settings.updateSection('targetList', {
       filePath: toRelativeProjectPath(targetPath),
@@ -386,6 +544,32 @@ function updateCompany(companyNo, patch) {
   };
 }
 
+function deleteCompany(companyNo) {
+  const targetPath = settings.getTargetListPath();
+  const workbookData = readWorkbookBundle(targetPath);
+  if (!workbookData.ok) return workbookData;
+
+  const wanted = String(normalizeCompanyNo(companyNo));
+  const rowIndex = workbookData.rows.findIndex((row, index) => {
+    if (index === 0) return false;
+    return String(mapRow(row, workbookData.columnMapping, index).no) === wanted;
+  });
+
+  if (rowIndex === -1) {
+    return { ok: false, error: `Company not found: ${companyNo}` };
+  }
+
+  const deleted = mapRow(workbookData.rows[rowIndex], workbookData.columnMapping, rowIndex);
+  workbookData.rows.splice(rowIndex, 1);
+  saveRows(workbookData, workbookData.rows);
+
+  return {
+    ok: true,
+    company: deleted,
+    targetPath: workbookData.targetPath,
+  };
+}
+
 function importTargetList({ fileName, buffer }) {
   const safeName = sanitizeImportFileName(fileName);
   const ext = path.extname(safeName).toLowerCase();
@@ -393,47 +577,67 @@ function importTargetList({ fileName, buffer }) {
     return { ok: false, error: 'Only .xlsx, .xls, and .csv files are supported.' };
   }
 
-  ensureDirectory(IMPORT_DIR);
-  const storedPath = path.join(IMPORT_DIR, `${Date.now()}-${safeName}`);
-  fs.writeFileSync(storedPath, buffer);
+  const importDir = getImportDir();
+  ensureDirectory(importDir);
+  const sourcePath = path.join(importDir, `${Date.now()}-${safeName}`);
+  fs.writeFileSync(sourcePath, buffer);
 
-  const fileType = ext === '.csv' ? 'csv' : 'xlsx';
-  const imported = readWorkbookBundle(storedPath, {
-    fileType,
-    sheetIndex: 0,
-    columnMapping: getColumnMapping(),
-  });
-  if (!imported.ok) return imported;
+  let workbook;
+  try {
+    workbook = XLSX.read(buffer, { type: 'buffer', raw: false, defval: '' });
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
 
-  const detectedMapping = detectColumnMapping(imported.headers);
-  const nextMapping = {
-    ...getColumnMapping(),
-    ...detectedMapping,
+  const selectedSheet = selectImportSheet(workbook);
+  if (!selectedSheet || !selectedSheet.headers || selectedSheet.headers.length === 0) {
+    return { ok: false, error: 'Could not find a readable sheet in the imported file.' };
+  }
+
+  const importMapping = {
+    ...DEFAULT_COLUMN_MAPPING,
+    ...selectedSheet.detected,
   };
+  const normalizedCompanies = normalizeImportedCompanies(selectedSheet.rows, importMapping);
+  if (normalizedCompanies.length === 0) {
+    return {
+      ok: false,
+      error: 'The imported file does not contain recognizable company rows.',
+    };
+  }
+
+  const targetPath = getCanonicalImportFile(safeName);
+  const canonicalRows = buildCanonicalWorkbookRows(normalizedCompanies, DEFAULT_COLUMN_MAPPING);
+  const workbookData = createEmptyWorkbookBundle(targetPath, 'xlsx', DEFAULT_COLUMN_MAPPING, 'Targets');
+  saveRows(workbookData, canonicalRows);
 
   settings.updateSection('targetList', {
-    filePath: toRelativeProjectPath(storedPath),
-    fileType,
+    filePath: toRelativeProjectPath(targetPath),
+    fileType: 'xlsx',
     sheetIndex: 0,
-    columnMapping: nextMapping,
+    columnMapping: DEFAULT_COLUMN_MAPPING,
   });
 
   const data = readTargetList();
   return {
     ok: !!data.ok,
-    filePath: toRelativeProjectPath(storedPath),
-    targetPath: storedPath,
-    fileType,
-    detectedMapping: nextMapping,
-    headers: imported.headers,
+    filePath: toRelativeProjectPath(targetPath),
+    targetPath,
+    sourceFilePath: sourcePath,
+    fileType: 'xlsx',
+    detectedMapping: importMapping,
+    headers: selectedSheet.headers,
+    sourceSheet: selectedSheet.sheetName,
     companyCount: data.ok ? data.companies.length : 0,
     error: data.ok ? null : data.error,
   };
 }
 
 module.exports = {
+  DEFAULT_COLUMN_MAPPING,
   TARGET_FIELDS,
   appendCompany,
+  deleteCompany,
   detectColumnMapping,
   findCompaniesByNos,
   findCompanyByNo,

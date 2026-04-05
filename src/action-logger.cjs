@@ -2,18 +2,81 @@
 // 各企業に対する操作を記録・表示する
 
 const fs = require('fs');
-const path = require('path');
 const { getRequestTarget } = require('./dashboard-runtime.cjs');
+const settings = require('./settings-manager.cjs');
+const { ensureDataDir, resolveDataPath } = require('./data-paths.cjs');
 
-const LOG_FILE = path.join(__dirname, '../data', 'action-log.json');
+const logCache = {
+  filePath: null,
+  signature: null,
+  data: [],
+};
+
+function getLogFile() {
+  return resolveDataPath('action-log.json');
+}
+
+function cloneValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof globalThis.structuredClone === 'function') {
+    return globalThis.structuredClone(value);
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getFileSignature(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonCached(filePath, fallbackValue) {
+  const signature = getFileSignature(filePath);
+  if (logCache.filePath === filePath && logCache.signature === signature) {
+    return logCache.data;
+  }
+
+  if (signature === null) {
+    logCache.filePath = filePath;
+    logCache.signature = null;
+    logCache.data = fallbackValue;
+    return fallbackValue;
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    logCache.filePath = filePath;
+    logCache.signature = signature;
+    logCache.data = parsed;
+    return parsed;
+  } catch {
+    logCache.filePath = filePath;
+    logCache.signature = signature;
+    logCache.data = fallbackValue;
+    return fallbackValue;
+  }
+}
+
+function writeJsonCached(filePath, data) {
+  ensureDataDir();
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  logCache.filePath = filePath;
+  logCache.signature = getFileSignature(filePath);
+  logCache.data = data;
+}
 
 function loadLog() {
-  if (!fs.existsSync(LOG_FILE)) return [];
-  return JSON.parse(fs.readFileSync(LOG_FILE, 'utf-8'));
+  return readJsonCached(getLogFile(), []);
 }
 
 function saveLog(entries) {
-  fs.writeFileSync(LOG_FILE, JSON.stringify(entries, null, 2), 'utf-8');
+  const prefs = settings.getSection('preferences');
+  const maxEntries = Math.max(100, Number(prefs.maxLogEntries) || 10000);
+  const trimmed = entries.slice(-maxEntries);
+  writeJsonCached(getLogFile(), trimmed);
 }
 
 function logAction(companyNo, companyName, action, details) {
@@ -29,7 +92,6 @@ function logAction(companyNo, companyName, action, details) {
 
   // ダッシュボードにリアルタイム通知（非同期、失敗しても無視）
   try {
-    const settings = require('./settings-manager.cjs');
     const http = require('http');
     const target = getRequestTarget(settings.getHost(), settings.getPort());
     const msg = `[No.${companyNo}] ${companyName} → ${action}`;
@@ -46,11 +108,11 @@ function logAction(companyNo, companyName, action, details) {
 }
 
 function getCompanyLog(companyNo) {
-  return loadLog().filter(e => e.companyNo === companyNo);
+  return cloneValue(loadLog().filter(e => e.companyNo === companyNo));
 }
 
 function getAllLogs() {
-  return loadLog();
+  return cloneValue(loadLog());
 }
 
 function getLatestActions() {
@@ -59,7 +121,18 @@ function getLatestActions() {
   entries.forEach(e => {
     latest[e.companyNo] = e;
   });
-  return Object.values(latest);
+  return Object.values(latest).map((entry) => ({ ...entry }));
 }
 
-module.exports = { logAction, getCompanyLog, getAllLogs, getLatestActions };
+function removeCompanyLogs(companyNo) {
+  const key = String(companyNo);
+  const entries = loadLog();
+  const remaining = entries.filter((entry) => String(entry.companyNo) !== key);
+  const removedCount = entries.length - remaining.length;
+  if (removedCount > 0) {
+    saveLog(remaining);
+  }
+  return removedCount;
+}
+
+module.exports = { logAction, getCompanyLog, getAllLogs, getLatestActions, removeCompanyLogs };

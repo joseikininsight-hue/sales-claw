@@ -22,11 +22,15 @@ echo "[1/4] 依存パッケージをインストール中..."
 npm install
 
 # --- Playwright ---
-echo "[2/4] Playwright (Chromium) をインストール中..."
+echo "[2/5] Playwright (Chromium) をインストール中..."
 npx playwright install chromium || echo "[WARN] Playwright のインストールに失敗しました。後で手動で実行してください: npx playwright install chromium"
 
+# --- Claude CLI ---
+echo "[3/5] Claude Code CLI をインストール中..."
+npm install -g @anthropic-ai/claude-code || echo "[WARN] Claude Code CLI のインストールに失敗しました。後で手動で実行してください: npm install -g @anthropic-ai/claude-code"
+
 # --- settings.json ---
-echo "[3/4] 設定ファイルを準備中..."
+echo "[4/5] 設定ファイルを準備中..."
 if [ ! -f "data/settings.json" ]; then
   cp data/sample-settings.json data/settings.json
   echo "       data/settings.json を作成しました。"
@@ -35,7 +39,7 @@ else
 fi
 
 # --- デスクトップショートカット / アプリランチャー ---
-echo "[4/4] ランチャーを作成中..."
+echo "[5/5] ランチャーを作成中..."
 
 OS="$(uname -s)"
 
@@ -82,5 +86,7 @@ echo "========================================="
 echo " セットアップ完了！"
 echo " デスクトップ起動: npm start"
 echo " Webダッシュボード: npm run dashboard"
+echo " Claude CLI が未導入なら: npm install -g @anthropic-ai/claude-code"
+echo " Playwright が未導入なら: npx playwright install chromium"
 echo "========================================="
 echo ""

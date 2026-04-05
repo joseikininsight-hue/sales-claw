@@ -8,6 +8,174 @@
 
 const settings = require('./settings-manager.cjs');
 
+function truncateMessage(text, maxLength) {
+  const limit = Number.isFinite(maxLength) && maxLength > 0 ? maxLength : 2000;
+  const value = String(text || '');
+  if (value.length <= limit) return value;
+  return value.slice(0, limit);
+}
+
+function applyLetterTemplate(message) {
+  const template = settings.getLetterTemplate();
+  if (!template.enabled) return message;
+
+  const body = String(message || '').trim();
+  const parts = [];
+  if (template.header) parts.push(template.header.trim());
+  if (body) parts.push(body);
+  if (template.footer) parts.push(template.footer.trim());
+  return parts.join('\n\n').trim();
+}
+
+function finalizeMessage(message) {
+  const style = settings.getMessageStyle();
+  const withTemplate = applyLetterTemplate(message);
+  return truncateMessage(withTemplate, style.maxLength);
+}
+
+function compactText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function truncateSoft(text, maxLength = 120) {
+  const value = compactText(text);
+  if (!value) return '';
+  if (value.length <= maxLength) return value;
+
+  const punctuations = ['。', '、', ' '];
+  let cutIndex = -1;
+  for (const marker of punctuations) {
+    const idx = value.lastIndexOf(marker, maxLength);
+    if (idx > cutIndex) cutIndex = idx;
+  }
+
+  const safeIndex = cutIndex > Math.floor(maxLength * 0.6) ? cutIndex : maxLength;
+  return value.slice(0, safeIndex).replace(/[、。\s]+$/, '') + '…';
+}
+
+function uniqueStrings(items) {
+  return Array.from(new Set((items || []).map((item) => compactText(item)).filter(Boolean)));
+}
+
+function formatAreaList(items, maxItems = 2) {
+  return uniqueStrings(items).slice(0, maxItems).join('・');
+}
+
+function ensureSentence(text) {
+  const value = compactText(text);
+  if (!value) return '';
+  return /[。！？]$/.test(value) ? value : `${value}。`;
+}
+
+function getPrimaryAreaLabel(businessAreas, companyType) {
+  const areaLabel = formatAreaList((businessAreas || []).map((area) => area && area.label), 1);
+  return areaLabel || compactText(companyType) || '案件対応';
+}
+
+function getSecondaryStrength(gaps, primaryKey) {
+  return (gaps || []).find((gap) => {
+    const strength = gap && gap.strength;
+    return strength && compactText(strength.label) && strength.key !== primaryKey;
+  }) || null;
+}
+
+function buildObservationPoints(companyName, companyType, businessAreas, focusAreas) {
+  const observations = [];
+  const focuses = uniqueStrings(focusAreas);
+  const areaLabel = formatAreaList((businessAreas || []).map((area) => area && area.label), 2);
+
+  if (focuses.includes('パートナーを募集中')) {
+    observations.push('貴社サイトで外部連携や募集に関する記載を拝見しました。');
+  }
+
+  const prioritizedFocuses = focuses
+    .filter((focus) => focus !== 'パートナーを募集中')
+    .map((focus) => focus.replace(/を.+$/, ''));
+  if (prioritizedFocuses.length > 0) {
+    observations.push(`特に${formatAreaList(prioritizedFocuses, 2)}を継続テーマとして進めておられる点が印象に残りました。`);
+  }
+
+  if (areaLabel) {
+    observations.push(`また、${areaLabel}を軸に事業展開されており、案件によって周辺領域まで含めた体制づくりが必要になるのではないかと感じました。`);
+  }
+
+  if (observations.length < 2 && companyType) {
+    observations.push(`貴社が${companyType}として幅広い案件対応を担われている前提で拝見しました。`);
+  }
+
+  if (observations.length < 2 && companyName) {
+    observations.push(`${companyName}様の公開情報を拝見し、汎用的な売り込みではなく実務面で補完できる余地を考えてご連絡しています。`);
+  }
+
+  return uniqueStrings(observations).slice(0, 2).map((point) => truncateSoft(point, 88));
+}
+
+function buildProposalPoint(gaps, businessAreas, companyType) {
+  const profile = getProfile(companyType);
+  const topGap = (gaps || []).find((gap) => gap && gap.strength && compactText(gap.strength.label)) || null;
+  const areaLabel = getPrimaryAreaLabel(businessAreas, companyType);
+
+  if (topGap) {
+    const strength = topGap.strength;
+    const strengthLabel = compactText(strength.label);
+    const capability = ensureSentence(truncateSoft(strength.detail || `${strengthLabel}領域の実務支援が可能です`, 84));
+    const secondaryGap = getSecondaryStrength(gaps, strength.key);
+    const secondaryLabel = secondaryGap && secondaryGap.strength
+      ? compactText(secondaryGap.strength.label)
+      : '';
+    const secondaryText = secondaryLabel && secondaryLabel !== strengthLabel
+      ? `必要に応じて${secondaryLabel}周辺まで含めて柔軟に支援できます。`
+      : '';
+
+    return truncateSoft(
+      `弊社では${strengthLabel}を主な対応領域としており、${capability}貴社の${areaLabel}案件でも、要件整理後の実装や不足しやすい専門工程の補完役としてご一緒できる余地があると考えております。${secondaryText}`,
+      168
+    );
+  }
+
+  if (profile.point) return truncateSoft(profile.point, 148);
+
+  const strengths = settings.getStrengths();
+  if (strengths.length > 0) {
+    const primary = strengths[0];
+    const label = compactText(primary.label);
+    const detail = ensureSentence(truncateSoft(primary.detail || `${label}領域の支援が可能です`, 82));
+    return truncateSoft(
+      `弊社では${label}を主な対応領域としており、${detail}必要な工程だけを補完する形でもご一緒できます。`,
+      150
+    );
+  }
+
+  return '';
+}
+
+function buildProofPoint(patterns, companyType) {
+  const relevant = Array.isArray(patterns) ? patterns : [];
+  if (relevant.length > 0) {
+    const best = relevant[0];
+    const partner = compactText(best.partner);
+    const proof = truncateSoft(best.proof, 86);
+    const matchedType = compactText(best.type || companyType);
+    return truncateSoft(
+      `${partner ? `実際に${partner}様では、` : '実際の支援では、'}${proof}${proof.endsWith('。') ? '' : '。'}${matchedType ? `${matchedType}に近い文脈でも、必要な工程だけを補完する進め方に対応できます。` : '必要な工程だけを切り出して進める形にも対応できます。'}`
+      ,
+      150
+    );
+  }
+
+  const allPatterns = settings.getSuccessPatterns();
+  if (allPatterns.length > 0) {
+    const sample = allPatterns[0];
+    const proof = truncateSoft(sample.proof, 82);
+    return truncateSoft(
+      `${proof}${proof.endsWith('。') ? '' : '。'}要件整理後の実装や追加開発の補完といった進め方でご一緒することが多いです。`,
+      140
+    );
+  }
+
+  return '';
+}
+
 // 企業種別からプロファイル選択（設定ベース）
 function getProfile(companyType) {
   const profiles = settings.getIndustryProfiles();
@@ -70,7 +238,7 @@ function buildMessage(companyName, companyType) {
   parts.push('');
   parts.push(settings.getSignature());
 
-  return parts.join('\n');
+  return finalizeMessage(parts.join('\n'));
 }
 
 // --- 企業分析ベースのカスタムメッセージ生成 ---
@@ -89,23 +257,33 @@ function buildCustomMessage(analysis) {
   const name = sender.name ? sender.name.split(' ')[0] : '';
   const intro = sender.companyName && name ? `${sender.companyName}の${name}と申します。` : '';
 
-  // 1. 相手の事業を理解した上での書き出し（相手起点）
-  const opener = generateOpener(companyName, companyType, businessAreas, focusAreas);
+  const observations = buildObservationPoints(companyName, companyType, businessAreas, focusAreas);
+  const proposal = buildProposalPoint(gaps, businessAreas, companyType);
+  const proof = buildProofPoint(relevantPatterns, companyType);
+  const fallbackOpener = generateOpener(companyName, companyType, businessAreas, focusAreas);
+  const fallbackHook = generateHook(gaps, businessAreas, companyType);
 
-  // 2. 相手のギャップに対して自社が埋められる具体的ポイント（1-2個に絞る）
-  const hook = generateHook(gaps, businessAreas, companyType);
-
-  // 3. 類似企業との協業実績（相手に近い1社だけ）
-  const proof = generateProof(relevantPatterns, companyType);
+  if (observations.length === 0 && !proposal && !proof && !fallbackOpener && !fallbackHook) {
+    return buildMessage(companyName, companyType);
+  }
 
   const parts = [greeting];
   if (intro) parts.push(intro);
-  parts.push('');
-  if (opener) parts.push(opener);
-  parts.push('');
-  if (hook) parts.push(hook);
-  parts.push('');
-  if (proof) parts.push(proof);
+
+  const bodyBlocks = observations.slice(0, 2);
+  if (proposal || fallbackHook) bodyBlocks.push(proposal || truncateSoft(fallbackHook, 150));
+  if (proof) bodyBlocks.push(proof);
+  if (bodyBlocks.length < 4 && fallbackOpener) {
+    bodyBlocks.unshift(truncateSoft(fallbackOpener, 88));
+  }
+
+  bodyBlocks
+    .filter(Boolean)
+    .slice(0, 4)
+    .forEach((block) => {
+      parts.push('');
+      parts.push(block);
+    });
 
   // 参照URL
   if (sender.partnerPage && tmpl.referenceUrlText) {
@@ -130,7 +308,7 @@ function buildCustomMessage(analysis) {
   parts.push('');
   parts.push(settings.getSignature());
 
-  return parts.join('\n');
+  return finalizeMessage(parts.join('\n'));
 }
 
 /**
@@ -206,4 +384,4 @@ function generateProof(patterns, companyType) {
   return '';
 }
 
-module.exports = { buildMessage, buildCustomMessage, getProfile };
+module.exports = { buildMessage, buildCustomMessage, getProfile, finalizeMessage };

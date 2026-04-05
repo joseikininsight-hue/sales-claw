@@ -2,11 +2,14 @@
 
 const fs = require('fs');
 const path = require('path');
+const { resolveDataPath } = require('./data-paths.cjs');
 
-const RUNTIME_FILE = path.join(__dirname, '../data', 'dashboard-runtime.json');
+function getRuntimeFile() {
+  return resolveDataPath('dashboard-runtime.json');
+}
 
 function ensureDataDir() {
-  const dir = path.dirname(RUNTIME_FILE);
+  const dir = path.dirname(getRuntimeFile());
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -29,13 +32,13 @@ function writeRuntime(runtime) {
     startedAt: runtime.startedAt || new Date().toISOString(),
   };
   normalized.url = buildRuntimeUrl(normalized.host, normalized.port);
-  fs.writeFileSync(RUNTIME_FILE, JSON.stringify(normalized, null, 2), 'utf8');
+  fs.writeFileSync(getRuntimeFile(), JSON.stringify(normalized, null, 2), 'utf8');
   return normalized;
 }
 
 function readRuntime() {
   try {
-    const raw = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(getRuntimeFile(), 'utf8'));
     if (!raw || !raw.port) return null;
     return {
       ...raw,
@@ -49,7 +52,8 @@ function readRuntime() {
 
 function clearRuntime() {
   try {
-    if (fs.existsSync(RUNTIME_FILE)) fs.unlinkSync(RUNTIME_FILE);
+    const runtimeFile = getRuntimeFile();
+    if (fs.existsSync(runtimeFile)) fs.unlinkSync(runtimeFile);
   } catch {
     // noop
   }
@@ -72,10 +76,10 @@ function getRequestTarget(fallbackHost, fallbackPort) {
 }
 
 module.exports = {
-  RUNTIME_FILE,
   buildRuntimeUrl,
   clearRuntime,
   getRequestTarget,
+  getRuntimeFile,
   readRuntime,
   toClientHost,
   writeRuntime,

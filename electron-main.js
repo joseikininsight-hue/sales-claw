@@ -8,10 +8,65 @@ const fs = require('fs');
 const http = require('http');
 const { exec } = require('child_process');
 
+const runtimeUserDataDir = path.join(app.getPath('userData'), 'runtime');
+if (!process.env.SALES_CLAW_USER_DATA_DIR) {
+  process.env.SALES_CLAW_USER_DATA_DIR = runtimeUserDataDir;
+}
+
+const settingsManager = require('./src/settings-manager.cjs');
+const { resolveDataPath } = require('./src/data-paths.cjs');
+const { readRuntime } = require('./src/dashboard-runtime.cjs');
+
 let mainWindow = null;
 let tray = null;
 let serverStarted = false;
 let dashboardRuntime = null;
+
+const APP_VERSION = app.getVersion();
+const BUILD_SOURCE = app.isPackaged ? 'installed' : 'development';
+const PLACEHOLDER_UPDATE_OWNERS = new Set(['', 'local-test', 'your-org', 'your-username', 'example']);
+
+function readAppUpdateConfig() {
+  try {
+    const configPath = path.join(process.resourcesPath, 'app-update.yml');
+    if (!fs.existsSync(configPath)) return null;
+    const parsed = {};
+    for (const line of fs.readFileSync(configPath, 'utf8').split(/\r?\n/)) {
+      const match = line.match(/^([A-Za-z0-9_]+):\s*(.+)\s*$/);
+      if (!match) continue;
+      parsed[match[1]] = match[2].trim();
+    }
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveAutoUpdateState() {
+  if (!app.isPackaged) {
+    return { enabled: false, reason: 'Development build: auto-update is disabled.' };
+  }
+  if (process.env.SALES_CLAW_DISABLE_AUTO_UPDATE === '1') {
+    return { enabled: false, reason: 'Auto-update is disabled by environment configuration.' };
+  }
+  const config = readAppUpdateConfig();
+  const owner = String(config && config.owner || '').trim();
+  const repo = String(config && config.repo || '').trim();
+  if (!config || !owner || !repo) {
+    return { enabled: false, reason: 'Auto-update feed is not configured for this build.' };
+  }
+  if (PLACEHOLDER_UPDATE_OWNERS.has(owner) || (owner === 'local-test' && repo === 'sales-claw')) {
+    return { enabled: false, reason: 'Auto-update is disabled for local verification builds.' };
+  }
+  return { enabled: true, reason: null };
+}
+
+const AUTO_UPDATE_STATE = resolveAutoUpdateState();
+const AUTO_UPDATE_ENABLED = AUTO_UPDATE_STATE.enabled;
+
+process.env.SALES_CLAW_APP_VERSION = APP_VERSION;
+process.env.SALES_CLAW_BUILD_SOURCE = BUILD_SOURCE;
+process.env.SALES_CLAW_AUTO_UPDATE_ENABLED = AUTO_UPDATE_ENABLED ? '1' : '0';
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -35,11 +90,11 @@ function getIcon(size = 'icon') {
 }
 
 function getDashboardUrl() {
-  return dashboardRuntime?.url || 'http://127.0.0.1:3765';
+  return (dashboardRuntime || readRuntime())?.url || 'http://127.0.0.1:3765';
 }
 
 function getDashboardPortLabel() {
-  return dashboardRuntime?.port || 3765;
+  return (dashboardRuntime || readRuntime())?.port || 3765;
 }
 
 // ─── ダッシュボードサーバー起動 ──────────────────────────────
@@ -134,10 +189,11 @@ function createTray() {
 
 // ─── 初回セットアップ ─────────────────────────────────────────
 async function firstRunSetup() {
-  const settingsPath = path.join(__dirname, 'data', 'settings.json');
-  const samplePath   = path.join(__dirname, 'data', 'sample-settings.json');
+  const settingsPath = settingsManager.SETTINGS_FILE;
+  const samplePath = settingsManager.SAMPLE_SETTINGS_FILE;
 
   if (!fs.existsSync(settingsPath) && fs.existsSync(samplePath)) {
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
     fs.copyFileSync(samplePath, settingsPath);
 
     const choice = await dialog.showMessageBox({
@@ -146,26 +202,26 @@ async function firstRunSetup() {
       message: '初回起動を検出しました',
       detail:
         '設定ファイルを作成しました。\n\n' +
-        'Playwright (ブラウザ自動化) のインストールが必要です。\n' +
-        '「インストール」を押すとバックグラウンドでインストールします。\n\n' +
-        '※ Claude Code CLI は別途インストールが必要です。\n' +
-        '  詳細は「スキップ（後で）」後に Settings タブをご確認ください。',
+        'Playwright (ブラウザ自動化) と Claude Code CLI のインストールを試行できます。\n' +
+        '「インストール」を押すとバックグラウンドで順番に実行します。\n\n' +
+        '失敗した場合は、表示される手動手順に従ってください。',
       buttons: ['インストール', 'スキップ（後で）'],
       defaultId: 0,
     });
 
     if (choice.response === 0) {
       await installPlaywright();
+      await installClaudeCli();
     }
   }
 }
 
-function installPlaywright() {
+function runInstaller(command, title, message, failureTitle, failureDetail) {
   return new Promise((resolve) => {
     const win = new BrowserWindow({
-      width: 500,
-      height: 200,
-      title: 'Playwright インストール中...',
+      width: 560,
+      height: 220,
+      title,
       resizable: false,
       webPreferences: { nodeIntegration: false },
     });
@@ -173,22 +229,46 @@ function installPlaywright() {
     win.loadURL('about:blank');
     win.webContents.executeJavaScript(`
       document.body.style.cssText = 'font-family:sans-serif;padding:30px;background:#1e1e2e;color:#cdd6f4';
-      document.body.innerHTML = '<h3 style="margin:0 0 12px">Playwright (Chromium) をインストール中...</h3><p style="color:#a6adc8;margin:0">しばらくお待ちください。</p>';
+      document.body.innerHTML = '<h3 style="margin:0 0 12px">${message}</h3><p style="color:#a6adc8;margin:0">しばらくお待ちください。</p>';
     `);
 
-    exec('npx playwright install chromium', { cwd: __dirname }, (err) => {
+    exec(command, {
+      cwd: __dirname,
+      shell: process.platform === 'win32',
+      windowsHide: process.platform === 'win32',
+    }, (err) => {
       win.close();
       if (err) {
         dialog.showMessageBox({
           type: 'warning',
-          title: 'インストール警告',
-          message: 'Playwright のインストールに失敗しました',
-          detail: '後で手動でインストールしてください:\nnpx playwright install chromium',
+          title: failureTitle,
+          message: `${title} に失敗しました`,
+          detail: failureDetail,
         });
       }
-      resolve();
+      resolve(!err);
     });
   });
+}
+
+function installPlaywright() {
+  return runInstaller(
+    'npx playwright install chromium',
+    'Playwright インストール中...',
+    'Playwright (Chromium) をインストール中...',
+    'インストール警告',
+    '後で手動でインストールしてください:\nnpx playwright install chromium'
+  );
+}
+
+function installClaudeCli() {
+  return runInstaller(
+    'npm install -g @anthropic-ai/claude-code',
+    'Claude CLI インストール中...',
+    'Claude Code CLI をインストール中...',
+    'インストール警告',
+    '後で手動でインストールしてください:\nnpm install -g @anthropic-ai/claude-code'
+  );
 }
 
 // ─── アプリ起動 ───────────────────────────────────────────────
@@ -228,31 +308,63 @@ app.whenReady().then(async () => {
   createTray();
   createWindow();
 
-  // 起動から5秒後にアップデートチェック（初回ロードの邪魔をしない）
-  setTimeout(() => checkForUpdates(), 5000);
+  if (AUTO_UPDATE_ENABLED) {
+    // 起動から5秒後にアップデートチェック（初回ロードの邪魔をしない）
+    setTimeout(() => checkForUpdates(), 5000);
 
-  // ダッシュボードの「今すぐ再起動」ボタンからの install-update フラグ監視
-  const installFlagFile = path.join(__dirname, 'data', 'install-update.flag');
-  setInterval(() => {
-    try {
-      if (fs.existsSync(installFlagFile)) {
-        fs.unlinkSync(installFlagFile);
-        autoUpdater.quitAndInstall();
-      }
-    } catch (e) { /* ignore */ }
-  }, 2000);
+    // ダッシュボードの「今すぐ再起動」ボタンからの install-update フラグ監視
+    const installFlagFile = resolveDataPath('install-update.flag');
+    setInterval(() => {
+      try {
+        if (fs.existsSync(installFlagFile)) {
+          fs.unlinkSync(installFlagFile);
+          autoUpdater.quitAndInstall();
+        }
+      } catch (e) { /* ignore */ }
+    }, 2000);
+  } else {
+    writeUpdateStatus({
+      state: BUILD_SOURCE === 'development' ? 'disabled-dev' : 'disabled',
+      version: APP_VERSION,
+      message: AUTO_UPDATE_STATE.reason || (BUILD_SOURCE === 'development'
+        ? 'Development build: auto-update is disabled.'
+        : 'Auto-update is disabled.'),
+    });
+  }
 });
 
 // ─── 自動更新 ─────────────────────────────────────────────────
-const UPDATE_STATUS_FILE = path.join(__dirname, 'data', 'update-status.json');
+const UPDATE_STATUS_FILE = resolveDataPath('update-status.json');
+
+function ensureUpdateDir() {
+  const dir = path.dirname(UPDATE_STATUS_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
 
 function writeUpdateStatus(status) {
   try {
-    fs.writeFileSync(UPDATE_STATUS_FILE, JSON.stringify({ ...status, ts: Date.now() }));
+    ensureUpdateDir();
+    fs.writeFileSync(UPDATE_STATUS_FILE, JSON.stringify({
+      appVersion: APP_VERSION,
+      buildSource: BUILD_SOURCE,
+      autoUpdateEnabled: AUTO_UPDATE_ENABLED,
+      ...status,
+      ts: Date.now(),
+    }));
   } catch (e) { /* ignore */ }
 }
 
 function checkForUpdates() {
+  if (!AUTO_UPDATE_ENABLED) {
+    writeUpdateStatus({
+      state: BUILD_SOURCE === 'development' ? 'disabled-dev' : 'disabled',
+      version: APP_VERSION,
+      message: AUTO_UPDATE_STATE.reason || (BUILD_SOURCE === 'development'
+        ? 'Development build: auto-update is disabled.'
+        : 'Auto-update is disabled.'),
+    });
+    return;
+  }
   writeUpdateStatus({ state: 'checking' });
   autoUpdater.checkForUpdates().catch((err) => {
     console.error('[AutoUpdater] checkForUpdates error:', err?.message || err);

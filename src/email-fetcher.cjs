@@ -4,23 +4,34 @@
 
 const { chromium } = require('playwright');
 const fs = require('fs');
-const path = require('path');
 const settings = require('./settings-manager.cjs');
+const { ensureDataDir, resolveDataPath } = require('./data-paths.cjs');
 
-const SESSION_DIR = path.join(__dirname, '../data', 'outlook-session');
-const EMAILS_FILE = path.join(__dirname, '../data', 'emails.json');
+function getSessionDir() {
+  return resolveDataPath('outlook-session');
+}
+
+function getEmailsFile() {
+  return resolveDataPath('emails.json');
+}
 
 function loadEmails() {
-  try { return JSON.parse(fs.readFileSync(EMAILS_FILE, 'utf-8')); } catch { return { emails: [], lastFetched: null }; }
+  try { return JSON.parse(fs.readFileSync(getEmailsFile(), 'utf-8')); } catch { return { emails: [], lastFetched: null }; }
 }
 
 function saveEmails(data) {
-  fs.writeFileSync(EMAILS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  ensureDataDir();
+  fs.writeFileSync(getEmailsFile(), JSON.stringify(data, null, 2), 'utf-8');
 }
 
 async function fetchEmails() {
   const prefs = settings.getSection('preferences');
+  const provider = (prefs.emailProvider || 'outlook').toLowerCase();
   const searchKeyword = prefs.emailSearchKeyword;
+
+  if (provider !== 'outlook') {
+    return { success: false, error: `emailProvider "${provider}" is not supported yet.` };
+  }
 
   if (!searchKeyword) {
     console.log('メール検索キーワードが設定されていません。');
@@ -28,11 +39,12 @@ async function fetchEmails() {
     return { success: false, error: '検索キーワード未設定' };
   }
 
-  if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+  const sessionDir = getSessionDir();
+  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
   console.log('=== Outlook Web メール取得 ===\n');
 
-  const context = await chromium.launchPersistentContext(SESSION_DIR, {
+  const context = await chromium.launchPersistentContext(sessionDir, {
     headless: false,
     viewport: { width: 1400, height: 900 },
     locale: prefs.locale || 'ja-JP',

@@ -2,17 +2,76 @@
 // 何回目の連絡で何を送ったかを記録し、2回目以降のメッセージ作成に活用する
 
 const fs = require('fs');
-const path = require('path');
+const { ensureDataDir, resolveDataPath } = require('./data-paths.cjs');
 
-const HISTORY_FILE = path.join(__dirname, '../data', 'contact-history.json');
+const historyCache = {
+  filePath: null,
+  signature: null,
+  data: {},
+};
+
+function getHistoryFile() {
+  return resolveDataPath('contact-history.json');
+}
+
+function cloneValue(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof globalThis.structuredClone === 'function') {
+    return globalThis.structuredClone(value);
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getFileSignature(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonCached(filePath, fallbackValue) {
+  const signature = getFileSignature(filePath);
+  if (historyCache.filePath === filePath && historyCache.signature === signature) {
+    return historyCache.data;
+  }
+
+  if (signature === null) {
+    historyCache.filePath = filePath;
+    historyCache.signature = null;
+    historyCache.data = fallbackValue;
+    return fallbackValue;
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    historyCache.filePath = filePath;
+    historyCache.signature = signature;
+    historyCache.data = parsed;
+    return parsed;
+  } catch {
+    historyCache.filePath = filePath;
+    historyCache.signature = signature;
+    historyCache.data = fallbackValue;
+    return fallbackValue;
+  }
+}
+
+function writeJsonCached(filePath, data) {
+  ensureDataDir();
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  historyCache.filePath = filePath;
+  historyCache.signature = getFileSignature(filePath);
+  historyCache.data = data;
+}
 
 function loadHistory() {
-  if (!fs.existsSync(HISTORY_FILE)) return {};
-  return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+  return readJsonCached(getHistoryFile(), {});
 }
 
 function saveHistory(data) {
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  writeJsonCached(getHistoryFile(), data);
 }
 
 /**
@@ -58,7 +117,7 @@ function recordContact(companyNo, companyName, record) {
  */
 function getHistory(companyNo) {
   const history = loadHistory();
-  return history[String(companyNo)] || null;
+  return cloneValue(history[String(companyNo)] || null);
 }
 
 /**
@@ -120,6 +179,15 @@ function recordResponse(companyNo, contactNo, response, notes) {
   return true;
 }
 
+function removeHistory(companyNo) {
+  const history = loadHistory();
+  const key = String(companyNo);
+  if (!Object.prototype.hasOwnProperty.call(history, key)) return false;
+  delete history[key];
+  saveHistory(history);
+  return true;
+}
+
 module.exports = {
   recordContact,
   getHistory,
@@ -127,4 +195,5 @@ module.exports = {
   getLastMessage,
   getAllHistorySummary,
   recordResponse,
+  removeHistory,
 };
