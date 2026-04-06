@@ -44,13 +44,16 @@ files:
   - "!data/imports/**"
   - "!data/*.csv"
   - "data/sample-targets.csv"
-  - "!*.xlsx"
+  - "!**/*.xlsx"
   - "!*.log"
+  - "!data/ai-run-metrics.jsonl"
   - "!tmp/**"
   - "!temp/**"
   - "!launch-silent.vbs"
   - "!launch.sh"
   - "!.claude/settings.local.json"
+  - "!.agents/**"
+  - "!.mcp.json"
   - "!assets/名称未設定のデザイン.png"
 
 # Windows インストーラー (NSIS)
