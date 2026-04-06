@@ -4220,7 +4220,7 @@ contain-intrinsic-size:84px;
 <!-- Docs Modal -->
 <!-- AI 起動モード選択モーダル -->
 <div id="launchModal" onclick="if(event.target===this)closeLaunchModal()" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(15,23,42,.75);backdrop-filter:blur(6px);z-index:10000;align-items:center;justify-content:center">
-  <div style="background:#fff;width:560px;max-width:95vw;border-radius:24px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.28);animation:modalIn .22s cubic-bezier(.34,1.2,.64,1)">
+  <div style="background:#fff;width:780px;max-width:95vw;border-radius:24px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.28);animation:modalIn .22s cubic-bezier(.34,1.2,.64,1)">
     <!-- ヘッダー: プロバイダー別動的グラデーション -->
     <div id="launchModalHeader" style="background:linear-gradient(135deg,#CC785C,#E8935A);padding:20px 24px;position:relative;overflow:hidden">
       <div style="position:absolute;top:-30px;right:-30px;width:130px;height:130px;background:rgba(255,255,255,.07);border-radius:50%"></div>
@@ -4239,7 +4239,9 @@ contain-intrinsic-size:84px;
       </div>
     </div>
     <!-- ボディ -->
-    <div style="padding:20px 20px 12px">
+    <div style="padding:20px 20px 12px;max-height:calc(85vh - 160px);overflow-y:auto">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+      <!-- 左カラム: プロバイダー + 診断 -->
       <div style="display:flex;flex-direction:column;gap:14px">
         <!-- プロバイダー選択カード -->
         <div>
@@ -4279,9 +4281,18 @@ contain-intrinsic-size:84px;
           <div id="launchProviderNote" style="font-size:.76rem;color:#475569;line-height:1.6">${_lang === 'ja' ? '選択した AI に合わせて、起動モードの実際の意味をここに表示します。' : 'Provider-specific mode guidance will appear here.'}</div>
         </div>
         <div id="launchSetupDiagnostics" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:11px 14px">
-          <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:6px">${_lang === 'ja' ? 'セットアップ診断' : 'Setup diagnostics'}</div>
-          <div id="launchSetupDiagnosticsBody" style="font-size:.74rem;color:#475569;line-height:1.6">${_lang === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...'}</div>
+          <div onclick="toggleDiagPanel()" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none">
+            <div style="display:flex;align-items:center;gap:6px">
+              <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b">${_lang === 'ja' ? 'セットアップ診断' : 'Setup diagnostics'}</div>
+              <div id="launchDiagBadge" style="font-size:.58rem;font-weight:700;padding:1px 7px;border-radius:10px;background:#ecfdf5;color:#059669"></div>
+            </div>
+            <span id="launchDiagArrow" style="font-size:.7rem;color:#94a3b8;transition:transform .2s">▼</span>
+          </div>
+          <div id="launchSetupDiagnosticsBody" style="font-size:.72rem;color:#475569;line-height:1.55;max-height:220px;overflow-y:auto;margin-top:6px">${_lang === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...'}</div>
         </div>
+      </div>
+      <!-- 右カラム: モード + ポリシー -->
+      <div style="display:flex;flex-direction:column;gap:14px">
         <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px 14px">
           <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:8px">${_t['launch.submitPolicy.title'] || (_lang === 'ja' ? '送信ポリシー' : 'Submission policy')}</div>
           <div style="display:flex;flex-direction:column;gap:8px">
@@ -4353,6 +4364,8 @@ contain-intrinsic-size:84px;
       <div id="launchModeHelpNote" style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:.72rem;color:#475569;line-height:1.6">
         選択した AI に合わせて、自動実行向けのモードと手動確認向けのモードをここに表示します。
       </div>
+      </div><!-- /右カラム -->
+      </div><!-- /grid -->
     </div>
     <!-- フッター -->
     <div style="padding:12px 20px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #f1f5f9">
@@ -5638,11 +5651,11 @@ function renderLaunchDiagnosticRow(tone, title, detail) {
     : tone === 'warn'
       ? { bg: '#fffbeb', fg: '#92400e', border: 'rgba(245,158,11,.22)' }
       : { bg: '#fef2f2', fg: '#991b1b', border: 'rgba(239,68,68,.2)' };
-  return '<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid ' + palette.border + ';background:' + palette.bg + ';border-radius:10px">'
-    + '<span style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:999px;background:#fff;font-size:.68rem;font-weight:900;color:' + palette.fg + ';flex-shrink:0">'
+  return '<div style="display:flex;align-items:flex-start;gap:6px;padding:5px 8px;border:1px solid ' + palette.border + ';background:' + palette.bg + ';border-radius:8px">'
+    + '<span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:999px;background:#fff;font-size:.6rem;font-weight:900;color:' + palette.fg + ';flex-shrink:0;margin-top:1px">'
     + (tone === 'ok' ? '✓' : tone === 'warn' ? '!' : '×')
     + '</span>'
-    + '<div style="min-width:0"><div style="font-weight:700;color:' + palette.fg + ';font-size:.74rem">' + esc(title) + '</div><div style="font-size:.71rem;color:#475569;line-height:1.5;margin-top:1px">' + esc(detail || '') + '</div></div>'
+    + '<div style="min-width:0"><div style="font-weight:700;color:' + palette.fg + ';font-size:.68rem;line-height:1.3">' + esc(title) + '</div><div style="font-size:.64rem;color:#64748b;line-height:1.4;margin-top:1px;word-break:break-all">' + esc(detail || '') + '</div></div>'
     + '</div>';
 }
 function renderLaunchSetupDiagnostics(data) {
@@ -5707,7 +5720,15 @@ function renderLaunchSetupDiagnostics(data) {
   rows.push(renderLaunchDiagnosticRow('warn',
     LANG === 'ja' ? '確認待ちタブの保持' : 'Awaiting tab retention',
     data.tabRetentionNote || (LANG === 'ja' ? 'AIフォーム入力は managed セッション前提です。' : 'Form fill expects a managed session.')));
-  body.innerHTML = rows.join('');
+  body.innerHTML = '<div style="display:flex;flex-direction:column;gap:4px">' + rows.join('') + '</div>';
+  const badge = document.getElementById('launchDiagBadge');
+  if (badge) {
+    const ok = rows.filter(r => r.includes('#059669')).length;
+    const warn = rows.filter(r => r.includes('#d97706') || r.includes('#ef4444')).length;
+    badge.textContent = warn > 0 ? (ok + '/' + (ok + warn)) : (ok + ' OK');
+    badge.style.background = warn > 0 ? '#fef3c7' : '#ecfdf5';
+    badge.style.color = warn > 0 ? '#92400e' : '#059669';
+  }
 }
 async function loadLaunchSetupDiagnostics(providerId = _currentAiProvider) {
   const body = document.getElementById('launchSetupDiagnosticsBody');
@@ -5854,6 +5875,15 @@ function setLaunchAutoSendSafe(enabled, options = {}) {
 
   function toggleLaunchAdvancedModes() {
     setLaunchAdvancedModesOpen(!_launchAdvancedModesOpen);
+  }
+
+  let _diagPanelOpen = true;
+  function toggleDiagPanel() {
+    _diagPanelOpen = !_diagPanelOpen;
+    const body = document.getElementById('launchSetupDiagnosticsBody');
+    const arrow = document.getElementById('launchDiagArrow');
+    if (body) body.style.display = _diagPanelOpen ? '' : 'none';
+    if (arrow) arrow.style.transform = _diagPanelOpen ? '' : 'rotate(-90deg)';
   }
 
 function updateLaunchModalSelection(mode) {
