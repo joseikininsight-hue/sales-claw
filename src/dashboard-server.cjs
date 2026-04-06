@@ -4275,11 +4275,6 @@ contain-intrinsic-size:84px;
         </div>
         <select id="launchProviderSelect" style="display:none">${providerSelectHtml}</select>
         <div id="launchProviderBadge" style="display:none"></div>
-        <!-- プロバイダーノート -->
-        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:11px 14px">
-          <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:3px">${_lang === 'ja' ? '通常利用' : 'Recommended'}</div>
-          <div id="launchProviderNote" style="font-size:.76rem;color:#475569;line-height:1.6">${_lang === 'ja' ? '選択した AI に合わせて、起動モードの実際の意味をここに表示します。' : 'Provider-specific mode guidance will appear here.'}</div>
-        </div>
         <div id="launchSetupDiagnostics" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:11px 14px">
           <div onclick="toggleDiagPanel()" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none">
             <div style="display:flex;align-items:center;gap:6px">
@@ -4361,15 +4356,12 @@ contain-intrinsic-size:84px;
           </div>
         </div>
       </div>
-      <div id="launchModeHelpNote" style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:.72rem;color:#475569;line-height:1.6">
-        選択した AI に合わせて、自動実行向けのモードと手動確認向けのモードをここに表示します。
-      </div>
       </div><!-- /右カラム -->
       </div><!-- /grid -->
     </div>
     <!-- フッター -->
     <div style="padding:12px 20px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #f1f5f9">
-      <div id="launchSelectedLabel" style="font-size:.72rem;color:#64748b;font-weight:600">${_lang === 'ja' ? 'AI とモードを選択してください' : 'Select AI and mode'}</div>
+      <div id="launchSelectedLabel" style="display:none"></div>
       <div style="display:flex;gap:8px">
         <button onclick="closeLaunchModal()" style="background:#f1f5f9;border:none;padding:9px 20px;font-size:.78rem;font-weight:600;cursor:pointer;color:#64748b;border-radius:10px;transition:background .15s" onmouseover="this.style.background='#e2e8f0'" onmouseout="this.style.background='#f1f5f9'">${_lang === 'ja' ? 'キャンセル' : 'Cancel'}</button>
         <button id="launchExternalBtn" onclick="confirmExternalLaunch()" style="background:#fff;border:1px solid #cbd5e1;color:#334155;padding:9px 16px;font-size:.76rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.03em;transition:all .15s" onmouseover="this.style.borderColor='#94a3b8';this.style.color='#334155'" onmouseout="this.style.borderColor='#cbd5e1';this.style.color='#334155'">${_lang === 'ja' ? '外部で開く' : 'Open External'}</button>
