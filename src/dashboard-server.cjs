@@ -3815,11 +3815,12 @@ tr.updated{animation:rowFlash .8s}
 .tab-content.active{display:block}
 
 /* Horizontal tab bar */
-#mainTabNav{position:sticky;top:48px;z-index:39;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border-bottom:1px solid var(--border-subtle);display:flex;align-items:stretch;padding:0 14px;gap:2px}
-.tab-btn{display:inline-flex;align-items:center;gap:7px;padding:10px 18px;font-size:.78rem;font-weight:500;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-3);cursor:pointer;transition:all .2s var(--ease-out-expo);white-space:nowrap;flex-shrink:0;border-radius:0!important;letter-spacing:.01em}
+#mainTabNav{position:sticky;top:48px;z-index:39;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border-bottom:1px solid var(--border-subtle);display:flex;align-items:stretch;padding:0 16px;gap:1px}
+.tab-btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;font-size:.74rem;font-weight:600;background:none;border:none;border-bottom:2.5px solid transparent;color:var(--text-3);cursor:pointer;transition:all .18s var(--ease-out-expo);white-space:nowrap;flex-shrink:0;border-radius:0!important;letter-spacing:.02em}
 .tab-btn:hover{color:var(--text-1);background:rgba(59,130,246,.04)}
-.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:700;background:rgba(59,130,246,.06)}
-.tab-btn .tab-icon{font-size:16px;opacity:.6;flex-shrink:0}
+.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:700;background:rgba(59,130,246,.05)}
+.tab-btn .tab-icon{font-size:17px;opacity:.5;flex-shrink:0}
+.tab-btn:hover .tab-icon{opacity:.8}
 .tab-btn.active .tab-icon{opacity:1}
 
 /* Badges / chips */
@@ -4190,21 +4191,19 @@ contain-intrinsic-size:84px;
     <button id="claudeActionBtn" onclick="claudeAction()" style="display:none;background:var(--primary);border:none;border-left:1px solid var(--border-subtle);color:#fff;font-size:.68rem;padding:4px 10px;cursor:pointer;font-weight:600;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em;border-radius:0 var(--radius-sm) var(--radius-sm) 0"></button>
     <button id="claudeStopBtn" onclick="stopClaude()" style="display:none;background:#dc2626;border:none;border-left:1px solid var(--border-subtle);color:#fff;font-size:.68rem;padding:4px 10px;cursor:pointer;font-weight:600;white-space:nowrap;text-transform:uppercase;letter-spacing:.04em;border-radius:0 var(--radius-sm) var(--radius-sm) 0">STOP</button>
   </div>
-  <!-- Icon buttons -->
-  <button onclick="showDocsModal()" title="${_t['app.docsTitle']}" style="display:flex;align-items:center;gap:4px;background:var(--bg-raised);border:1px solid var(--border-default);padding:4px 10px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;color:var(--text-2);transition:all .12s;border-radius:var(--radius-sm)" onmouseover="this.style.background='var(--bg-hover)';this.style.color='var(--text-1)'" onmouseout="this.style.background='var(--bg-raised)';this.style.color='var(--text-2)'">
-    <span class="material-symbols-outlined" style="font-size:15px">description</span>
-    ${_t['app.docs']}
-  </button>
-  <button onclick="location.href='/api/export'" style="display:flex;align-items:center;gap:4px;background:var(--bg-raised);border:1px solid var(--border-default);padding:4px 10px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;color:var(--text-2);transition:all .12s;border-radius:var(--radius-sm)" onmouseover="this.style.background='var(--bg-hover)';this.style.color='var(--text-1)'" onmouseout="this.style.background='var(--bg-raised)';this.style.color='var(--text-2)'">
-    <span class="material-symbols-outlined" style="font-size:15px">download</span>
-    ${_t['app.export'] || 'Export'}
-  </button>
-  <!-- 運用メモボタン -->
-  <button id="memoBtn" onclick="toggleMemoPanel()" title="運用メモ">
-    <span class="material-symbols-outlined" style="font-size:15px">sticky_note_2</span>
-    運用メモ
-    <span id="memoBadge">0</span>
-  </button>
+  <!-- Icon-only action buttons -->
+  <div style="display:flex;align-items:center;gap:2px">
+    <button onclick="showDocsModal()" title="${_t['app.docsTitle'] || 'Guide'}" style="display:flex;align-items:center;justify-content:center;width:32px;height:32px;background:none;border:1px solid transparent;cursor:pointer;color:var(--text-3);transition:all .15s;border-radius:var(--radius-sm)" onmouseover="this.style.background='var(--bg-hover)';this.style.color='var(--text-1)';this.style.borderColor='var(--border-default)'" onmouseout="this.style.background='none';this.style.color='var(--text-3)';this.style.borderColor='transparent'">
+      <span class="material-symbols-outlined" style="font-size:18px">menu_book</span>
+    </button>
+    <button onclick="location.href='/api/export'" title="${_t['app.export'] || 'Export'}" style="display:flex;align-items:center;justify-content:center;width:32px;height:32px;background:none;border:1px solid transparent;cursor:pointer;color:var(--text-3);transition:all .15s;border-radius:var(--radius-sm)" onmouseover="this.style.background='var(--bg-hover)';this.style.color='var(--text-1)';this.style.borderColor='var(--border-default)'" onmouseout="this.style.background='none';this.style.color='var(--text-3)';this.style.borderColor='transparent'">
+      <span class="material-symbols-outlined" style="font-size:18px">download</span>
+    </button>
+    <button id="memoBtn" onclick="toggleMemoPanel()" title="${_lang === 'ja' ? '運用メモ' : 'Notes'}" style="display:flex;align-items:center;justify-content:center;width:32px;height:32px;background:none;border:1px solid transparent;cursor:pointer;color:var(--text-3);transition:all .15s;border-radius:var(--radius-sm);position:relative" onmouseover="this.style.background='var(--bg-hover)';this.style.color='var(--text-1)';this.style.borderColor='var(--border-default)'" onmouseout="this.style.background='none';this.style.color='var(--text-3)';this.style.borderColor='transparent'">
+      <span class="material-symbols-outlined" style="font-size:18px">sticky_note_2</span>
+      <span id="memoBadge" style="position:absolute;top:2px;right:2px;min-width:14px;height:14px;background:var(--error);color:#fff;font-size:.5rem;font-weight:800;border-radius:7px;line-height:14px;text-align:center;display:none">0</span>
+    </button>
+  </div>
 </header>
 
 <!-- 運用メモパネル (dropdown) -->
