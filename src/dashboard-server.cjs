@@ -5338,52 +5338,45 @@ contain-intrinsic-size:84px;
 </button>
 
 <!-- Floating panel -->
-<div id="liveMonitorCard" style="position:fixed;bottom:84px;right:24px;z-index:9989;width:380px;height:540px;background:var(--bg-card);border:1px solid var(--border-default);border-radius:var(--radius-lg);overflow:hidden;box-shadow:var(--shadow-modal);display:none;flex-direction:column;animation:monitorPanelIn .25s var(--ease-out-expo)">
+<div id="liveMonitorCard" style="position:fixed;bottom:84px;right:24px;z-index:9989;width:420px;max-height:min(600px,calc(100vh - 120px));background:var(--bg-card);border:1px solid var(--border-default);border-radius:16px;overflow:hidden;box-shadow:0 20px 60px rgba(15,23,42,.18),0 2px 8px rgba(15,23,42,.08);display:none;flex-direction:column;animation:monitorPanelIn .25s var(--ease-out-expo)">
   <!-- Header -->
-  <div style="display:flex;align-items:center;gap:8px;padding:12px 14px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);user-select:none;flex-shrink:0">
-    <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#e2e8f0;flex:1">Live Activity</span>
-    <div id="monitorStatusChip" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.1);color:#94a3b8;font-size:.58rem;font-weight:700;padding:2px 8px;border-radius:4px;letter-spacing:.04em">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
-    <button id="liveMonitorToggleBtn" onclick="toggleMonitorPanel()" style="display:inline-flex;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#e2e8f0;font-size:16px;padding:4px;border-radius:6px;cursor:pointer;transition:all .15s;line-height:1" onmouseover="this.style.background='rgba(255,255,255,.2)'" onmouseout="this.style.background='rgba(255,255,255,.08)'">✕</button>
+  <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);user-select:none;flex-shrink:0">
+    <span class="material-symbols-outlined" style="font-size:16px;color:#e2e8f0">monitoring</span>
+    <span style="font-size:.72rem;font-weight:700;color:#e2e8f0;flex:1">Live Activity</span>
+    <div id="monitorStatusChip" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.1);color:#94a3b8;font-size:.56rem;font-weight:700;padding:2px 8px;border-radius:4px;letter-spacing:.04em">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
+    <button id="liveMonitorToggleBtn" onclick="toggleMonitorPanel()" style="display:inline-flex;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#e2e8f0;font-size:14px;padding:3px;border-radius:6px;cursor:pointer;transition:all .15s;line-height:1" onmouseover="this.style.background='rgba(255,255,255,.2)'" onmouseout="this.style.background='rgba(255,255,255,.08)'">✕</button>
   </div>
 
   <!-- Body -->
   <div id="liveMonitorBody" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
-    <!-- Latest Activity Summary -->
-    <div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-        <div style="font-size:.58rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-3)">${_lang === 'ja' ? '最新アクティビティ' : 'Latest Activity'}</div>
-        <div id="monitorUpdatedAt" style="font-size:.6rem;font-family:var(--font-mono);color:var(--text-3);white-space:nowrap">-</div>
-      </div>
-      <div id="monitorCompany" style="font-size:.82rem;font-weight:700;color:var(--text-1);margin-bottom:4px">-</div>
-      <div style="background:var(--bg-card);border-radius:var(--radius-sm);padding:6px 8px;border:1px solid var(--border-subtle)">
-        <div style="font-size:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-bottom:2px">${_lang === 'ja' ? '最新ステップ' : 'Latest Step'}</div>
-        <div id="monitorStep" style="font-size:.75rem;color:var(--text-1);font-weight:500">-</div>
+    <!-- Compact Latest Activity -->
+    <div style="padding:8px 14px;border-bottom:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div style="min-width:0;flex:1">
+          <div id="monitorCompany" style="font-size:.78rem;font-weight:700;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</div>
+          <div id="monitorStep" style="font-size:.68rem;color:var(--text-2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</div>
+        </div>
+        <div id="monitorUpdatedAt" style="font-size:.58rem;font-family:var(--font-mono);color:var(--text-3);white-space:nowrap;flex-shrink:0">-</div>
       </div>
     </div>
 
     <!-- Thinking indicator -->
-    <div id="monitorThinkingRow" style="display:none;align-items:center;gap:8px;padding:7px 14px;background:linear-gradient(90deg,rgba(99,102,241,.07),transparent);border-bottom:1px solid rgba(99,102,241,.12);flex-shrink:0">
+    <div id="monitorThinkingRow" style="display:none;align-items:center;gap:8px;padding:6px 14px;background:linear-gradient(90deg,rgba(99,102,241,.06),transparent);border-bottom:1px solid rgba(99,102,241,.1);flex-shrink:0">
       <span class="think-spin"></span>
-      <span id="monitorThinkingText" style="font-size:.72rem;color:#6366f1;font-style:italic;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">思考中...</span>
+      <span id="monitorThinkingText" style="font-size:.68rem;color:#6366f1;font-style:italic;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">思考中...</span>
     </div>
     <div id="monitorActiveSummary" style="display:none">-</div>
 
     <!-- Event List (scrollable, chat-style) -->
-    <div id="monitorEventList" style="display:flex;flex-direction:column;flex:1;overflow-y:auto;background:var(--bg-card);overscroll-behavior:contain;-webkit-mask-image:linear-gradient(to bottom,black 90%,transparent 100%)"></div>
+    <div id="monitorEventList" style="display:flex;flex-direction:column;flex:1;overflow-y:auto;background:var(--bg-card);overscroll-behavior:contain;padding:4px 0"></div>
 
-    <!-- URL -->
-    <div style="padding:8px 14px;border-top:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
-      <div style="font-size:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-bottom:3px">${_lang === 'ja' ? 'URL' : 'URL'}</div>
-      <a id="monitorCurrentUrl" href="#" target="_blank" style="display:block;font-size:.68rem;color:var(--primary);font-family:var(--font-mono);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:4px 6px;background:var(--bg-card);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)">-</a>
-    </div>
-
-    <!-- Screenshot -->
-    <div style="padding:8px 14px;border-top:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-        <div style="font-size:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3)">${_lang === 'ja' ? '最新スクショ' : 'Latest Screenshot'}</div>
-        <a id="monitorScreenshotLink" href="#" target="_blank" style="display:none;font-size:.6rem;color:var(--primary);text-decoration:none;font-weight:600">${_lang === 'ja' ? '別タブ ↗' : 'Open ↗'}</a>
+    <!-- Collapsible footer: URL + Screenshot -->
+    <div id="monitorFooter" style="border-top:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
+      <div style="display:flex;align-items:center;gap:6px;padding:6px 14px">
+        <a id="monitorCurrentUrl" href="#" target="_blank" style="flex:1;font-size:.62rem;color:var(--primary);font-family:var(--font-mono);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</a>
+        <a id="monitorScreenshotLink" href="#" target="_blank" style="display:none;font-size:.58rem;color:var(--primary);text-decoration:none;font-weight:700;white-space:nowrap">${_lang === 'ja' ? 'スクショ ↗' : 'SS ↗'}</a>
       </div>
-      <div id="monitorScreenshotWrap" style="min-height:80px;max-height:140px;overflow:auto;overscroll-behavior:contain;border:1px dashed var(--border-default);border-radius:var(--radius-sm);background:var(--bg-deep);display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:.7rem;text-align:center;padding:8px">${_lang === 'ja' ? 'スクリーンショット待機中' : 'Waiting for screenshot'}</div>
+      <div id="monitorScreenshotWrap" style="display:none;margin:0 14px 8px;max-height:100px;overflow:auto;overscroll-behavior:contain;border:1px dashed var(--border-default);border-radius:var(--radius-sm);background:var(--bg-deep)"></div>
     </div>
   </div>
 </div>
@@ -7081,36 +7074,26 @@ function renderLiveMonitor(monitor) {
   if (events.length === 0) {
     eventListEl.innerHTML = '<div style="padding:18px 14px;color:var(--outline);font-size:.78rem">' + (LANG === 'ja' ? 'まだ進行状況ログはありません。' : 'No progress log yet.') + '</div>';
   } else {
-    eventListEl.innerHTML = events.slice(0, 14).map((event, index) => {
+    eventListEl.innerHTML = events.slice(0, 20).map((event, index) => {
       const eventStatus = event && event.status ? event.status : 'idle';
       const eventTone = styles[eventStatus] || styles.idle;
+      const dotColor = dotColors[eventStatus] || '#94a3b8';
       const companyLabel = event && event.companyName
         ? ((event.companyNo ? '#' + event.companyNo + ' ' : '') + event.companyName)
         : (LANG === 'ja' ? '対象未設定' : 'Unknown target');
-      const stepLabel = event && event.step ? event.step : (LANG === 'ja' ? 'ステップ未設定' : 'No step');
-      const timeLabel = event && event.updatedAt ? new Date(event.updatedAt).toLocaleTimeString(locale) : '--:--:--';
-      const urlLabel = event && event.currentUrl ? esc(event.currentUrl) : '';
-      const screenshotHref = monitorScreenshotUrl(event);
+      const stepLabel = event && event.step ? event.step : '';
+      const timeLabel = event && event.updatedAt ? new Date(event.updatedAt).toLocaleTimeString(locale, { hour:'2-digit', minute:'2-digit' }) : '--:--';
       return ''
-        + '<div style="padding:12px 14px;border-bottom:1px solid var(--outline-variant);background:' + (index === 0 ? 'var(--surface-lowest)' : '#fff') + '">'
-        +   '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:6px">'
-        +     '<div style="min-width:0">'
-        +       '<div style="font-size:.82rem;font-weight:700;color:var(--on-surface);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(companyLabel) + '</div>'
-        +       '<div style="margin-top:2px;font-size:.74rem;color:var(--on-surface-variant)">' + esc(stepLabel) + '</div>'
+        + '<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 14px' + (index === 0 ? ';background:rgba(59,130,246,.03)' : '') + '">'
+        +   '<span style="width:8px;height:8px;border-radius:50%;background:' + dotColor + ';flex-shrink:0;margin-top:4px"></span>'
+        +   '<div style="min-width:0;flex:1">'
+        +     '<div style="display:flex;align-items:baseline;gap:6px">'
+        +       '<span style="font-size:.72rem;font-weight:700;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(companyLabel) + '</span>'
+        +       '<span style="font-size:.56rem;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0">' + esc(timeLabel) + '</span>'
         +     '</div>'
-        +     '<div style="display:flex;align-items:center;gap:6px;flex-shrink:0">'
-        +       '<span style="display:inline-flex;align-items:center;gap:4px;background:' + eventTone.bg + ';color:' + eventTone.fg + ';font-size:.62rem;font-weight:700;padding:2px 8px;border-radius:999px">' + esc(labels[eventStatus] || eventStatus) + '</span>'
-        +       '<span style="font-size:.68rem;color:var(--outline);font-family:var(--font-mono)">' + esc(timeLabel) + '</span>'
-        +     '</div>'
+        +     (stepLabel ? '<div style="font-size:.66rem;color:var(--text-2);margin-top:1px;line-height:1.35">' + esc(stepLabel) + '</div>' : '')
         +   '</div>'
-        +   '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">'
-        +     (urlLabel
-              ? '<a href="' + urlLabel + '" target="_blank" style="min-width:0;max-width:100%;font-size:.69rem;color:var(--primary);text-decoration:none;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + urlLabel + '</a>'
-              : '<span style="font-size:.69rem;color:var(--outline)">' + (LANG === 'ja' ? 'URLなし' : 'No URL') + '</span>')
-        +     (screenshotHref
-              ? '<a href="' + screenshotHref + '" target="_blank" style="font-size:.68rem;color:var(--primary);text-decoration:none;font-weight:600">' + (LANG === 'ja' ? 'スクショ ↗' : 'Screenshot ↗') + '</a>'
-              : '')
-        +   '</div>'
+        +   '<span style="font-size:.54rem;font-weight:700;padding:1px 6px;border-radius:999px;background:' + eventTone.bg + ';color:' + eventTone.fg + ';flex-shrink:0;white-space:nowrap;margin-top:2px">' + esc(labels[eventStatus] || eventStatus) + '</span>'
         + '</div>';
     }).join('');
   }
