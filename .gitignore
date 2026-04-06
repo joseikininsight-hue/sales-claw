@@ -82,3 +82,12 @@ dist/
 
 # Electron dev
 .webpack/
+.aidesigner/*
+!.aidesigner/.gitkeep
+
+# Local agent/MCP config (machine-specific)
+.agents/
+.mcp.json
+
+# AI run metrics (operational data)
+data/ai-run-metrics.jsonl

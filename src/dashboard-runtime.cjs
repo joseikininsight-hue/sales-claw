@@ -1,11 +1,33 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { resolveDataPath } = require('./data-paths.cjs');
 
 function getRuntimeFile() {
   return resolveDataPath('dashboard-runtime.json');
+}
+
+function getAlternateRuntimeFiles() {
+  const files = [];
+  const appData = typeof process.env.APPDATA === 'string' ? process.env.APPDATA.trim() : '';
+  if (appData) {
+    files.push(path.join(appData, 'sales-claw', 'runtime', 'data', 'dashboard-runtime.json'));
+  }
+  files.push(path.join(os.homedir(), '.sales-claw', 'data', 'dashboard-runtime.json'));
+  return files;
+}
+
+function getRuntimeFiles() {
+  const seen = new Set();
+  const files = [getRuntimeFile(), ...getAlternateRuntimeFiles()];
+  return files.filter(file => {
+    const resolved = path.resolve(file);
+    if (seen.has(resolved)) return false;
+    seen.add(resolved);
+    return true;
+  });
 }
 
 function ensureDataDir() {
@@ -20,6 +42,21 @@ function toClientHost(host) {
 
 function buildRuntimeUrl(host, port) {
   return `http://${toClientHost(host)}:${port}`;
+}
+
+function normalizeRuntime(raw) {
+  if (!raw || !raw.port) return null;
+  return {
+    ...raw,
+    host: toClientHost(raw.host || raw.bindHost || '127.0.0.1'),
+    url: raw.url || buildRuntimeUrl(raw.host || raw.bindHost || '127.0.0.1', raw.port),
+  };
+}
+
+function getRuntimeScore(runtime, stat) {
+  const startedAt = Date.parse(runtime.startedAt || '') || 0;
+  const mtime = stat && typeof stat.mtimeMs === 'number' ? stat.mtimeMs : 0;
+  return Math.max(startedAt, mtime);
 }
 
 function writeRuntime(runtime) {
@@ -37,17 +74,21 @@ function writeRuntime(runtime) {
 }
 
 function readRuntime() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(getRuntimeFile(), 'utf8'));
-    if (!raw || !raw.port) return null;
-    return {
-      ...raw,
-      host: toClientHost(raw.host || raw.bindHost || '127.0.0.1'),
-      url: raw.url || buildRuntimeUrl(raw.host || raw.bindHost || '127.0.0.1', raw.port),
-    };
-  } catch {
-    return null;
+  const runtimes = [];
+  for (const file of getRuntimeFiles()) {
+    try {
+      const stat = fs.statSync(file);
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const normalized = normalizeRuntime(raw);
+      if (!normalized) continue;
+      runtimes.push({ runtime: normalized, score: getRuntimeScore(normalized, stat) });
+    } catch {
+      // noop
+    }
   }
+  if (!runtimes.length) return null;
+  runtimes.sort((a, b) => b.score - a.score);
+  return runtimes[0].runtime;
 }
 
 function clearRuntime() {
@@ -80,6 +121,7 @@ module.exports = {
   clearRuntime,
   getRequestTarget,
   getRuntimeFile,
+  getRuntimeFiles,
   readRuntime,
   toClientHost,
   writeRuntime,

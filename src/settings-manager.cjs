@@ -177,6 +177,7 @@ const DEFAULT_SETTINGS = {
     maxLogEntries: 10000,         // ログの最大保持件数
     // セキュリティ
     requireApprovalBeforeSend: true,  // 送信前に承認を要求
+    autoSendEligibleForms: false,     // CAPTCHA等がない安全なフォームは自動送信
     // エクスポート
     exportFilenamePrefix: 'outreach_progress',
   },
@@ -250,9 +251,25 @@ function save(settings) {
   ensureDataDir(DEFAULT_SETTINGS_DIR);
   ensureDataDir(configuredDir);
 
-  fs.writeFileSync(configuredFile, payload, 'utf-8');
+  atomicWriteFileSync(configuredFile, payload);
   if (path.resolve(configuredFile) !== path.resolve(SETTINGS_FILE)) {
-    fs.writeFileSync(SETTINGS_FILE, payload, 'utf-8');
+    atomicWriteFileSync(SETTINGS_FILE, payload);
+  }
+}
+
+function atomicWriteFileSync(filePath, content) {
+  const tmpFile = filePath + '.tmp.' + process.pid;
+  fs.writeFileSync(tmpFile, content, 'utf-8');
+  try {
+    fs.renameSync(tmpFile, filePath);
+  } catch (e) {
+    if (process.platform === 'win32' && (e.code === 'EPERM' || e.code === 'EBUSY')) {
+      fs.copyFileSync(tmpFile, filePath);
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    } else {
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+      throw e;
+    }
   }
 }
 
@@ -457,6 +474,10 @@ function getApprovalBeforeSend() {
   return getSection('preferences').requireApprovalBeforeSend !== false;
 }
 
+function getAutoSendEligibleForms() {
+  return getSection('preferences').autoSendEligibleForms === true;
+}
+
 function getFormFillTimeout() {
   const timeout = Number(getSection('preferences').formFillTimeout);
   return Number.isFinite(timeout) && timeout > 0 ? timeout : 5000;
@@ -486,7 +507,7 @@ module.exports = {
   getExcludeStatuses, getTargetListPath, getPort, getScreenshotDir,
   getHost, getRuntimeRoot,
   isConfigured, getSignature, getMessageStyle, getLetterTemplate,
-  getApprovalBeforeSend, getFormFillTimeout, getActiveSettingsFile,
+  getApprovalBeforeSend, getAutoSendEligibleForms, getFormFillTimeout, getActiveSettingsFile,
   getAiProvider, getAiModels, getAiModel,
   // Constants
   DEFAULT_SETTINGS, PROJECT_ROOT, SETTINGS_FILE, LEGACY_SETTINGS_FILE, SAMPLE_SETTINGS_FILE, STATIC_DATA_DIR,

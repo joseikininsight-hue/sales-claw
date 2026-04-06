@@ -53,10 +53,12 @@ let _aiStatusCacheTime = 0;
 let _aiStatusCacheProvider = null;
 let _aiExecutablePath = {};
 let dashboardSessionToken = null;
+const CLI_LOG_SECRET = require('crypto').randomBytes(24).toString('hex');
 let dashboardDataCacheKey = null;
 let dashboardDataCacheValue = null;
 let dashboardDataCacheBuiltAt = 0;
 let standaloneDashboardLockHeld = false;
+let standaloneDashboardLockHooksInstalled = false;
 
 // Managed AI PTY process
 let claudePty = null;
@@ -64,8 +66,28 @@ let claudeProcessMode = 'default';
 let claudeProcess = null;
 let headlessAiRun = null;
 let activeAiProvider = normalizeProviderId(typeof settings.getAiProvider === 'function' ? settings.getAiProvider() : 'claude');
+let managedAiAutoSendSafe = !!(typeof settings.getAutoSendEligibleForms === 'function' ? settings.getAutoSendEligibleForms() : false);
 const aiInstallState = Object.fromEntries(listProviders().map((provider) => [provider.id, 'idle']));
 const aiInstallError = Object.fromEntries(listProviders().map((provider) => [provider.id, null]));
+let managedAiSessionState = null;
+
+const MANAGED_AI_READY_DELAY_MS = {
+  claude: 1500,
+  codex: 12000,
+  gemini: 25000,
+};
+
+const MANAGED_AI_MIN_READY_AGE_MS = {
+  claude: 0,
+  codex: 24000,
+  gemini: 25000,
+};
+
+const MANAGED_AI_ENTER_DELAY_MS = {
+  claude: 250,
+  codex: 900,
+  gemini: 1000,
+};
 
 // WebSocket server for PTY I/O
 const wss = new WebSocket.Server({ noServer: true });
@@ -78,6 +100,7 @@ wss.on('connection', (ws) => {
     running: !!claudePty,
     mode: claudeProcessMode,
     provider: activeAiProvider,
+    autoSendSafe: getManagedAiAutoSendSafe(),
   }));
   ws.on('message', (msg) => {
     try {
@@ -166,6 +189,20 @@ function releaseStandaloneDashboardLock() {
     // noop
   }
   standaloneDashboardLockHeld = false;
+}
+
+function ensureStandaloneDashboardLockHooks() {
+  if (standaloneDashboardLockHooksInstalled) return;
+  standaloneDashboardLockHooksInstalled = true;
+  process.on('exit', releaseStandaloneDashboardLock);
+  process.on('SIGINT', () => {
+    releaseStandaloneDashboardLock();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    releaseStandaloneDashboardLock();
+    process.exit(0);
+  });
 }
 
 function canReachRuntimeUrl(runtimeUrl, timeoutMs = 1200) {
@@ -269,6 +306,25 @@ function getProviderDisplayName(providerId) {
   return getProvider(providerId).displayName;
 }
 
+function getConfiguredAiAutoSendSafe() {
+  try {
+    return !!(typeof settings.getAutoSendEligibleForms === 'function' ? settings.getAutoSendEligibleForms() : false);
+  } catch (_) {
+    return false;
+  }
+}
+
+function getManagedAiAutoSendSafe() {
+  return !!managedAiAutoSendSafe;
+}
+
+function getAutoSendPolicyLabel(autoSendSafe, lang = 'ja') {
+  if (autoSendSafe) {
+    return lang === 'ja' ? '安全なフォームは自動送信' : 'Auto-send safe forms';
+  }
+  return lang === 'ja' ? '確認待ちで停止' : 'Stop for approval';
+}
+
 function getProviderModeLabel(providerId, mode, lang = 'ja') {
   const provider = normalizeProviderId(providerId);
   const currentMode = String(mode || '').trim();
@@ -283,7 +339,7 @@ function getProviderModeLabel(providerId, mode, lang = 'ja') {
     codex: {
       default: isJa ? 'on-request' : 'On-request',
       acceptEdits: isJa ? 'on-request（手動監視）' : 'On-request (manual)',
-      auto: isJa ? 'full-auto' : 'Full-auto',
+      auto: isJa ? 'no-prompt auto' : 'No-prompt auto',
       bypassPermissions: isJa ? 'danger bypass' : 'Danger bypass',
       'danger-full-access': isJa ? 'danger bypass' : 'Danger bypass',
     },
@@ -305,8 +361,8 @@ function getProviderRecommendedModesText(providerId, lang = 'ja') {
   const provider = normalizeProviderId(providerId);
   if (provider === 'codex') {
     return lang === 'ja'
-      ? 'full-auto（auto）または danger bypass（bypassPermissions）'
-      : 'full-auto (auto) or danger bypass (bypassPermissions)';
+      ? 'no-prompt auto（auto）または danger bypass（bypassPermissions）'
+      : 'no-prompt auto (auto) or danger bypass (bypassPermissions)';
   }
   if (provider === 'gemini') {
     return lang === 'ja'
@@ -318,8 +374,345 @@ function getProviderRecommendedModesText(providerId, lang = 'ja') {
     : 'auto or bypassPermissions';
 }
 
+function getProviderApprovalCaveat(providerId, lang = 'ja') {
+  const provider = normalizeProviderId(providerId);
+  const isJa = lang === 'ja';
+  if (provider === 'codex') {
+    return {
+      tone: 'warn',
+      message: isJa
+        ? "Codex は bypassPermissions でも起動フラグ自体は正しく付きますが、Playwright MCP の操作種別ごとに Codex 本体の許可ダイアログが一度だけ出る場合があります。これは Sales Claw 側の起動ミスではなく Codex 側の権限ルールです。表示されたら「Yes, and don't ask again」を選ぶと次回から抑制できます。"
+        : 'Codex still receives the bypass flags correctly, but Codex itself may show a one-time permission dialog for Playwright MCP action types. This is a Codex-side permission rule, not a Sales Claw launch failure. Choose "Yes, and don\'t ask again" to suppress it next time.',
+    };
+  }
+  if (provider === 'gemini') {
+    return {
+      tone: 'warn',
+      message: isJa
+        ? 'Gemini は yolo でも browser / MCP 系の確認が残る場合があります。Sales Claw 側では最強の approval-mode を渡していますが、Gemini 側の安全確認は完全には消せないことがあります。'
+        : 'Gemini may still pause for browser / MCP confirmations even in yolo mode. Sales Claw passes the strongest approval mode available, but Gemini can still keep its own safety checks.',
+    };
+  }
+  return {
+    tone: 'ok',
+    message: isJa
+      ? 'Claude の bypassPermissions は通常、CLI 側の権限確認を大きく減らします。残る場合はログインや初期セットアップ由来の停止を疑ってください。'
+      : 'Claude bypassPermissions usually removes most CLI-side permission prompts. If it still pauses, it is more likely a login or bootstrap issue.',
+  };
+}
+
+function getProviderLaunchExamples(providerId) {
+  return {
+    auto: buildLaunchArgs(providerId, 'auto', {}).join(' '),
+    bypassPermissions: buildLaunchArgs(providerId, 'bypassPermissions', {}).join(' '),
+    default: buildLaunchArgs(providerId, 'default', {}).join(' '),
+  };
+}
+
+function getManagedAiReadyDelay(providerId) {
+  return MANAGED_AI_READY_DELAY_MS[normalizeProviderId(providerId)] || 2500;
+}
+
+function getManagedAiEnterDelay(providerId) {
+  return MANAGED_AI_ENTER_DELAY_MS[normalizeProviderId(providerId)] || 300;
+}
+
+function getManagedAiMinReadyAge(providerId) {
+  return MANAGED_AI_MIN_READY_AGE_MS[normalizeProviderId(providerId)] || 0;
+}
+
+function getManagedAiSubmitSequence(providerId) {
+  switch (normalizeProviderId(providerId)) {
+    case 'codex':
+      return ['\t', '\r'];
+    default:
+      return ['\r'];
+  }
+}
+
+function stripAnsiCodes(value) {
+  return String(value || '').replace(
+    // eslint-disable-next-line no-control-regex
+    /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-_]|\u009b[0-9;?]*[ -/]*[@-~]/g,
+    '',
+  );
+}
+
+function clearManagedAiSessionStateTimers(state = managedAiSessionState) {
+  if (!state) return;
+  if (state.readyTimer) {
+    clearTimeout(state.readyTimer);
+    state.readyTimer = null;
+  }
+  if (state.enterTimer) {
+    clearTimeout(state.enterTimer);
+    state.enterTimer = null;
+  }
+}
+
+function createManagedAiSessionState(providerId) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  return {
+    providerId: normalizedProviderId,
+    launchedAt: Date.now(),
+    recentOutput: '',
+    ready: false,
+    readyAt: 0,
+    readyReason: null,
+    queue: [],
+    dispatching: false,
+    readyTimer: null,
+    enterTimer: null,
+    contractVersionSent: 0,
+  };
+}
+
+function hasManagedAiStartupBlocker(providerId, outputText) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const tail = String(outputText || '').slice(-6000);
+  const hasVisiblePrompt = hasManagedAiReadyMarker(normalizedProviderId, tail);
+  if (/Do you trust the following folders/i.test(tail)) return true;
+  if (/Action Required/i.test(tail) && !hasVisiblePrompt) return true;
+  if (normalizedProviderId === 'codex'
+    && /Starting MCP servers/i.test(tail)
+    && !/MCP startup incomplete/i.test(tail)
+    && !hasVisiblePrompt) {
+    return true;
+  }
+  if (normalizedProviderId === 'gemini'
+    && /Applying trust settings/i.test(tail)
+    && !hasVisiblePrompt) {
+    return true;
+  }
+  return false;
+}
+
+function scheduleManagedAiReadyTimer(providerId, delayMs = getManagedAiReadyDelay(providerId)) {
+  const state = managedAiSessionState;
+  if (!state) return;
+  if (state.readyTimer) {
+    clearTimeout(state.readyTimer);
+  }
+  state.readyTimer = setTimeout(() => {
+    const currentState = managedAiSessionState;
+    if (!currentState || currentState !== state) return;
+    const stateAge = Date.now() - currentState.launchedAt;
+    const minReadyAge = getManagedAiMinReadyAge(providerId);
+    if (stateAge < minReadyAge) {
+      scheduleManagedAiReadyTimer(providerId, Math.max(1000, minReadyAge - stateAge));
+      return;
+    }
+    if (hasManagedAiReadyMarker(providerId, currentState.recentOutput)) {
+      markManagedAiSessionReady('startup-timer-prompt-visible');
+      return;
+    }
+    if (hasManagedAiStartupBlocker(providerId, currentState.recentOutput)) {
+      scheduleManagedAiReadyTimer(providerId, 3000);
+      return;
+    }
+    markManagedAiSessionReady('startup-delay');
+  }, delayMs);
+  if (typeof state.readyTimer.unref === 'function') {
+    state.readyTimer.unref();
+  }
+}
+
+function resetManagedAiSessionState(providerId) {
+  clearManagedAiSessionStateTimers();
+  managedAiSessionState = createManagedAiSessionState(providerId);
+  scheduleManagedAiReadyTimer(providerId);
+  appendDiagnosticEvent('managed_ai_state_reset', {
+    provider: normalizeProviderId(providerId),
+    readyDelayMs: getManagedAiReadyDelay(providerId),
+    minReadyAgeMs: getManagedAiMinReadyAge(providerId),
+  });
+  return managedAiSessionState;
+}
+
+function getManagedAiSessionState() {
+  if (!managedAiSessionState || managedAiSessionState.providerId !== getManagedAiProvider()) {
+    managedAiSessionState = createManagedAiSessionState(getManagedAiProvider());
+  }
+  return managedAiSessionState;
+}
+
+function getManagedAiReadyMarkers(providerId) {
+  switch (normalizeProviderId(providerId)) {
+    case 'codex':
+      return [
+        /›\s+/,
+        /Type instructions and press Enter/i,
+        /Write tests for @filename/i,
+        /Explain this codebase/i,
+        /Implement \{feature\}/i,
+        /gpt-5\.[0-9]/i,
+      ];
+    case 'gemini':
+      return [
+        /Type your message or @path\/to\/file/i,
+        /Type your message/i,
+      ];
+    case 'claude':
+    default:
+      return [
+        /\? for shortcuts/i,
+        />\s*$/m,
+      ];
+  }
+}
+
+function hasManagedAiReadyMarker(providerId, outputText) {
+  const markers = getManagedAiReadyMarkers(providerId);
+  return markers.some((pattern) => pattern.test(String(outputText || '')));
+}
+
+function markManagedAiSessionReady(reason = 'unknown') {
+  const state = managedAiSessionState;
+  if (!state || state.ready) return;
+  state.ready = true;
+  state.readyAt = Date.now();
+  state.readyReason = reason;
+  if (state.readyTimer) {
+    clearTimeout(state.readyTimer);
+    state.readyTimer = null;
+  }
+  appendDiagnosticEvent('managed_ai_ready', {
+    provider: state.providerId,
+    reason,
+    ageMs: state.readyAt - state.launchedAt,
+    queueLength: state.queue.length,
+  });
+  flushManagedAiPromptQueue();
+}
+
+function updateManagedAiReadyFromOutput(providerId, chunk) {
+  const state = managedAiSessionState;
+  if (!state || state.providerId !== normalizeProviderId(providerId)) return;
+  const normalized = stripAnsiCodes(`${state.recentOutput}${String(chunk || '')}`);
+  state.recentOutput = normalized.slice(-16000);
+  if (state.ready) return;
+  if ((Date.now() - state.launchedAt) < getManagedAiMinReadyAge(providerId)) return;
+  if (hasManagedAiReadyMarker(providerId, state.recentOutput)) {
+    markManagedAiSessionReady('cli-prompt-visible');
+    return;
+  }
+  if (hasManagedAiStartupBlocker(providerId, state.recentOutput)) return;
+}
+
+// CLI出力からエラー・承認要求・トークン制限等を検知して進行状況ログに転送
+let _lastCliIssueTime = 0;
+const CLI_ISSUE_PATTERNS = [
+  // エラー系（行頭 or 明確なエラー形式のみ）
+  { pattern: /^Error:|^TypeError:|^ReferenceError:|^SyntaxError:/m, type: 'error', label: 'CLIエラー' },
+  { pattern: /\bfatal\b[:\s]/i, type: 'error', label: '致命的エラー' },
+  { pattern: /\bECONNREFUSED\b|\bENOTFOUND\b|\bETIMEDOUT\b|\bEPIPE\b/i, type: 'error', label: '接続エラー' },
+  // トークン・レート制限
+  { pattern: /rate.?limit|too many requests|\b429\b/i, type: 'warn', label: 'レート制限' },
+  { pattern: /token.?limit|context.?limit|context.?window\b/i, type: 'warn', label: 'トークン制限' },
+  { pattern: /\bquota\b.*\bexceeded\b|\bbilling\b.*\berror\b/i, type: 'warn', label: 'クォータ超過' },
+  { pattern: /API.?key.?invalid|\bauth\w*\s+fail|\bunauthorized\b|\b401\b/i, type: 'error', label: '認証エラー' },
+  // 承認・確認要求（明確なプロンプト形式のみ）
+  { pattern: /\(y\/n\)|\(yes\/no\)/i, type: 'warn', label: '承認要求' },
+  { pattern: /waiting for.*\bapproval\b|user.*input.*required/i, type: 'warn', label: 'ユーザー入力待ち' },
+  // MCP関連
+  { pattern: /MCP.*\berror\b|MCP.*\bfail/i, type: 'error', label: 'MCP接続エラー' },
+  { pattern: /MCP.*\btimeout\b/i, type: 'warn', label: 'MCPタイムアウト' },
+];
+
+function detectCliIssuesFromOutput(rawData, providerId) {
+  const now = Date.now();
+  if (now - _lastCliIssueTime < 2000) return; // 2秒デバウンス（同じエラーの連打防止）
+  const text = stripAnsiCodes(String(rawData || ''));
+  if (text.length < 5) return;
+  for (const rule of CLI_ISSUE_PATTERNS) {
+    if (rule.pattern.test(text)) {
+      _lastCliIssueTime = now;
+      const provider = getProvider(normalizeProviderId(providerId));
+      const cleanText = text.replace(/[\r\n]+/g, ' ').trim().slice(0, 200);
+      const message = '[' + provider.displayName + '] ' + rule.label + ': ' + cleanText;
+      // SSEで全クライアントに通知
+      sseClients.forEach(function(r) {
+        r.write('data: ' + JSON.stringify({ type: 'cli-log', message: message, logType: rule.type, time: new Date().toISOString() }) + '\n\n');
+      });
+      break; // 1チャンクにつき1件のみ通知
+    }
+  }
+}
+
+function flushManagedAiPromptQueue() {
+  const state = managedAiSessionState;
+  if (!state || !claudePty || state.dispatching || !state.ready || state.queue.length === 0) return;
+  const next = state.queue.shift();
+  state.dispatching = true;
+  appendDiagnosticEvent('managed_ai_prompt_dispatch', {
+    provider: state.providerId,
+    queuedAt: next.queuedAt,
+    ageMs: Date.now() - next.queuedAt,
+    remainingQueueLength: state.queue.length,
+  });
+  const promptPayload = typeof next.promptText === 'string' && next.promptText.includes('\n')
+    ? `\u001b[200~${next.promptText}\u001b[201~`
+    : next.promptText;
+  try {
+    claudePty.write(promptPayload);
+  } catch (error) {
+    state.dispatching = false;
+    throw error;
+  }
+  const submitSequence = getManagedAiSubmitSequence(state.providerId);
+  const sendSubmitKey = (index = 0) => {
+    const submitKey = submitSequence[index];
+    if (!submitKey) {
+      state.dispatching = false;
+      state.enterTimer = null;
+      setTimeout(() => flushManagedAiPromptQueue(), 250);
+      return;
+    }
+    state.enterTimer = setTimeout(() => {
+      try {
+        if (claudePty) claudePty.write(submitKey);
+      } finally {
+        sendSubmitKey(index + 1);
+      }
+    }, index === 0 ? getManagedAiEnterDelay(state.providerId) : 220);
+    if (typeof state.enterTimer.unref === 'function') {
+      state.enterTimer.unref();
+    }
+  };
+  sendSubmitKey(0);
+}
+
+function queueManagedAiPrompt(promptText, providerId) {
+  const state = getManagedAiSessionState();
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (state.providerId !== normalizedProviderId) {
+    throw new Error(`${getProviderDisplayName(normalizedProviderId)} の管理セッションが一致していません。`);
+  }
+  state.queue.push({
+    promptText: String(promptText || ''),
+    queuedAt: Date.now(),
+  });
+  appendDiagnosticEvent('managed_ai_prompt_queued', {
+    provider: normalizedProviderId,
+    ready: state.ready,
+    queueLength: state.queue.length,
+    promptChars: String(promptText || '').length,
+    estimatedTokens: estimateTextTokens(promptText),
+  });
+  flushManagedAiPromptQueue();
+  return {
+    queued: true,
+    ready: state.ready,
+    queueLength: state.queue.length,
+  };
+}
+
 function isHeadlessAutomationProvider(providerId) {
   return ['codex', 'gemini'].includes(normalizeProviderId(providerId));
+}
+
+function requiresManagedAiSessionForFormFill(providerId) {
+  return ['claude', 'codex', 'gemini'].includes(normalizeProviderId(providerId));
 }
 
 function getAutomationModeForProvider(providerId) {
@@ -420,6 +813,163 @@ function ensureCodexWorkspaceTrusted(projectRoot = PROJECT_ROOT) {
   return true;
 }
 
+function getGeminiTrustedFoldersPath() {
+  return path.join(os.homedir(), '.gemini', 'trustedFolders.json');
+}
+
+function getGeminiProjectsPath() {
+  return path.join(os.homedir(), '.gemini', 'projects.json');
+}
+
+function ensureGeminiWorkspaceTrusted(projectRoot = PROJECT_ROOT) {
+  const resolvedProjectRoot = path.resolve(projectRoot);
+  const trustedFoldersPath = getGeminiTrustedFoldersPath();
+  const projectsPath = getGeminiProjectsPath();
+  let changed = false;
+
+  try {
+    ensureParentDir(trustedFoldersPath);
+    const trustedFolders = readJsonFileSafe(trustedFoldersPath, {}) || {};
+    if (trustedFolders[resolvedProjectRoot] !== 'TRUST_FOLDER') {
+      trustedFolders[resolvedProjectRoot] = 'TRUST_FOLDER';
+      fs.writeFileSync(trustedFoldersPath, JSON.stringify(trustedFolders, null, 2), 'utf8');
+      changed = true;
+    }
+  } catch (_) {
+    return false;
+  }
+
+  try {
+    ensureParentDir(projectsPath);
+    const projectName = path.basename(resolvedProjectRoot) || 'project';
+    const projectsState = readJsonFileSafe(projectsPath, { projects: {} }) || { projects: {} };
+    projectsState.projects = projectsState.projects || {};
+    const lowerKey = resolvedProjectRoot.toLowerCase();
+    if (!projectsState.projects[lowerKey]) {
+      projectsState.projects[lowerKey] = projectName;
+      fs.writeFileSync(projectsPath, JSON.stringify(projectsState, null, 2), 'utf8');
+      changed = true;
+    }
+  } catch (_) {
+    return changed;
+  }
+
+  return changed;
+}
+
+function isCodexWorkspaceTrusted(projectRoot = PROJECT_ROOT) {
+  const configPath = getCodexConfigPath();
+  if (!fs.existsSync(configPath)) return false;
+  try {
+    const content = fs.readFileSync(configPath, 'utf8');
+    return getCodexTrustProjectKeys(projectRoot).some((key) => content.includes(`[projects.'${key.replace(/'/g, "''")}']`));
+  } catch (_) {
+    return false;
+  }
+}
+
+function isGeminiWorkspaceTrusted(projectRoot = PROJECT_ROOT) {
+  const resolvedProjectRoot = path.resolve(projectRoot);
+  try {
+    const trustedFolders = readJsonFileSafe(getGeminiTrustedFoldersPath(), {}) || {};
+    const projectsState = readJsonFileSafe(getGeminiProjectsPath(), { projects: {} }) || { projects: {} };
+    const projectKeys = Object.keys(projectsState.projects || {});
+    return trustedFolders[resolvedProjectRoot] === 'TRUST_FOLDER'
+      && projectKeys.includes(resolvedProjectRoot.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
+function copyFileIfExists(sourcePath, targetPath) {
+  if (!sourcePath || !targetPath || !fs.existsSync(sourcePath)) return false;
+  ensureParentDir(targetPath);
+  fs.copyFileSync(sourcePath, targetPath);
+  return true;
+}
+
+function getManagedProviderHome(providerId) {
+  return resolveDataPath(path.join('provider-homes', normalizeProviderId(providerId)));
+}
+
+function prepareGeminiManagedHome(projectRoot = PROJECT_ROOT) {
+  const realHome = os.homedir();
+  const managedHome = getManagedProviderHome('gemini');
+  const managedGeminiDir = path.join(managedHome, '.gemini');
+  const managedAppDataRoaming = path.join(managedHome, 'AppData', 'Roaming');
+  const managedAppDataLocal = path.join(managedHome, 'AppData', 'Local');
+  const managedTempDir = path.join(managedHome, 'tmp');
+  fs.mkdirSync(managedGeminiDir, { recursive: true });
+  fs.mkdirSync(managedAppDataRoaming, { recursive: true });
+  fs.mkdirSync(managedAppDataLocal, { recursive: true });
+  fs.mkdirSync(managedTempDir, { recursive: true });
+
+  copyFileIfExists(path.join(realHome, '.gemini', 'oauth_creds.json'), path.join(managedGeminiDir, 'oauth_creds.json'));
+  copyFileIfExists(path.join(realHome, '.gemini', 'google_accounts.json'), path.join(managedGeminiDir, 'google_accounts.json'));
+  copyFileIfExists(path.join(realHome, '.gemini', 'GEMINI.md'), path.join(managedGeminiDir, 'GEMINI.md'));
+  const realSettings = readJsonFileSafe(path.join(realHome, '.gemini', 'settings.json'), {}) || {};
+  const managedSettings = {
+    ...realSettings,
+    security: {
+      ...(realSettings.security || {}),
+      folderTrust: {
+        ...((realSettings.security && realSettings.security.folderTrust) || {}),
+        enabled: false,
+      },
+    },
+    general: {
+      ...(realSettings.general || {}),
+      sessionRetention: {
+        ...((realSettings.general && realSettings.general.sessionRetention) || {}),
+        enabled: false,
+      },
+    },
+  };
+  fs.writeFileSync(path.join(managedGeminiDir, 'settings.json'), JSON.stringify(managedSettings, null, 2), 'utf8');
+
+  const resolvedProjectRoot = path.resolve(projectRoot);
+  const projectName = path.basename(resolvedProjectRoot) || 'project';
+  fs.writeFileSync(path.join(managedGeminiDir, 'projects.json'), JSON.stringify({
+    projects: {
+      [resolvedProjectRoot.toLowerCase()]: projectName,
+    },
+  }, null, 2), 'utf8');
+  fs.writeFileSync(path.join(managedGeminiDir, 'trustedFolders.json'), JSON.stringify({
+    [resolvedProjectRoot]: 'TRUST_FOLDER',
+  }, null, 2), 'utf8');
+
+  return managedHome;
+}
+
+function buildManagedProviderEnv(providerId) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const baseEnv = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+  if (normalizedProviderId !== 'gemini') {
+    return baseEnv;
+  }
+
+  const managedHome = prepareGeminiManagedHome(PROJECT_ROOT);
+  const parsed = path.parse(managedHome);
+  const appDataRoaming = path.join(managedHome, 'AppData', 'Roaming');
+  const appDataLocal = path.join(managedHome, 'AppData', 'Local');
+  const managedTempDir = path.join(managedHome, 'tmp');
+  return {
+    ...baseEnv,
+    HOME: managedHome,
+    USERPROFILE: managedHome,
+    HOMEDRIVE: parsed.root.replace(/\\$/, ''),
+    HOMEPATH: managedHome.slice(parsed.root.length - 1),
+    APPDATA: appDataRoaming,
+    LOCALAPPDATA: appDataLocal,
+    TEMP: managedTempDir,
+    TMP: managedTempDir,
+    XDG_CONFIG_HOME: managedHome,
+    XDG_CACHE_HOME: path.join(managedHome, '.cache'),
+    XDG_STATE_HOME: path.join(managedHome, '.state'),
+    GEMINI_CLI_TRUSTED_FOLDERS_PATH: path.join(managedHome, '.gemini', 'trustedFolders.json'),
+  };
+}
+
 function buildCliCommandSpec(executable, args = []) {
   const exePath = String(executable || '').trim();
   const extension = path.extname(exePath).toLowerCase();
@@ -452,7 +1002,7 @@ async function runProviderCliCommand(providerId, args = [], options = {}) {
   const spec = buildCliCommandSpec(executable, args);
   const result = spawnSync(spec.command, spec.args, {
     cwd: PROJECT_ROOT,
-    env: process.env,
+    env: options.env || process.env,
     encoding: 'utf8',
     windowsHide: true,
     timeout: options.timeout || 15000,
@@ -467,13 +1017,14 @@ async function runProviderCliCommand(providerId, args = [], options = {}) {
   };
 }
 
-async function ensureProviderPlaywrightMcp(providerId) {
+async function ensureProviderPlaywrightMcp(providerId, options = {}) {
   const normalized = normalizeProviderId(providerId);
   if (!['codex', 'gemini'].includes(normalized)) {
     return { ok: true, required: false };
   }
 
-  const check = await runProviderCliCommand(normalized, ['mcp', 'list'], { timeout: 20000 });
+  const cliOptions = { timeout: 20000, env: options.env || process.env };
+  const check = await runProviderCliCommand(normalized, ['mcp', 'list'], cliOptions);
   const combined = `${check.stdout}\n${check.stderr}`;
   if (check.ok && /playwright/i.test(combined)) {
     return { ok: true, required: true, configured: true };
@@ -482,13 +1033,13 @@ async function ensureProviderPlaywrightMcp(providerId) {
   const addArgs = normalized === 'codex'
     ? ['mcp', 'add', 'playwright', '--', 'npm', 'exec', '@playwright/mcp', '--browser', 'chrome']
     : ['mcp', 'add', 'playwright', 'npm', 'exec', '@playwright/mcp', '--browser', 'chrome'];
-  const add = await runProviderCliCommand(normalized, addArgs, { timeout: 30000 });
+  const add = await runProviderCliCommand(normalized, addArgs, { timeout: 30000, env: cliOptions.env });
   if (!add.ok) {
     const message = `${getProviderDisplayName(normalized)} で MCP Playwright の設定に失敗しました。${String(add.stderr || add.stdout || '').trim()}`;
     return { ok: false, required: true, configured: false, error: message };
   }
 
-  const verify = await runProviderCliCommand(normalized, ['mcp', 'list'], { timeout: 20000 });
+  const verify = await runProviderCliCommand(normalized, ['mcp', 'list'], cliOptions);
   const verifyOutput = `${verify.stdout}\n${verify.stderr}`;
   if (verify.ok && /playwright/i.test(verifyOutput)) {
     return { ok: true, required: true, configured: true, added: true };
@@ -515,12 +1066,65 @@ function getAssetCandidates(filename) {
 
 function ensureDashboardSessionToken() {
   if (!dashboardSessionToken) {
-    dashboardSessionToken = crypto.randomBytes(24).toString('hex');
+    dashboardSessionToken = readPersistedDashboardSessionToken();
+    if (!dashboardSessionToken) {
+      dashboardSessionToken = crypto.randomBytes(24).toString('hex');
+      persistDashboardSessionToken(dashboardSessionToken);
+    }
   }
   return dashboardSessionToken;
 }
 
 const DASHBOARD_SESSION_COOKIE = 'sales_claw_session';
+const DASHBOARD_SESSION_FILE = resolveDataPath('dashboard-session.json');
+
+function readPersistedDashboardSessionToken() {
+  try {
+    if (!fs.existsSync(DASHBOARD_SESSION_FILE)) return '';
+    const raw = JSON.parse(fs.readFileSync(DASHBOARD_SESSION_FILE, 'utf8'));
+    const token = typeof raw.token === 'string' ? raw.token.trim() : '';
+    return /^[a-f0-9]{48,}$/i.test(token) ? token : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function persistDashboardSessionToken(token) {
+  try {
+    const dir = path.dirname(DASHBOARD_SESSION_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(DASHBOARD_SESSION_FILE, JSON.stringify({
+      token,
+      updatedAt: new Date().toISOString(),
+    }, null, 2), 'utf8');
+  } catch (_) {
+    // noop
+  }
+}
+
+function getDashboardSessionCookieName() {
+  const runtimePort = dashboardRuntime && dashboardRuntime.port ? dashboardRuntime.port : null;
+  const serverAddress = server && typeof server.address === 'function' ? server.address() : null;
+  const port = runtimePort
+    || (serverAddress && serverAddress.port ? serverAddress.port : null)
+    || settings.getPort()
+    || 'default';
+  const scope = String(port).replace(/[^0-9A-Za-z_-]/g, '') || 'default';
+  return `${DASHBOARD_SESSION_COOKIE}_p${scope}`;
+}
+
+function buildExpiredDashboardSessionCookie(cookieName) {
+  return `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`;
+}
+
+function buildDashboardSessionCookieHeaders() {
+  const currentCookieName = getDashboardSessionCookieName();
+  const headers = [buildDashboardSessionCookie()];
+  if (currentCookieName !== DASHBOARD_SESSION_COOKIE) {
+    headers.push(buildExpiredDashboardSessionCookie(DASHBOARD_SESSION_COOKIE));
+  }
+  return headers;
+}
 
 function serializeForInlineScript(value) {
   return JSON.stringify(value)
@@ -585,7 +1189,7 @@ function parseRequestCookies(req) {
 }
 
 function buildDashboardSessionCookie() {
-  return `${DASHBOARD_SESSION_COOKIE}=${encodeURIComponent(ensureDashboardSessionToken())}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${8 * 60 * 60}`;
+  return `${getDashboardSessionCookieName()}=${encodeURIComponent(ensureDashboardSessionToken())}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${8 * 60 * 60}`;
 }
 
 function isAllowedOrigin(req) {
@@ -629,17 +1233,23 @@ function getRequestSessionToken(req) {
   }
 
   const cookies = parseRequestCookies(req);
-  return cookies[DASHBOARD_SESSION_COOKIE] || '';
+  return cookies[getDashboardSessionCookieName()] || '';
 }
 
-function isAuthorizedDashboardRequest(req) {
+function isAuthorizedDashboardRequest(req, options = {}) {
+  const expectedToken = ensureDashboardSessionToken();
+  const providedToken = getRequestSessionToken(req);
+  const tokenMatches = !!providedToken && providedToken === expectedToken;
+  const allowTokenWithoutOrigin = !!options.allowTokenWithoutOrigin;
+  const hasExplicitBrowserOrigin = !!(req && (req.headers.origin || req.headers.referer));
+
   if (!isAllowedOrigin(req)) {
-    return { ok: false, statusCode: 403, error: 'Blocked cross-origin dashboard request.' };
+    if (!(allowTokenWithoutOrigin && tokenMatches && !hasExplicitBrowserOrigin)) {
+      return { ok: false, statusCode: 403, error: 'Blocked cross-origin dashboard request.' };
+    }
   }
 
-  const providedToken = getRequestSessionToken(req);
-  const expectedToken = ensureDashboardSessionToken();
-  if (!providedToken || providedToken !== expectedToken) {
+  if (!tokenMatches) {
     return { ok: false, statusCode: 401, error: 'Missing or invalid dashboard session token.' };
   }
 
@@ -719,6 +1329,187 @@ function appendDiagnosticEvent(type, payload = {}) {
     });
     fs.appendFileSync(filePath, entry + '\n', 'utf8');
   } catch (_) {}
+}
+
+function getAiRunMetricsFile() {
+  return resolveDataPath('ai-run-metrics.jsonl');
+}
+
+function appendAiRunMetric(type, payload = {}) {
+  try {
+    ensureDataDir();
+    const filePath = getAiRunMetricsFile();
+    const entry = JSON.stringify({
+      ts: new Date().toISOString(),
+      type,
+      ...payload,
+    });
+    fs.appendFileSync(filePath, entry + '\n', 'utf8');
+  } catch (_) {}
+}
+
+function estimateTextTokens(text) {
+  return Math.max(1, Math.ceil(String(text || '').length / 4));
+}
+
+const MANAGED_AI_CONTRACT_VERSION = 1;
+
+function trimOneLineText(value, maxLength = 160) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
+function trimMultilineText(value, maxLength = 1200) {
+  const text = String(value || '')
+    .replace(/\r/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (!text) return '';
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+}
+
+function compactMessageForPrompt(message, sender = {}) {
+  const lines = String(message || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trimEnd());
+  while (lines.length > 0 && !lines[0].trim()) lines.shift();
+  while (lines.length > 0 && !lines[lines.length - 1].trim()) lines.pop();
+
+  if (lines.length > 0 && /^お世話になります/.test(lines[0].trim())) {
+    lines.shift();
+  }
+  if (lines.length > 0) {
+    const introLine = lines[0].trim();
+    const senderName = String(sender.name || '').trim();
+    const senderCompany = String(sender.companyName || '').trim();
+    if (
+      (senderName && introLine.includes(senderName))
+      || (senderCompany && introLine.includes(senderCompany))
+      || /と申します。?$/.test(introLine)
+    ) {
+      lines.shift();
+    }
+  }
+  while (lines.length > 0 && !lines[0].trim()) lines.shift();
+
+  let signatureIndex = lines.length;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (
+      /^何卒よろしくお願いいたします/.test(line)
+      || /^よろしくお願いいたします/.test(line)
+      || /^TEL[:：]/i.test(line)
+      || /^MAIL[:：]/i.test(line)
+      || (sender.companyName && line.includes(String(sender.companyName).trim()))
+      || (sender.name && line.includes(String(sender.name).trim()))
+    ) {
+      signatureIndex = i;
+      break;
+    }
+  }
+
+  const core = lines.slice(0, signatureIndex).join('\n');
+  return trimMultilineText(core, 900);
+}
+
+function buildCompactSenderPayload(sender = {}) {
+  const payload = {};
+  [
+    ['companyName', sender.companyName],
+    ['name', sender.name],
+    ['nameKana', sender.nameKana],
+    ['email', sender.email],
+    ['phone', sender.phone],
+    ['mobile', sender.mobile],
+    ['fax', sender.fax],
+    ['title', sender.title],
+    ['department', sender.department],
+    ['postalCode', sender.postalCode],
+    ['address', sender.address],
+    ['website', sender.website],
+    ['partnerPage', sender.partnerPage],
+  ].forEach(([key, value]) => {
+    const normalized = String(value || '').trim();
+    if (normalized) payload[key] = normalized;
+  });
+  return payload;
+}
+
+function buildCompactApproachPayload(objective = '', guardrails = '') {
+  const payload = {};
+  if (objective) payload.objective = trimOneLineText(objective, 220);
+  if (guardrails) payload.guardrails = trimOneLineText(guardrails, 220);
+  return payload;
+}
+
+function buildManagedAiSessionContract(providerId = getManagedAiProvider(), options = {}) {
+  const provider = getProvider(providerId);
+  const autoSendSafe = typeof options.autoSendSafe === 'boolean'
+    ? options.autoSendSafe
+    : getManagedAiAutoSendSafe();
+  return [
+    `SALES_CLAW_SESSION_CONTRACT v${MANAGED_AI_CONTRACT_VERSION}`,
+    `provider=${provider.id}`,
+    `cli=${provider.cliLabel}`,
+    `sendPolicy=${autoSendSafe ? 'safe-auto-send' : 'approval-stop'}`,
+    'rules:',
+    '- direct Playwright worker / JS automation は使わない',
+    '- MCP は Playwright のみ使用。別の Web 取得 MCP は使わない',
+    '- 1社目のみ browser_navigate 可。2社目以降は browser_evaluate(window.open) + browser_tabs',
+    '- 既存タブを navigate で上書きしない',
+    '- CAPTCHA / reCAPTCHA / hCaptcha / Turnstile / ロボチェッカーは回避しない',
+    '- 営業NG / 対象外は skipped',
+    '- form_fill / confirm_reached / awaiting_approval / submitted を正しく記録',
+    '- 入力項目は設定にある値だけ使う。推測しない',
+    autoSendSafe
+      ? '- 安全と判断できるフォームだけ submitted まで進める。少しでも手動判断が必要なら awaiting_approval'
+      : '- 送信は行わず awaiting_approval で止める',
+    '- 同じセッションではこの契約を再説明しない。以後の batch payload だけ実行する',
+  ].join('\n');
+}
+
+function extractPromptJsonLine(outputText) {
+  const lines = String(outputText || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.startsWith('{') || !line.endsWith('}')) continue;
+    try {
+      return JSON.parse(line);
+    } catch (_) {}
+  }
+  return null;
+}
+
+function summarizePhaseAAnalysisForPrompt(analysis) {
+  if (!analysis || typeof analysis !== 'object') return [];
+  const lines = [];
+  const businessAreas = Array.isArray(analysis.businessAreas)
+    ? analysis.businessAreas.map((entry) => trimOneLineText(entry && entry.label)).filter(Boolean).slice(0, 2)
+    : [];
+  const focusAreas = Array.isArray(analysis.focusAreas)
+    ? analysis.focusAreas.map((entry) => trimOneLineText(entry)).filter(Boolean).slice(0, 2)
+    : [];
+  const gaps = Array.isArray(analysis.gaps)
+    ? analysis.gaps.map((entry) => trimOneLineText(entry && entry.strength && entry.strength.label)).filter(Boolean).slice(0, 2)
+    : [];
+  const patterns = Array.isArray(analysis.relevantPatterns)
+    ? analysis.relevantPatterns.map((entry) => trimOneLineText(entry && (entry.partner || entry.type || entry.proof))).filter(Boolean).slice(0, 1)
+    : [];
+
+  if (businessAreas.length > 0) lines.push(`- 事業領域: ${businessAreas.join(' / ')}`);
+  if (focusAreas.length > 0) lines.push(`- 注力/状況: ${focusAreas.join(' / ')}`);
+  if (gaps.length > 0) lines.push(`- 提案軸: ${gaps.join(' / ')}`);
+  if (patterns.length > 0) lines.push(`- 近い支援実績: ${patterns.join(' / ')}`);
+  if (analysis.analysisMode) lines.push(`- 分析モード: ${trimOneLineText(analysis.analysisMode, 40)}`);
+  return lines;
 }
 
 function watchTarget(targetPath, mode) {
@@ -1589,6 +2380,23 @@ async function resolveClaudeExecutable(providerId = getSelectedAiProvider()) {
   return provider.id;
 }
 
+async function resolveNodeExecutable() {
+  if (/node(?:\.exe)?$/i.test(path.basename(process.execPath || ''))) {
+    return process.execPath;
+  }
+  if (process.platform === 'win32') {
+    const result = await execCommand('where node', { timeout: 3000 });
+    const candidates = String(result.stdout || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && fs.existsSync(line));
+    return candidates[0] || null;
+  }
+  const result = await execCommand('which node', { timeout: 3000 });
+  const candidate = String(result.stdout || '').trim();
+  return candidate && fs.existsSync(candidate) ? candidate : null;
+}
+
 async function probeClaudeAuthStatus(providerId = getSelectedAiProvider()) {
   const provider = getProvider(providerId);
   const executable = await resolveClaudeExecutable(provider.id);
@@ -1668,6 +2476,105 @@ async function probeClaudeAuthStatus(providerId = getSelectedAiProvider()) {
   };
 }
 
+async function probeNpmStatus() {
+  const result = await execCommand('npm --version', { timeout: 5000 });
+  if (result.error) {
+    return {
+      available: false,
+      version: null,
+      error: String(result.stderr || result.stdout || result.error.message || 'npm is not available.').trim(),
+    };
+  }
+  const version = String(result.stdout || result.stderr || '').trim().split(/\r?\n/)[0].trim();
+  return {
+    available: !!version,
+    version: version || null,
+    error: version ? null : 'npm version could not be determined.',
+  };
+}
+
+async function probePlaywrightPackageStatus(npmStatus = null) {
+  const npm = npmStatus || await probeNpmStatus();
+  if (!npm.available) {
+    return {
+      available: false,
+      error: 'npm is required to bootstrap Playwright MCP.',
+      command: 'npm exec @playwright/mcp -- --help',
+    };
+  }
+  const result = await execCommand('npm exec @playwright/mcp -- --help', { timeout: 12000, maxBuffer: 1024 * 1024 });
+  const output = String(result.stdout || result.stderr || '').trim();
+  const available = !result.error && /Usage: Playwright MCP/i.test(output);
+  return {
+    available,
+    error: available ? null : (output || String(result.error && result.error.message || 'Playwright MCP bootstrap check failed.').trim()),
+    command: 'npm exec @playwright/mcp -- --help',
+  };
+}
+
+async function probeProviderPlaywrightSetup(providerId = getSelectedAiProvider()) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!['codex', 'gemini'].includes(normalizedProviderId)) {
+    return {
+      configured: null,
+      error: null,
+      note: 'Claude validates Playwright access at launch/runtime. Codex and Gemini additionally require MCP registration.',
+    };
+  }
+  const result = await runProviderCliCommand(normalizedProviderId, ['mcp', 'list'], { timeout: 20000 });
+  const output = `${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim();
+  const configured = !!(result.ok && /playwright/i.test(output));
+  return {
+    configured,
+    error: configured ? null : (output || `${getProviderDisplayName(normalizedProviderId)} MCP list did not report Playwright.`),
+    note: configured ? 'Playwright MCP is registered.' : 'Playwright MCP is not registered yet.',
+  };
+}
+
+async function probeAiSetupDiagnostics(providerId = getSelectedAiProvider()) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const provider = getProvider(normalizedProviderId);
+  const auth = await probeClaudeAuthStatus(normalizedProviderId);
+  const npm = await probeNpmStatus();
+  const playwrightPackage = await probePlaywrightPackageStatus(npm);
+  const providerPlaywright = await probeProviderPlaywrightSetup(normalizedProviderId);
+  const workspaceTrusted = normalizedProviderId === 'codex'
+    ? {
+      configured: isCodexWorkspaceTrusted(PROJECT_ROOT),
+      note: 'Codex では trusted workspace 設定が必要です。',
+    }
+    : normalizedProviderId === 'gemini'
+      ? {
+        configured: isGeminiWorkspaceTrusted(PROJECT_ROOT),
+        note: 'Gemini では trustedFolders / projects 登録が必要です。',
+      }
+      : {
+        configured: true,
+        note: 'Claude は workspace trust の事前設定を必要としません。',
+      };
+  return {
+    provider: normalizedProviderId,
+    providerLabel: provider.displayName,
+    cliInstalled: !!auth.installed,
+    cliLoggedIn: !!auth.loggedIn,
+    cliAuthError: auth.error || null,
+    npm,
+    playwrightPackage,
+    providerPlaywright,
+    workspaceTrusted,
+    installCommand: getInstallCommand(normalizedProviderId),
+    autoInstallSupported: !!npm.available,
+    managedSessionRequired: requiresManagedAiSessionForFormFill(normalizedProviderId),
+    tabRetentionNote: `${provider.displayName} の確認待ちでフォームタブを残すには、ダッシュボードの「AI を起動」で ${provider.displayName} を managed セッションとして起動してから実行する必要があります。`,
+    launchExamples: getProviderLaunchExamples(normalizedProviderId),
+    approvalCaveat: {
+      ...getProviderApprovalCaveat(normalizedProviderId, 'ja'),
+      en: getProviderApprovalCaveat(normalizedProviderId, 'en').message,
+      ja: getProviderApprovalCaveat(normalizedProviderId, 'ja').message,
+    },
+  };
+}
+
 async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider()) {
   const selectedProviderId = normalizeProviderId(providerId);
   const managedProviderId = getManagedAiProvider();
@@ -1687,11 +2594,16 @@ async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider())
       error: `${provider.cliLabel} が未ログインです。先に ${provider.displayName} を起動してログインを完了してください。`,
     };
   }
-  if (isHeadlessAutomationProvider(selectedProviderId)) {
-    if (selectedProviderId === 'codex') {
-      ensureCodexWorkspaceTrusted(PROJECT_ROOT);
-    }
-    const playwrightSetup = await ensureProviderPlaywrightMcp(selectedProviderId);
+  if (selectedProviderId === 'codex') {
+    ensureCodexWorkspaceTrusted(PROJECT_ROOT);
+  }
+  if (selectedProviderId === 'gemini') {
+    ensureGeminiWorkspaceTrusted(PROJECT_ROOT);
+  }
+  if (['codex', 'gemini'].includes(selectedProviderId)) {
+    const playwrightSetup = await ensureProviderPlaywrightMcp(selectedProviderId, {
+      env: selectedProviderId === 'gemini' ? buildManagedProviderEnv(selectedProviderId) : process.env,
+    });
     if (!playwrightSetup.ok) {
       return {
         ok: false,
@@ -1699,36 +2611,35 @@ async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider())
         error: playwrightSetup.error || `${provider.displayName} の MCP Playwright 設定に失敗しました。`,
       };
     }
-    const activeRun = getActiveHeadlessRun();
-    if (activeRun && activeRun.provider !== selectedProviderId) {
-      return {
-        ok: false,
-        statusCode: 409,
-        error: `現在は ${getProviderDisplayName(activeRun.provider)} の headless automation が実行中です。完了を待つか停止してください。`,
-      };
-    }
-  } else {
-    if (!claudePty) {
-      return {
-        ok: false,
-        statusCode: 409,
-        error: `${provider.displayName} が未起動です。先に「AI を起動」でダッシュボード管理セッションを開始してください。外部ターミナルだけでは自動実行できません。`,
-      };
-    }
-    if (managedProviderId !== selectedProviderId) {
-      return {
-        ok: false,
-        statusCode: 409,
-        error: `現在の管理セッションは ${getProviderDisplayName(managedProviderId)} です。Settings で選択した ${provider.displayName} に合わせて起動し直してください。`,
-      };
-    }
-    if (!['auto', 'bypassPermissions'].includes(claudeProcessMode)) {
-      return {
-        ok: false,
-        statusCode: 409,
-        error: `現在の ${provider.displayName} 起動モードは ${getProviderModeLabel(provider.id, claudeProcessMode, 'ja')}（${claudeProcessMode}）です。このモードでは権限確認で停止しやすいため、AIフォーム入力は ${getProviderRecommendedModesText(provider.id, 'ja')} で起動してください。`,
-      };
-    }
+  }
+  const activeRun = getActiveHeadlessRun();
+  if (activeRun) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: `現在は ${getProviderDisplayName(activeRun.provider)} の headless automation が実行中です。確認待ちタブを残すため、完了を待つか停止してから managed セッションで実行してください。`,
+    };
+  }
+  if (requiresManagedAiSessionForFormFill(selectedProviderId) && !claudePty) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: `${provider.displayName} が未起動です。確認待ちでフォームタブを残すには、先に「AI を起動」で ${provider.displayName} の管理セッションを開始してください。外部ターミナルや headless 実行だけではタブ保持できません。`,
+    };
+  }
+  if (requiresManagedAiSessionForFormFill(selectedProviderId) && managedProviderId !== selectedProviderId) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: `現在の管理セッションは ${getProviderDisplayName(managedProviderId)} です。${provider.displayName} でタブ保持したい場合は、${provider.displayName} を選んで起動し直してください。`,
+    };
+  }
+  if (requiresManagedAiSessionForFormFill(selectedProviderId) && !['auto', 'bypassPermissions'].includes(claudeProcessMode)) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: `現在の ${provider.displayName} 起動モードは ${getProviderModeLabel(provider.id, claudeProcessMode, 'ja')}（${claudeProcessMode}）です。このモードでは権限確認で停止しやすいため、AIフォーム入力は ${getProviderRecommendedModesText(provider.id, 'ja')} で起動してください。`,
+    };
   }
   const sender = settings.getSender();
   const missingSenderFields = [];
@@ -1748,120 +2659,223 @@ async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider())
     auth,
     providerId: selectedProviderId,
     provider,
-    execution: isHeadlessAutomationProvider(selectedProviderId) ? 'headless' : 'managed',
+    execution: 'managed',
   };
 }
 
-function buildClaudeFormFillPrompt(companies, sender, providerId = getManagedAiProvider()) {
-  const provider = getProvider(providerId);
+async function runParallelAnalysisWorker(company, nodeExecutable) {
+  const { spawn } = require('child_process');
+  const startedAtMs = Date.now();
+  const payload = JSON.stringify({
+    no: company.no,
+    companyName: company.companyName || company.name || '',
+    url: company.url || '',
+    type: company.type || '',
+    formUrl: company.formUrl || '',
+  });
+
+  return await new Promise((resolve) => {
+    const child = spawn(nodeExecutable, ['src/parallel-analysis.cjs', payload], {
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, SALES_CLAW_CLI_TOKEN: process.env.SALES_CLAW_CLI_TOKEN || CLI_LOG_SECRET },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk || '');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '');
+    });
+    child.on('error', (error) => {
+      resolve({
+        ok: false,
+        companyNo: company.no,
+        companyName: company.companyName || company.name || '',
+        elapsedMs: Date.now() - startedAtMs,
+        error: error.message || 'parallel-analysis spawn failed',
+        stdout,
+        stderr,
+      });
+    });
+    child.on('close', (exitCode) => {
+      const parsed = extractPromptJsonLine(stdout);
+      if (parsed && parsed.ok) {
+        resolve({
+          ok: true,
+          companyNo: company.no,
+          companyName: company.companyName || company.name || '',
+          elapsedMs: Date.now() - startedAtMs,
+          analysis: parsed.analysis || null,
+          message: typeof parsed.message === 'string' ? parsed.message : '',
+          formUrl: parsed.formUrl || company.formUrl || '',
+          formResolutionMethod: parsed.formResolutionMethod || null,
+          stdout,
+          stderr,
+        });
+        return;
+      }
+      const parsedError = parsed && typeof parsed.error === 'string' ? parsed.error : '';
+      const errorText = parsedError
+        || trimOneLineText(stderr || stdout || `parallel-analysis exited with code ${exitCode || 0}`, 240)
+        || 'parallel-analysis failed';
+      resolve({
+        ok: false,
+        companyNo: company.no,
+        companyName: company.companyName || company.name || '',
+        elapsedMs: Date.now() - startedAtMs,
+        error: errorText,
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+async function executeBackendPhaseABatch(companies, providerId = getSelectedAiProvider()) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const nodeExecutable = await resolveNodeExecutable();
+  if (!nodeExecutable || !fs.existsSync(nodeExecutable)) {
+    throw new Error('Node.js executable was not found for Phase A analysis.');
+  }
+
+  const batchStartedAtMs = Date.now();
+  appendDiagnosticEvent('phase_a_batch_started', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+  });
+  appendAiRunMetric('phase_a_batch_started', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+  });
+
+  const results = await Promise.all(companies.map((company) => runParallelAnalysisWorker(company, nodeExecutable)));
+  const successes = [];
+  const failures = [];
+
+  results.forEach((result) => {
+    if (result && result.ok) successes.push(result);
+    else failures.push(result);
+  });
+
+  const elapsedMs = Date.now() - batchStartedAtMs;
+  appendDiagnosticEvent('phase_a_batch_completed', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+    successCount: successes.length,
+    failureCount: failures.length,
+    elapsedMs,
+  });
+  appendAiRunMetric('phase_a_batch_completed', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+    successCount: successes.length,
+    failureCount: failures.length,
+    elapsedMs,
+      companies: results.map((result) => ({
+        companyNo: result.companyNo,
+        companyName: result.companyName,
+        ok: !!result.ok,
+        elapsedMs: result.elapsedMs,
+        error: result.ok ? null : result.error,
+        messageChars: result.ok ? String(result.message || '').length : 0,
+        analysisMode: result.ok && result.analysis ? result.analysis.analysisMode || null : null,
+        hasFormUrl: !!(result.ok && result.formUrl),
+        formResolutionMethod: result.ok ? result.formResolutionMethod || null : null,
+      })),
+    });
+
+  return {
+    provider: normalizedProviderId,
+    nodeExecutable,
+    elapsedMs,
+    successes,
+    failures,
+  };
+}
+
+function buildClaudeFormFillPrompt(companies, sender, providerId = getManagedAiProvider(), options = {}) {
   const configuredScreenshotDir = settings.getScreenshotDir();
   const promptScreenshotDir = path.join(PROJECT_ROOT, 'screenshots');
+  const autoSendSafe = typeof options.autoSendSafe === 'boolean'
+    ? options.autoSendSafe
+    : getManagedAiAutoSendSafe();
+  const phaseAByCompany = options.phaseAByCompany instanceof Map ? options.phaseAByCompany : new Map();
+  const phaseACompleted = phaseAByCompany.size > 0;
   const messageTemplates = settings.getSection('messageTemplates') || {};
   const approachObjective = typeof messageTemplates.approachObjective === 'string' ? messageTemplates.approachObjective.trim() : '';
   const approachGuardrails = typeof messageTemplates.approachGuardrails === 'string' ? messageTemplates.approachGuardrails.trim() : '';
-  const companyListText = (companies || []).map((company, index) => {
-    const lines = [
-      `${index + 1}. 会社名: ${company.companyName || '(不明)'}`,
-      `   管理番号: ${company.no}`,
-    ];
-    if (company.url) lines.push(`   WebサイトURL: ${company.url}`);
-    if (company.formUrl) lines.push(`   問い合わせURL: ${company.formUrl}`);
-    if (company.type) lines.push(`   種別: ${company.type}`);
-    if (company.notes) lines.push(`   備考: ${company.notes}`);
-    lines.push(`   inputスクショ保存先: ${path.join(promptScreenshotDir, `ss-${company.no}-input.png`)}`);
-    lines.push(`   confirmスクショ保存先: ${path.join(promptScreenshotDir, `ss-${company.no}-confirm.png`)}`);
-    lines.push(...buildCompanyAutomationHints(company));
-    return lines.join('\n');
-  }).join('\n\n');
+  const missingFormUrlCount = (companies || []).filter((company) => !String(company.formUrl || '').trim()).length;
+  const allFormUrlsResolved = missingFormUrlCount === 0;
+  const companyPayloadLines = (companies || []).map((company, index) => {
+    const phaseA = phaseAByCompany.get(String(company.no)) || null;
+    const compactPayload = {
+      index: index + 1,
+      no: company.no,
+      name: company.companyName || '(不明)',
+      type: String(company.type || '').trim() || undefined,
+      site: String(company.url || '').trim() || undefined,
+      form: String(company.formUrl || '').trim() || undefined,
+      note: company.notes ? trimOneLineText(company.notes, 120) : undefined,
+      attempt: company.contactNo && company.contactNo > 1 ? company.contactNo : undefined,
+      screenshots: {
+        input: path.join(promptScreenshotDir, `ss-${company.no}-input.png`),
+        confirm: path.join(promptScreenshotDir, `ss-${company.no}-confirm.png`),
+        ...(autoSendSafe ? { sent: path.join(promptScreenshotDir, `ss-${company.no}-sent.png`) } : {}),
+      },
+      messageCore: compactMessageForPrompt(phaseA && phaseA.message, sender) || undefined,
+      analysisHints: summarizePhaseAAnalysisForPrompt(phaseA && phaseA.analysis)
+        .map((line) => trimOneLineText(String(line || '').replace(/^- /, ''), 160))
+        .filter(Boolean)
+        .slice(0, 4),
+      automationHints: buildCompanyAutomationHints(company)
+        .map((hint) => trimOneLineText(hint, 160))
+        .filter(Boolean)
+        .slice(0, 3),
+      formResolution: phaseA && phaseA.formResolutionMethod && company.formUrl
+        ? phaseA.formResolutionMethod
+        : undefined,
+    };
+    return JSON.stringify(compactPayload);
+  }).join('\n');
 
-  const senderLines = [
-    `- 会社名: ${sender.companyName || ''}`,
-    `- 担当者名: ${sender.name || ''}`,
-    `- 担当者名カナ: ${sender.nameKana || ''}`,
-    `- メールアドレス: ${sender.email || ''}`,
-    `- 電話番号: ${sender.phone || ''}`,
-    `- 携帯番号: ${sender.mobile || ''}`,
-    `- FAX: ${sender.fax || ''}`,
-    `- 役職: ${sender.title || ''}`,
-    `- 部署: ${sender.department || ''}`,
-    `- 郵便番号: ${sender.postalCode || ''}`,
-    `- 住所: ${sender.address || ''}`,
-    `- Webサイト: ${sender.website || ''}`,
-    `- パートナーページ: ${sender.partnerPage || ''}`,
+  const senderPayload = JSON.stringify(buildCompactSenderPayload(sender));
+  const approachPayload = JSON.stringify(buildCompactApproachPayload(approachObjective, approachGuardrails));
+
+  return [
+    'SALES_CLAW_BATCH_PAYLOAD',
+    JSON.stringify({
+      companyCount: companies.length,
+      phaseACompleted,
+      autoSendSafe,
+      knownFormUrlCount: (companies || []).filter((company) => String(company.formUrl || '').trim()).length,
+      missingFormUrlCount,
+      screenshotDir: promptScreenshotDir,
+      configuredScreenshotDir,
+    }),
+    '',
+    'sender_json:',
+    senderPayload,
+    '',
+    'approach_json:',
+    approachPayload,
+    '',
+    'batch_rules:',
+    '- Phase A は backend 完了済み。再分析・再生成しない',
+    '- messageCore は本文コア。必要なら共有 sender_json を使って短い挨拶と署名を補う',
+    '- 本文コアは最小限の短縮以外で書き換えない',
+    '- unresolved form は site から Contact/お問い合わせ または common path を浅く確認する',
+    '- 1社ずつ処理し、結果報告は簡潔にする',
+    autoSendSafe
+      ? '- 安全と判断できたフォームだけ submitted。手動確認が必要なら awaiting_approval'
+      : '- 送信は行わず awaiting_approval で止める',
+    '',
+    'companies_jsonl:',
+    companyPayloadLines,
   ].join('\n');
-  const approachLines = [];
-  if (approachObjective) approachLines.push(`- 狙い: ${approachObjective}`);
-  if (approachGuardrails) approachLines.push(`- 避けたいこと: ${approachGuardrails}`);
-
-  return `以下の${companies.length}社に対して問い合わせフォーム入力作業を実行してください。
-
-## 絶対条件
-- この作業は ${provider.cliLabel} と MCP Playwright を使って進めること
-- Web確認・フォーム解析・入力・スクリーンショットは **mcp__playwright__browser_navigate / browser_snapshot / browser_fill_form / browser_take_screenshot / browser_click / browser_tabs** だけを使うこと
-- **darbot-windows-mcp - Scrape-Tool を含む他の MCP Web 取得ツールは使わないこと**
-- リポジトリ内の direct Playwright worker / JS automation に依存しないこと
-- 送信直前の画面で止め、送信は行わないこと
-- 各社のフォームタブは閉じずに残し、ユーザーが手動送信できる状態にすること
-- reCAPTCHA / hCaptcha / Cloudflare Turnstile などの手動認証は回避しないこと。検出したらユーザー手動対応待ちとして扱うこと
-- 営業目的NG・対象外・利用目的不一致のフォームには入力しないこと
-- スクリーンショットは対象企業リストに書かれたプロジェクト配下の絶対パスへ保存すること。今回の保存先は ${promptScreenshotDir} で、settings の保存先 ${configuredScreenshotDir} ではない
-- Bash でスクリーンショットをコピー・移動しないこと。保存後のファイル移動は不要
-- 問い合わせURLが既知なら、余計な探索をせずそのURLを最優先で開くこと
-- 問い合わせURLが未登録なら、まず公式サイト内の「お問い合わせ / Contact」を確認し、それでも見つからない場合のみ「会社名 問い合わせ」で1回だけ検索すること
-- 検索結果は公式ドメインの最上位候補を優先し、無関係なページへ横道探索しないこと
-
-## 送信者情報
-${senderLines}
-
-${approachLines.length > 0 ? `## 営業アプローチ方針
-${approachLines.join('\n')}
-- 上記は AI への内部指示です。顧客向け本文にそのまま転記せず、文面のトーン・提案内容・避ける表現に反映してください
-
-` : ''}## 対象企業リスト
-${companyListText}
-
-## 実行手順
-1. 各社の Web サイトと問い合わせフォームを、MCP Playwright の navigate / snapshot で確認する
-2. src/company-analyzer.cjs を使って企業分析し、src/message-builder.cjs の buildCustomMessage() または buildMessage() を使って本文を生成する
-3. action-logger.cjs の logAction(no, name, 'message_draft', 生成した本文全文) を必ず記録する
-3.1. action-logger.cjs の logAction は同期関数。.then() / .catch() を付けず、そのまま呼ぶこと
-4. 「メッセージ生成完了」などの要約だけを残すのは禁止。確認待ちで全文を見られる状態にする
-4.1. 本文は薄い一般文にしない。相手サイトで読み取れた固有要素を最低2点、こちらの提供価値を1点、近い支援実績や参考事例を1点は反映すること
-4.2. 「お困りではないでしょうか」だけで終わらせず、どの案件のどの工程を補完できるかまで書くこと
-5. フォーム本文や注意書きを読み、営業目的NG・利用目的不一致・対象外フォームではないか確認する
-6. 対象外でなければ必要な項目を把握し、送信者情報と生成メッセージを入力する
-7. input スクリーンショットを保存する
-8. 確認画面があれば confirm スクリーンショットを保存する
-8.1. Playwright の保存先は必ず ${promptScreenshotDir} を使う。ほかの絶対パスには保存しないこと
-8.2. reCAPTCHA などでユーザーの手動操作が必要な場合や、確認画面がなく最終クリックが即送信になるフォームでは、最終送信ボタンを押さず input スクリーンショットで止めること
-9. action-logger.cjs の logAction を使って form_fill → confirm_reached → awaiting_approval を記録する
-10. src/live-monitor.cjs の updateLiveMonitor / finishLiveMonitor を使って currentUrl・step・latestScreenshot を更新する
-11. タブは閉じずに残し、ユーザーがダッシュボードから判断できる状態にする
-
-## 対象外の判定ルール
-- フォーム本文や注意書きに「営業目的の問い合わせ禁止」「営業・売り込み禁止」「サービス導入相談専用」「既存顧客専用」「採用専用」「IR専用」「報道専用」などの記載がある場合は対象外
-- 対象外の場合はフォーム入力しない
-- 対象外の場合は logAction(no, name, 'skipped', '営業NG/対象外: 理由') を記録する
-- 対象外の場合は finishLiveMonitor(companyNo, { status: 'skipped', step: '営業NG/対象外', ... }) で終了する
-- 対象外なのに awaiting_approval へ進めてはいけない
-
-## 入力項目ルール
-- 最低限の基本項目は「会社名・担当者名・メール・電話・問い合わせ本文」。これらは設定値がある場合のみ使う
-- 追加項目の「部署・役職・担当者名カナ・郵便番号・住所・携帯・FAX・Webサイト」は、フォーム上に明示的な対応項目がある場合だけ使う
-- 設定に存在しない値は作らない。推測・補完・創作は禁止
-- フォーム必須項目に対応する設定値が不足している場合は、その不足内容をログに明記する
-- companyProfile.notes や内部メモはフォーム入力や送信本文に使わない
-- valuePropositions や messageTemplates は message-builder.cjs 経由で反映し、本文をその場で好きに作り替えすぎない
-- エラー時は action-logger.cjs の error ログに、原因・URL・不足項目・CAPTCHA有無を分かる形で残すこと
-
-## 注意
-- 相手企業ごとにフォーム構造が違っても、その場で判断して対応する
-- 送信よりも、確認待ち状態の正確な記録を優先する
-- 確認待ちでは status を awaiting_approval にする
-- CAPTCHA / 手動送信待ちの確認待ちでは、awaiting_approval の details に「手動対応理由」を具体的に書くこと
-- 完了・失敗・中断時は finishLiveMonitor を呼ぶ
-- Playwright 以外の MCP ツールで権限確認が出そうな場合は、そのツールを使わず Playwright 側の操作に切り替える
-- 進行状況とエラーは簡潔に報告する`;
 }
 
 function getClaudeAutomationModel(providerId = getSelectedAiProvider()) {
@@ -1919,22 +2933,47 @@ function writeWorkspaceClaudeFormFillPromptFile(companies, promptText, providerI
   return promptFile;
 }
 
-function queueClaudeFormFillInManagedSession(companies, providerId = getManagedAiProvider()) {
+function queueClaudeFormFillInManagedSession(companies, providerId = getManagedAiProvider(), options = {}) {
   if (!claudePty) {
     throw new Error('Managed AI session is not running.');
   }
   const normalizedProviderId = normalizeProviderId(providerId);
   const provider = getProvider(normalizedProviderId);
+  const state = getManagedAiSessionState();
+  const autoSendSafe = typeof options.autoSendSafe === 'boolean'
+    ? options.autoSendSafe
+    : getManagedAiAutoSendSafe();
   const sender = settings.getSender();
-  const promptFile = writeClaudeFormFillPromptFile(companies, buildClaudeFormFillPrompt(companies, sender, normalizedProviderId), normalizedProviderId);
+  const phaseAByCompany = options.phaseAByCompany instanceof Map ? options.phaseAByCompany : new Map();
+  const needsSessionContract = state.contractVersionSent !== MANAGED_AI_CONTRACT_VERSION;
+  const sessionContractText = needsSessionContract
+    ? buildManagedAiSessionContract(normalizedProviderId, { autoSendSafe })
+    : '';
+  const fullMessageChars = companies.reduce((total, company) => {
+    const phaseA = phaseAByCompany.get(String(company.no)) || null;
+    return total + String(phaseA && phaseA.message ? phaseA.message : '').length;
+  }, 0);
+  const compactMessageChars = companies.reduce((total, company) => {
+    const phaseA = phaseAByCompany.get(String(company.no)) || null;
+    return total + compactMessageForPrompt(phaseA && phaseA.message, sender).length;
+  }, 0);
+  const promptText = buildClaudeFormFillPrompt(companies, sender, normalizedProviderId, options);
+  const promptFile = writeClaudeFormFillPromptFile(companies, promptText, normalizedProviderId);
+  const workspacePromptFile = writeWorkspaceClaudeFormFillPromptFile(companies, promptText, normalizedProviderId);
   const model = getClaudeAutomationModel(normalizedProviderId);
   const messageLines = [
-    `次の指示ファイルを読んで、その内容を実行してください: ${promptFile}`,
-    `必ず ${provider.cliLabel} と MCP Playwright を使って進めてください。`,
-    'リポジトリ内の direct Playwright worker / JS automation は使わないでください。',
-    '送信は行わず、確認待ちまでで止め、フォームタブは閉じないでください。',
+    `Sales Claw の batch payload を送ります。必ず ${provider.cliLabel} と MCP Playwright で実行してください。前回までの会話や未完了タスクは引き継がず、この batch だけを正として扱ってください。`,
+    'Phase A は backend 完了済みです。再分析・再生成・settings 更新はしないでください。',
+    autoSendSafe
+      ? '安全と判断できるフォームだけ自動送信してください。CAPTCHA / 手動確認 / 営業NGは awaiting_approval にしてください。'
+      : '送信は行わず、awaiting_approval で止めてください。',
+    '本文は companies_jsonl の messageCore を基準に使い、必要なら sender_json の署名だけ補ってください。',
+    '進行報告は簡潔にしてください。',
+    '--- BEGIN SALES CLAW BATCH ---',
+    promptText,
+    '--- END SALES CLAW BATCH ---',
   ];
-  if (model) {
+  if (model && normalizedProviderId === 'claude') {
     messageLines.splice(1, 0, `優先モデル: ${model}`);
   }
 
@@ -1950,13 +2989,40 @@ function queueClaudeFormFillInManagedSession(companies, providerId = getManagedA
       companyNo: company.no,
       companyName: company.companyName || company.name || '',
       status: 'queued',
-      step: `${provider.displayName} CLI に作業指示を送信`,
+      step: `${provider.displayName} CLI にキュー投入（2フェーズ並列処理）`,
       currentUrl: company.formUrl || company.url || '',
     });
   });
 
-  emitClaudeAutomationLog(`[AIフォーム入力開始] ${companies.length}社の処理を ${provider.displayName} CLI に依頼しました。\n`, 'system', providerId);
-  claudePty.write(`${messageLines.join('\n')}\r`);
+  emitClaudeAutomationLog(`[AIフォーム入力開始] ${companies.length}社の2フェーズ並列処理を ${provider.displayName} CLI に依頼しました。\n  フェーズA: 企業分析+メッセージ生成（並列）\n  フェーズB: フォーム入力（順次）\n  送信ポリシー: ${autoSendSafe ? '安全なフォームは自動送信' : '確認待ちで停止'}\n`, 'system', providerId);
+  // 全プロバイダーで直接テキスト送信に統一（@file参照はGemini PTYで動作しないため）
+  const queuedPrompt = [
+    ...(needsSessionContract ? [sessionContractText, ''] : []),
+    ...messageLines,
+  ].join('\n');
+  appendAiRunMetric('phase_b_prompt_compiled', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+    knownFormUrlCount: companies.filter((company) => String(company.formUrl || '').trim()).length,
+    missingFormUrlCount: companies.filter((company) => !String(company.formUrl || '').trim()).length,
+    promptChars: promptText.length,
+    promptLines: promptText.split(/\r?\n/).length,
+    queuedPromptChars: queuedPrompt.length,
+    queuedPromptLines: queuedPrompt.split(/\r?\n/).length,
+    estimatedPromptTokens: estimateTextTokens(queuedPrompt),
+    sessionContractInjected: needsSessionContract,
+    sessionContractChars: sessionContractText.length,
+    messageFullChars: fullMessageChars,
+    messageCoreChars: compactMessageChars,
+    messageTrimmedChars: Math.max(0, fullMessageChars - compactMessageChars),
+    autoSendSafe,
+    phaseASuccessCount: Array.isArray(options.phaseASuccesses) ? options.phaseASuccesses.length : null,
+    phaseAFailureCount: Array.isArray(options.phaseAFailures) ? options.phaseAFailures.length : null,
+  });
+  const queueState = queueManagedAiPrompt(queuedPrompt, normalizedProviderId);
+  if (needsSessionContract) {
+    state.contractVersionSent = MANAGED_AI_CONTRACT_VERSION;
+  }
   notifyClients({ type: 'update', reason: 'claude-automation-queued', time: Date.now() });
   invalidateAiStatusCache(normalizedProviderId);
   return {
@@ -1965,35 +3031,180 @@ function queueClaudeFormFillInManagedSession(companies, providerId = getManagedA
     provider: normalizedProviderId,
     providerLabel: provider.displayName,
     mode: `${provider.id}-cli-managed`,
+    autoSendSafe,
     promptFile,
+    workspacePromptFile,
+    queued: queueState.queued,
+    ready: queueState.ready,
+    phaseASuccessCount: Array.isArray(options.phaseASuccesses) ? options.phaseASuccesses.length : undefined,
+    phaseAFailureCount: Array.isArray(options.phaseAFailures) ? options.phaseAFailures.length : undefined,
+    };
+}
+
+async function queueAiFormFill(companies, providerId = getSelectedAiProvider(), options = {}) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  return queueClaudeFormFillInManagedSession(companies, normalizedProviderId, options);
+}
+
+async function startManagedAiSession(mode = 'default', providerId = getSelectedAiProvider(), options = {}) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const provider = getProvider(normalizedProviderId);
+  const cols = Math.max(2, Number(options.cols) || 120);
+  const rows = Math.max(1, Number(options.rows) || 30);
+  const allowReuse = options.allowReuse !== false;
+  const autoSendSafe = typeof options.autoSendSafe === 'boolean'
+    ? options.autoSendSafe
+    : getConfiguredAiAutoSendSafe();
+
+  if (claudePty
+    && allowReuse
+    && getManagedAiProvider() === normalizedProviderId
+    && String(claudeProcessMode || '') === String(mode || '')
+    && getManagedAiAutoSendSafe() === autoSendSafe) {
+    return {
+      ok: true,
+      mode,
+      provider: normalizedProviderId,
+      providerLabel: provider.displayName,
+      reused: true,
+      autoSendSafe,
+    };
+  }
+
+  if (claudePty) {
+    await stopManagedClaudePty();
+    claudePty = null;
+  }
+
+  if (normalizedProviderId === 'codex') {
+    ensureCodexWorkspaceTrusted(PROJECT_ROOT);
+  }
+  if (normalizedProviderId === 'gemini') {
+    ensureGeminiWorkspaceTrusted(PROJECT_ROOT);
+  }
+  const launchEnv = buildManagedProviderEnv(normalizedProviderId);
+  const playwrightSetup = await ensureProviderPlaywrightMcp(normalizedProviderId, { env: launchEnv });
+  if (!playwrightSetup.ok) {
+    throw new Error(playwrightSetup.error);
+  }
+
+  const nodePty = require('node-pty');
+  const executable = await resolveClaudeExecutable(normalizedProviderId);
+  const flags = buildLaunchArgs(normalizedProviderId, mode, {
+    model: getConfiguredAiModel(normalizedProviderId),
+    sessionId: normalizedProviderId === 'claude' ? crypto.randomUUID() : null,
+  });
+  const spawnSpec = buildManagedSpawnSpec(normalizedProviderId, executable, flags);
+  const ptyProc = nodePty.spawn(spawnSpec.command, spawnSpec.args, {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd: PROJECT_ROOT,
+    env: launchEnv,
+  });
+
+  claudePty = ptyProc;
+  claudeProcessMode = mode;
+  activeAiProvider = normalizedProviderId;
+  managedAiAutoSendSafe = autoSendSafe;
+  resetManagedAiSessionState(normalizedProviderId);
+  invalidateAiStatusCache(normalizedProviderId);
+
+  ptyProc.onData((data) => {
+    updateManagedAiReadyFromOutput(normalizedProviderId, data);
+    broadcastPty({ type: 'output', data, provider: normalizedProviderId });
+    detectCliIssuesFromOutput(data, normalizedProviderId);
+  });
+
+  ptyProc.onExit(({ exitCode }) => {
+    if (claudePty === ptyProc) {
+      claudePty = null;
+      clearManagedAiSessionStateTimers();
+      managedAiSessionState = null;
+      invalidateAiStatusCache(normalizedProviderId);
+    }
+    try {
+      const { getLiveMonitorSummary, finishLiveMonitor: finishMon } = require('./live-monitor.cjs');
+      const summary = getLiveMonitorSummary();
+      const stuckSessions = (summary.events || []).filter(ev =>
+        ev && ev.active !== false && !['awaiting_approval', 'submitted', 'completed', 'skipped', 'error'].includes(ev.status)
+      );
+      stuckSessions.forEach(ev => {
+        try {
+          finishMon(ev.companyNo, {
+            status: 'error',
+            step: 'AIセッション終了 (exit code: ' + exitCode + ')',
+            companyName: ev.companyName || '',
+          });
+        } catch (_) {}
+      });
+      if (stuckSessions.length > 0) {
+        console.warn('[ai-exit] ' + stuckSessions.length + '社の未完了セッションをerrorに変更しました');
+      }
+    } catch (_) {}
+    broadcastPty({ type: 'exit', code: exitCode, provider: normalizedProviderId });
+    notifyClients({ type: 'claude-exit', code: exitCode, provider: normalizedProviderId, time: Date.now() });
+  });
+
+  return {
+    ok: true,
+    mode,
+    provider: normalizedProviderId,
+    providerLabel: provider.displayName,
+    reused: false,
+    autoSendSafe,
   };
 }
 
-async function queueAiFormFill(companies, providerId = getSelectedAiProvider()) {
-  const normalizedProviderId = normalizeProviderId(providerId);
-  if (isHeadlessAutomationProvider(normalizedProviderId)) {
-    return startHeadlessAiAutomationRun(companies, normalizedProviderId);
+function buildManagedTerminalViewerUrl() {
+  const runtime = dashboardRuntime || readRuntime();
+  let baseUrl = runtime && runtime.url ? runtime.url : '';
+  if (!baseUrl && server.listening) {
+    const address = server.address();
+    if (address && typeof address === 'object') {
+      const host = !address.address || address.address === '::' ? '127.0.0.1' : address.address;
+      baseUrl = `http://${host}:${address.port}`;
+    }
   }
-  return queueClaudeFormFillInManagedSession(companies, normalizedProviderId);
+  if (!baseUrl) {
+    throw new Error('Dashboard runtime URL could not be resolved.');
+  }
+  const runtimeUrl = new URL(baseUrl);
+  const terminalUrl = new URL('/terminal', `${runtimeUrl.protocol === 'https:' ? 'wss:' : 'ws:'}//${runtimeUrl.host}`);
+  terminalUrl.searchParams.set('session', ensureDashboardSessionToken());
+  return terminalUrl.toString();
 }
 
-async function launchClaudeInExternalTerminal(mode = 'default', providerId = getSelectedAiProvider()) {
-  const provider = getProvider(providerId);
-  const executable = await resolveClaudeExecutable(provider.id);
-  if (process.platform === 'win32' && executable === provider.id) {
-    throw new Error(`${provider.displayName} executable was not found.`);
+async function openManagedAiViewerInExternalTerminal(providerId = getManagedAiProvider()) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const provider = getProvider(normalizedProviderId);
+  const nodeExecutable = await resolveNodeExecutable();
+  if (!nodeExecutable || !fs.existsSync(nodeExecutable)) {
+    throw new Error('Node.js executable was not found for the external viewer.');
   }
 
+  const viewerScript = path.join(PROJECT_ROOT, 'scripts', 'managed-pty-viewer.cjs');
+  if (!fs.existsSync(viewerScript)) {
+    throw new Error('Managed PTY viewer script was not found.');
+  }
+
+  const viewerUrl = buildManagedTerminalViewerUrl();
   const { spawn } = require('child_process');
-  const flags = buildLaunchArgs(provider.id, mode, {
-    model: getClaudeAutomationModel(provider.id),
-    sessionId: provider.id === 'claude' ? crypto.randomUUID() : null,
-  });
+  const viewerArgs = [
+    escapePowerShellArg(nodeExecutable),
+    escapePowerShellArg(viewerScript),
+    '--url',
+    escapePowerShellArg(viewerUrl),
+    '--provider',
+    escapePowerShellArg(provider.displayName),
+  ];
 
   if (process.platform === 'win32') {
+    const windowTitle = `Sales Claw - ${provider.displayName} Live Viewer`;
     const command = [
+      `$Host.UI.RawUI.WindowTitle = ${escapePowerShellArg(windowTitle)}`,
       `Set-Location -LiteralPath ${escapePowerShellArg(PROJECT_ROOT)}`,
-      ['&', escapePowerShellArg(executable), ...flags.map(escapePowerShellArg)].join(' '),
+      ['&', ...viewerArgs].join(' '),
     ].join('; ');
     const encoded = toPowerShellEncodedCommand(command);
     const child = spawn('cmd.exe', ['/c', 'start', '""', 'powershell.exe', '-NoExit', '-EncodedCommand', encoded], {
@@ -2004,11 +3215,11 @@ async function launchClaudeInExternalTerminal(mode = 'default', providerId = get
       windowsHide: false,
     });
     child.unref();
-    return { ok: true, mode, provider: provider.id, providerLabel: provider.displayName };
+    return { ok: true, provider: normalizedProviderId, providerLabel: provider.displayName, viewer: true, viewerUrl };
   }
 
   if (process.platform === 'darwin') {
-    const terminalCommand = `cd ${escapePowerShellArg(PROJECT_ROOT)}; ${[escapePowerShellArg(executable), ...flags.map(escapePowerShellArg)].join(' ')}`;
+    const terminalCommand = `cd ${escapePowerShellArg(PROJECT_ROOT)}; ${[...viewerArgs].join(' ')}`;
     const child = spawn('osascript', [
       '-e',
       `tell application "Terminal" to do script ${escapePowerShellArg(terminalCommand)}`,
@@ -2021,14 +3232,14 @@ async function launchClaudeInExternalTerminal(mode = 'default', providerId = get
       stdio: 'ignore',
     });
     child.unref();
-    return { ok: true, mode, provider: provider.id, providerLabel: provider.displayName };
+    return { ok: true, provider: normalizedProviderId, providerLabel: provider.displayName, viewer: true, viewerUrl };
   }
 
   const terminalPrograms = [
-    ['x-terminal-emulator', ['-e', executable, ...flags]],
-    ['gnome-terminal', ['--', executable, ...flags]],
-    ['konsole', ['-e', executable, ...flags]],
-    ['xterm', ['-e', executable, ...flags]],
+    ['x-terminal-emulator', ['-e', nodeExecutable, viewerScript, '--url', viewerUrl, '--provider', provider.displayName]],
+    ['gnome-terminal', ['--', nodeExecutable, viewerScript, '--url', viewerUrl, '--provider', provider.displayName]],
+    ['konsole', ['-e', nodeExecutable, viewerScript, '--url', viewerUrl, '--provider', provider.displayName]],
+    ['xterm', ['-e', nodeExecutable, viewerScript, '--url', viewerUrl, '--provider', provider.displayName]],
   ];
   for (const [program, args] of terminalPrograms) {
     try {
@@ -2039,13 +3250,46 @@ async function launchClaudeInExternalTerminal(mode = 'default', providerId = get
         stdio: 'ignore',
       });
       child.unref();
-      return { ok: true, mode, provider: provider.id, providerLabel: provider.displayName };
+      return { ok: true, provider: normalizedProviderId, providerLabel: provider.displayName, viewer: true, viewerUrl };
     } catch (_) {
       // try next terminal
     }
   }
 
   throw new Error('No supported external terminal launcher was found.');
+}
+
+async function launchClaudeInExternalTerminal(mode = 'default', providerId = getSelectedAiProvider(), autoSendSafe = getConfiguredAiAutoSendSafe()) {
+  if (claudePty) {
+    const activeProviderId = getManagedAiProvider();
+    const viewer = await openManagedAiViewerInExternalTerminal(activeProviderId);
+    return {
+      ok: true,
+      mode: claudeProcessMode || mode,
+      provider: activeProviderId,
+      providerLabel: getProviderDisplayName(activeProviderId),
+      reused: true,
+      viewer: true,
+      viewerUrl: viewer.viewerUrl,
+      autoSendSafe: getManagedAiAutoSendSafe(),
+    };
+  }
+
+  const session = await startManagedAiSession(mode, providerId, {
+    allowReuse: true,
+    autoSendSafe,
+  });
+  const viewer = await openManagedAiViewerInExternalTerminal(session.provider);
+  return {
+    ok: true,
+    mode: session.mode,
+    provider: session.provider,
+    providerLabel: session.providerLabel,
+    reused: session.reused,
+    viewer: true,
+    viewerUrl: viewer.viewerUrl,
+    autoSendSafe: !!session.autoSendSafe,
+  };
 }
 
 function getProviderRunningCheckCommand(providerId) {
@@ -2064,6 +3308,7 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
       ...activeHeadlessStatus,
       selectedProvider: selectedProviderId,
       selectedProviderLabel: getProviderDisplayName(selectedProviderId),
+      autoSendSafe: getManagedAiAutoSendSafe(),
       installed: true,
       version: null,
       installState: getProviderInstallState(activeHeadlessStatus.provider),
@@ -2085,6 +3330,7 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
       running: true,
       managed: true,
       mode: claudeProcessMode,
+      autoSendSafe: getManagedAiAutoSendSafe(),
       version: null,
       installState: getProviderInstallState(runtimeProviderId),
       installError: getProviderInstallError(runtimeProviderId),
@@ -2098,6 +3344,7 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
       ..._aiStatusCache,
       selectedProvider: selectedProviderId,
       selectedProviderLabel: getProviderDisplayName(selectedProviderId),
+      autoSendSafe: getConfiguredAiAutoSendSafe(),
       installState: getProviderInstallState(runtimeProviderId),
       installError: getProviderInstallError(runtimeProviderId),
       installCommand,
@@ -2121,6 +3368,7 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
       ..._aiStatusCache,
       selectedProvider: selectedProviderId,
       selectedProviderLabel: getProviderDisplayName(selectedProviderId),
+      autoSendSafe: getConfiguredAiAutoSendSafe(),
       installState: getProviderInstallState(runtimeProviderId),
       installError: getProviderInstallError(runtimeProviderId),
       installCommand,
@@ -2154,6 +3402,7 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
     ..._aiStatusCache,
     selectedProvider: selectedProviderId,
     selectedProviderLabel: getProviderDisplayName(selectedProviderId),
+    autoSendSafe: getConfiguredAiAutoSendSafe(),
     installState: getProviderInstallState(runtimeProviderId),
     installError: getProviderInstallError(runtimeProviderId),
     installCommand,
@@ -2166,6 +3415,7 @@ function buildDashboardDataFromSources() {
   const targetRows = targetData.ok ? targetData.companies : [];
   const allLogs = getAllLogs();
   const historySummary = getAllHistorySummary();
+  const _lang = settings.getSection('preferences').language || 'ja';
   const historyMap = new Map(historySummary.map((entry) => [String(entry.companyNo), getHistory(entry.companyNo)]));
   const outreachTargets = getTargetMap();
   const monitorSummary = getLiveMonitorSummary();
@@ -2370,7 +3620,7 @@ function buildDashboardDataFromSources() {
   for (let i = trendDays - 1; i >= 0; i--) {
     const d = new Date(today);
     d.setDate(d.getDate() - i);
-    trendLabels.push(i === 0 ? '今日' : i === 1 ? '昨日' : `${i}日前`);
+    trendLabels.push(i === 0 ? (_lang === 'ja' ? '今日' : 'Today') : i === 1 ? (_lang === 'ja' ? '昨日' : 'Yesterday') : (_lang === 'ja' ? `${i}日前` : `${i}d ago`));
     trendIndexByDay.set(d.toISOString().slice(0, 10), trendDays - 1 - i);
   }
   allLogs.forEach((log) => {
@@ -2401,9 +3651,11 @@ function loadData(options = {}) {
   const force = !!options.force;
   const cacheKey = getDashboardDataCacheKey();
   if (!force && dashboardDataCacheValue && dashboardDataCacheKey === cacheKey) {
+    dashboardDataCacheValue.cacheKey = cacheKey;
     return dashboardDataCacheValue;
   }
   const data = buildDashboardDataFromSources();
+  data.cacheKey = cacheKey;
   dashboardDataCacheKey = cacheKey;
   dashboardDataCacheValue = data;
   dashboardDataCacheBuiltAt = Date.now();
@@ -2423,10 +3675,11 @@ function parseJsonBody(req) {
 }
 
 // JSON response helper
-function jsonResponse(res, statusCode, data) {
+function jsonResponse(res, statusCode, data, extraHeaders = {}) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    ...extraHeaders,
   });
   res.end(JSON.stringify(data));
 }
@@ -2448,38 +3701,47 @@ function buildPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sales Claw</title>
 <link rel="icon" type="image/png" href="/assets/favicon.png">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+<link href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css" rel="stylesheet">
 <script>
-tailwind={config:{darkMode:'class',theme:{extend:{colors:{'primary':'#004ccd','primary-c':'#0f62fe','surface':'#f7f9fd','surface-low':'#f2f4f8','surface-lowest':'#ffffff','surface-container':'#eceef2','surface-high':'#e6e8ec','on-surface':'#191c1f','on-surface-v':'#424656','outline-v':'#c3c6d8','outline':'#737687','error':'#ba1a1a','tertiary':'#9e3100','secondary':'#445ba1'},fontFamily:{sans:['Inter','sans-serif'],mono:['"JetBrains Mono"','monospace']},borderRadius:{DEFAULT:'0',none:'0',sm:'0',md:'0',lg:'0',xl:'0','2xl':'0','full':'9999px'}}}}}
+tailwind={config:{darkMode:'class',theme:{extend:{colors:{'primary':'#3b82f6','primary-c':'#2563eb','surface':'#f8f9fa','surface-low':'#f1f5f9','surface-lowest':'#ffffff','surface-container':'#e2e8f0','surface-high':'#f1f5f9','on-surface':'#0f172a','on-surface-v':'#475569','outline-v':'#cbd5e1','outline':'#64748b','error':'#ef4444','tertiary':'#f59e0b','secondary':'#8b5cf6'},fontFamily:{sans:['Inter','"Noto Sans JP"','sans-serif'],mono:['"JetBrains Mono"','monospace']},borderRadius:{DEFAULT:'0',none:'0',sm:'4px',md:'8px',lg:'12px',xl:'16px','2xl':'20px','full':'9999px'}}}}}
 </script>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <style>
 :root{
-  /* Base surfaces — light */
-  --bg-deep:#f0f2f8;--bg-base:#f4f6fb;--bg-surface:#f8f9fd;--bg-card:#ffffff;--bg-raised:#eef0f6;--bg-hover:#e8ebf4;
+  /* Base surfaces — Premium SaaS cool palette */
+  --bg-deep:#e2e8f0;--bg-base:#f8f9fa;--bg-surface:#f1f5f9;--bg-card:#ffffff;--bg-raised:#e2e8f0;--bg-hover:#dde4ee;
   /* Brand */
-  --primary:#2563eb;--primary-dim:#1d4ed8;--primary-glow:rgba(37,99,235,.12);--on-primary:#ffffff;
+  --primary:#3b82f6;--primary-dim:#2563eb;--primary-glow:rgba(59,130,246,.08);--on-primary:#ffffff;
   /* Semantic */
-  --success:#059669;--success-dim:rgba(5,150,105,.1);
-  --error:#dc2626;--error-dim:rgba(220,38,38,.1);
-  --warning:#d97706;--warning-dim:rgba(217,119,6,.1);
-  --info:#7c3aed;--info-dim:rgba(124,58,237,.1);
-  /* Text */
+  --success:#10b981;--success-dim:rgba(16,185,129,.08);
+  --error:#ef4444;--error-dim:rgba(239,68,68,.08);
+  --warning:#f59e0b;--warning-dim:rgba(245,158,11,.08);
+  --info:#8b5cf6;--info-dim:rgba(139,92,246,.08);
+  /* Text — cool slate hierarchy */
   --text-1:#0f172a;--text-2:#475569;--text-3:#94a3b8;
-  /* Borders */
-  --border-subtle:rgba(15,23,42,.07);--border-default:rgba(15,23,42,.12);--border-strong:rgba(15,23,42,.22);
+  /* Borders — slate-based */
+  --border-subtle:rgba(15,23,42,.06);--border-default:rgba(15,23,42,.12);--border-strong:rgba(15,23,42,.20);
   /* Legacy compat aliases */
   --surface:var(--bg-base);--surface-low:var(--bg-deep);--surface-lowest:var(--bg-card);--surface-high:var(--bg-raised);--surface-container:var(--bg-hover);
   --on-surface:var(--text-1);--on-surface-variant:var(--text-2);--outline-variant:var(--border-subtle);--outline:var(--text-3);
   --error-container:var(--error-dim);--success-container:var(--success-dim);--warning-container:var(--warning-dim);--info-container:var(--info-dim);
-  --secondary-container:rgba(124,58,237,.1);
+  --secondary-container:rgba(139,92,246,.08);
   /* Typography */
-  --font-body:'Inter',system-ui,sans-serif;--font-mono:'JetBrains Mono','Fira Code',monospace;
-  /* Radii */
+  --font-body:'Inter','Noto Sans JP',system-ui,-apple-system,sans-serif;--font-mono:'JetBrains Mono','Fira Code',ui-monospace,monospace;
+  /* Radii — crisp SaaS */
   --radius-sm:4px;--radius-md:8px;--radius-lg:12px;--radius-xl:20px;
-  /* Shadows */
-  --shadow-ambient:0 1px 8px rgba(15,23,42,.08);--shadow-card:0 4px 20px rgba(15,23,42,.1);--shadow-modal:0 24px 60px rgba(15,23,42,.2);
+  /* Shadows — premium 4-layer system */
+  --shadow-xs:0 1px 2px rgba(15,23,42,.05);
+  --shadow-ambient:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04);
+  --shadow-card:0 1px 3px rgba(15,23,42,.06),0 4px 12px rgba(15,23,42,.04),0 8px 24px rgba(15,23,42,.02);
+  --shadow-modal:0 4px 12px rgba(15,23,42,.08),0 16px 40px rgba(15,23,42,.06),0 24px 64px rgba(15,23,42,.04);
+  /* Transition tokens */
+  --ease-out-expo:cubic-bezier(.16,1,.3,1);
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);
+  /* Glass-morphism */
+  --glass-bg:rgba(255,255,255,.72);--glass-blur:blur(20px) saturate(180%);--glass-border:rgba(255,255,255,.25);
 }
 *{box-sizing:border-box}
 body{font-family:var(--font-body);background:var(--bg-base);margin:0;color:var(--text-1);font-size:.875rem;line-height:1.5}
@@ -2490,8 +3752,8 @@ body{font-family:var(--font-body);background:var(--bg-base);margin:0;color:var(-
 ::-webkit-scrollbar-thumb{background:var(--border-default);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--border-strong)}
 
-/* Header brand */
-.app-header{position:fixed;top:0;left:0;right:0;height:48px;background:rgba(255,255,255,.96);backdrop-filter:blur(12px);border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;padding:0 14px;gap:10px;z-index:50;box-shadow:0 1px 12px rgba(15,23,42,.08)}
+/* Header brand — glass morphism */
+.app-header{position:fixed;top:0;left:0;right:0;height:48px;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border-bottom:1px solid var(--glass-border);display:flex;align-items:center;padding:0 14px;gap:10px;z-index:50;box-shadow:var(--shadow-ambient),inset 0 -1px 0 var(--glass-border)}
 .app-brand{display:flex;align-items:center;gap:10px;flex:0 0 220px;min-width:220px;padding-right:14px;border-right:1px solid var(--border-subtle);height:100%}
 .app-brand-mark{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:linear-gradient(145deg,#eff6ff,#dbeafe);border:1px solid rgba(37,99,235,.14);box-shadow:0 4px 16px rgba(37,99,235,.12);overflow:hidden;flex-shrink:0;border-radius:10px}
 .app-brand-logo{width:100%;height:100%;object-fit:contain;display:block}
@@ -2505,24 +3767,24 @@ body{font-family:var(--font-body);background:var(--bg-base);margin:0;color:var(-
 @media (max-width: 900px){.app-brand{flex-basis:170px;min-width:170px}.app-brand-caption{display:none}.app-build-chip{display:none}}
 
 /* Stat cards */
-.sn{font-family:var(--font-mono);font-size:1.6rem;font-weight:700;transition:color .3s;line-height:1}
-.sn.changed{animation:pop .4s}
+.sn{font-family:var(--font-mono);font-size:1.6rem;font-weight:700;transition:color .3s var(--ease-out-expo);line-height:1}
+.sn.changed{animation:pop .4s var(--ease-spring)}
 .sl{font-size:.6rem;color:var(--text-2);margin-top:6px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
 @keyframes pop{0%{transform:scale(1)}50%{transform:scale(1.15)}100%{transform:scale(1)}}
-#statsRow > div{background:var(--bg-card)!important;border:1px solid var(--border-subtle)!important;border-radius:var(--radius-md)!important;transition:box-shadow .15s,transform .15s,border-color .15s;cursor:default}
-#statsRow > div:hover{box-shadow:var(--shadow-card);transform:translateY(-2px);border-color:var(--border-default)!important}
+#statsRow > div{background:var(--bg-card)!important;border:1px solid var(--border-subtle)!important;border-radius:var(--radius-md)!important;transition:box-shadow .25s var(--ease-out-expo),transform .25s var(--ease-out-expo),border-color .25s;cursor:default;overflow:hidden}
+#statsRow > div:hover{box-shadow:var(--shadow-card),0 0 0 1px var(--border-default);transform:translateY(-2px);border-color:var(--border-default)!important}
 
 /* Table */
-.sc{background:var(--bg-card);box-shadow:var(--shadow-ambient);border-radius:var(--radius-lg)!important;overflow:hidden;border:1px solid var(--border-subtle)}
-.tc{background:var(--bg-card);box-shadow:var(--shadow-ambient);border:1px solid var(--border-subtle);border-radius:var(--radius-md)!important}
+.sc{background:var(--bg-card);box-shadow:var(--shadow-card);border-radius:var(--radius-lg)!important;overflow:hidden;border:1px solid var(--border-subtle);transition:box-shadow .2s,transform .2s}
+.tc{background:var(--bg-card);box-shadow:var(--shadow-ambient);border:1px solid var(--border-subtle);border-radius:var(--radius-md)!important;transition:box-shadow .2s,transform .2s}
 .furl{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sort-icon{font-size:.55rem;color:var(--primary);margin-left:2px}
 .main-table{width:100%;border-collapse:collapse;font-size:.8rem;table-layout:fixed}
-.main-table thead th{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2);user-select:none;padding:.7rem .75rem;background:var(--bg-surface);border-bottom:1px solid var(--border-default);white-space:nowrap;overflow:hidden}
+.main-table thead th{font-size:.6rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text-3);user-select:none;padding:.7rem .75rem;background:var(--bg-surface);border-bottom:1px solid var(--border-default);white-space:nowrap;overflow:hidden}
 .main-table thead th[onclick]:hover{background:var(--bg-raised);cursor:pointer;color:var(--text-1)}
 .main-table tbody td{padding:.55rem .75rem;border-bottom:1px solid var(--border-subtle);vertical-align:middle;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;height:44px;max-height:44px}
-.main-table tbody tr{background:var(--bg-card);transition:background .1s;cursor:pointer}
-.main-table tbody tr:nth-child(even){background:var(--bg-raised)}
+.main-table tbody tr{background:var(--bg-card);transition:background .2s var(--ease-out-expo);cursor:pointer}
+.main-table tbody tr:nth-child(even){background:var(--bg-surface)}
 .main-table tbody tr:hover{background:var(--primary-glow)}
 .main-table .company-meta{display:none}
 .main-table td.action-cell{overflow:visible;cursor:default}
@@ -2531,13 +3793,13 @@ tr.updated{animation:rowFlash .8s}
 @keyframes rowFlash{0%{background:rgba(16,185,129,.15)}100%{background:transparent}}
 
 /* Filter buttons */
-.fb{font-size:.7rem;padding:4px 13px;border:1px solid var(--border-default);background:transparent;color:var(--text-2);cursor:pointer;transition:all .15s;font-weight:500;border-radius:var(--radius-xl)!important}
+.fb{font-size:.7rem;padding:5px 14px;border:1px solid var(--border-default);background:transparent;color:var(--text-2);cursor:pointer;transition:all .2s var(--ease-out-expo);font-weight:500;border-radius:var(--radius-xl)!important}
 .fb.active{background:var(--primary);color:#fff;border-color:var(--primary);box-shadow:0 2px 10px rgba(59,130,246,.3)}
-.fb:not(.active):hover{background:var(--bg-raised);color:var(--text-1);border-color:var(--border-strong)}
+.fb:not(.active):hover{background:var(--bg-hover);color:var(--text-1);border-color:var(--border-strong);transform:translateY(-1px)}
 
 /* Filter bar */
-.filter-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 10px;background:var(--bg-surface);border:1px solid var(--border-default);border-radius:10px;margin-top:8px}
-.filter-field{display:flex;align-items:center;gap:4px;background:var(--bg-deep);border:1px solid var(--border-default);border-radius:7px;padding:0 8px;height:30px;transition:border-color .15s,box-shadow .15s;flex-shrink:0}
+.filter-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);margin-top:8px;box-shadow:var(--shadow-ambient)}
+.filter-field{display:flex;align-items:center;gap:4px;background:var(--bg-base);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:0 10px;height:32px;transition:all .2s;flex-shrink:0}
 .filter-field:focus-within{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
 .filter-field .ms{font-size:14px;color:var(--text-3);flex-shrink:0;font-family:'Material Symbols Outlined';font-variation-settings:'FILL' 0,'wght' 300}
 .filter-field select,.filter-field input{border:none;background:transparent;outline:none;font-size:.78rem;color:var(--text-1);font-family:var(--font-body);min-width:0}
@@ -2553,15 +3815,15 @@ tr.updated{animation:rowFlash .8s}
 .tab-content.active{display:block}
 
 /* Horizontal tab bar */
-#mainTabNav{position:sticky;top:48px;z-index:39;background:var(--bg-surface);border-bottom:1px solid var(--border-subtle);display:flex;align-items:stretch;padding:0 12px;gap:0;box-shadow:0 2px 12px rgba(0,0,0,.3)}
-.tab-btn{display:inline-flex;align-items:center;gap:7px;padding:10px 16px;font-size:.78rem;font-weight:500;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-2);cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0;border-radius:0!important;letter-spacing:.01em}
-.tab-btn:hover{color:var(--text-1);background:var(--bg-hover)}
-.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:700;background:var(--primary-glow)}
+#mainTabNav{position:sticky;top:48px;z-index:39;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border-bottom:1px solid var(--border-subtle);display:flex;align-items:stretch;padding:0 14px;gap:2px}
+.tab-btn{display:inline-flex;align-items:center;gap:7px;padding:10px 18px;font-size:.78rem;font-weight:500;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-3);cursor:pointer;transition:all .2s var(--ease-out-expo);white-space:nowrap;flex-shrink:0;border-radius:0!important;letter-spacing:.01em}
+.tab-btn:hover{color:var(--text-1);background:rgba(59,130,246,.04)}
+.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:700;background:rgba(59,130,246,.06)}
 .tab-btn .tab-icon{font-size:16px;opacity:.6;flex-shrink:0}
 .tab-btn.active .tab-icon{opacity:1}
 
 /* Badges / chips */
-.badge,.chip{display:inline-block;font-size:.58rem;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:var(--radius-xl)!important}
+.badge,.chip{display:inline-block;font-size:.58rem;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:var(--radius-xl)!important;transition:all .15s var(--ease-out-expo)}
 .chip-success{background:var(--success-dim);color:var(--success);border:1px solid rgba(16,185,129,.2)}
 .chip-error{background:var(--error-dim);color:var(--error);border:1px solid rgba(239,68,68,.2)}
 .chip-warning{background:var(--warning-dim);color:var(--warning);border:1px solid rgba(245,158,11,.2)}
@@ -2594,7 +3856,7 @@ tr.updated{animation:rowFlash .8s}
 
 /* Toast */
 .toast-container{position:fixed;top:3.5rem;right:16px;z-index:10000;display:flex;flex-direction:column;gap:8px}
-.toast-msg{padding:11px 18px;font-size:.8rem;font-weight:600;box-shadow:var(--shadow-modal);animation:slideIn .25s cubic-bezier(.34,1.56,.64,1);border-radius:var(--radius-md)!important;border:1px solid var(--border-default);backdrop-filter:blur(8px)}
+.toast-msg{padding:11px 18px;font-size:.8rem;font-weight:600;box-shadow:var(--shadow-modal);animation:slideIn .3s var(--ease-spring);border-radius:var(--radius-md)!important;border:1px solid var(--border-default);backdrop-filter:blur(8px)}
 .toast-msg.success{background:rgba(16,185,129,.15);color:var(--success);border-color:rgba(16,185,129,.3)}
 .toast-msg.error{background:rgba(239,68,68,.15);color:var(--error);border-color:rgba(239,68,68,.3)}
 .toast-msg.info{background:rgba(59,130,246,.15);color:var(--primary);border-color:rgba(59,130,246,.3)}
@@ -2613,10 +3875,10 @@ tr.updated{animation:rowFlash .8s}
 .status-meta{font-size:.72rem;color:var(--on-surface-variant);margin-top:6px}
 
 /* Action buttons */
-.btn-act{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;font-size:.72rem;font-weight:600;border:1px solid;cursor:pointer;transition:all .15s;border-radius:var(--radius-sm)!important}
+.btn-act{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;font-size:.72rem;font-weight:600;border:1px solid;cursor:pointer;transition:all .2s var(--ease-out-expo);border-radius:var(--radius-sm)!important}
 .btn-act:active{transform:translateY(1px)}
 .btn-act-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
-.btn-act-primary:hover{background:var(--primary-dim);border-color:var(--primary-dim);box-shadow:0 0 12px rgba(59,130,246,.3)}
+.btn-act-primary:hover{background:var(--primary-dim);border-color:var(--primary-dim);box-shadow:0 2px 12px rgba(59,130,246,.3)}
 .btn-act-success{background:var(--success);color:#000;border-color:var(--success)}
 .btn-act-success:hover{opacity:.85;box-shadow:0 0 12px rgba(16,185,129,.25)}
 .btn-act-danger{background:none;color:var(--error);border-color:rgba(239,68,68,.4)}
@@ -2647,29 +3909,57 @@ tr.updated{animation:rowFlash .8s}
 /* Spinner */
 .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:var(--primary);border-radius:50%!important;animation:spin .6s linear infinite;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* AI thinking indicator */
+.think-spin{width:10px;height:10px;border:1.5px solid rgba(99,102,241,.2);border-top-color:#818cf8;border-radius:50%!important;animation:spin .8s linear infinite;flex-shrink:0;display:inline-block}
+.cli-thinking-line{display:flex!important;align-items:center;gap:6px;padding:4px 10px!important;background:rgba(99,102,241,.05);border-left:2px solid rgba(99,102,241,.3)}
 
 /* Card containers for awaiting/sent */
-.awaiting-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-left:3px solid var(--warning);margin-bottom:10px;border-radius:var(--radius-md)!important;box-shadow:var(--shadow-ambient);transition:box-shadow .15s,border-color .15s}
-.awaiting-card:hover{box-shadow:var(--shadow-card);border-color:var(--border-default)}
-.sent-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-left:3px solid var(--success);margin-bottom:10px;border-radius:var(--radius-md)!important;box-shadow:var(--shadow-ambient);transition:box-shadow .15s}
-.sent-card:hover{box-shadow:var(--shadow-card)}
+.awaiting-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-left:3px solid var(--warning);margin-bottom:10px;border-radius:var(--radius-md)!important;box-shadow:var(--shadow-card);transition:all .25s var(--ease-out-expo)}
+.awaiting-card:hover{box-shadow:var(--shadow-card),0 6px 24px rgba(15,23,42,.06);transform:translateY(-1px);border-color:var(--border-default)}
+.sent-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-left:3px solid var(--success);margin-bottom:10px;border-radius:var(--radius-md)!important;box-shadow:var(--shadow-card);transition:all .25s var(--ease-out-expo)}
+.sent-card:hover{box-shadow:var(--shadow-card),0 6px 24px rgba(15,23,42,.06);transform:translateY(-1px)}
 .row-danger td{background:rgba(239,68,68,.06)!important}
 .row-success td{background:rgba(16,185,129,.06)!important}
 .row-warning td{background:rgba(245,158,11,.06)!important}
 
 /* Bootstrap grid compat — used in render() JS */
 .row{display:flex;flex-wrap:wrap;gap:12px}.col-md-4{width:calc(33.333% - 8px);min-width:200px}.col-md-8{width:calc(66.666% - 4px)}.g-3,.row.g-3{gap:12px}
-.d-flex{display:flex}.align-items-center{align-items:center}.justify-content-between{justify-content:space-between}.flex-wrap{flex-wrap:wrap}.flex-column{flex-direction:column}.gap-1{gap:4px}.gap-2{gap:8px}.gap-3{gap:12px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-1{margin-top:4px}.mt-2{margin-top:8px}.ms-2{margin-left:8px}.ms-auto{margin-left:auto}.me-1{margin-right:4px}.me-2{margin-right:8px}.fw-bold{font-weight:700}.text-muted{color:var(--on-surface-variant)}.text-center{text-align:center}.py-4{padding:16px 0}.py-0{padding-top:0;padding-bottom:0}.px-1{padding-left:4px;padding-right:4px}.form-check-input{width:16px;height:16px;cursor:pointer}
+.d-flex{display:flex}.align-items-center{align-items:center}.justify-content-between{justify-content:space-between}.flex-wrap{flex-wrap:wrap}.flex-column{flex-direction:column}.gap-1{gap:4px}.gap-2{gap:8px}.gap-3{gap:12px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-1{margin-top:4px}.mt-2{margin-top:8px}.ms-2{margin-left:8px}.ms-auto{margin-left:auto}.me-1{margin-right:4px}.me-2{margin-right:8px}.fw-bold{font-weight:700}.text-muted{color:var(--on-surface-variant)}.text-center{text-align:center}.py-4{padding:16px 0}.py-0{padding-top:0;padding-bottom:0}.px-1{padding-left:4px;padding-right:4px}.form-check-input{appearance:none;-webkit-appearance:none;width:16px;height:16px;border:2px solid var(--border-strong);border-radius:4px;background:var(--bg-card);cursor:pointer;transition:all .15s var(--ease-out-expo);position:relative}
+.form-check-input:checked{background:var(--primary);border-color:var(--primary)}
+.form-check-input:checked::after{content:'';position:absolute;left:4px;top:1px;width:5px;height:9px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
+.form-check-input:focus{box-shadow:0 0 0 3px rgba(59,130,246,.15);border-color:var(--primary)}
+.form-check-input:hover:not(:checked){border-color:var(--primary);background:rgba(59,130,246,.04)}
+/* Stat pills */
+.stat-pill{display:flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border-radius:5px;border:1px solid var(--border-default);border-left:3px solid;background:var(--bg-card);box-shadow:var(--shadow-xs);cursor:default;transition:all .15s var(--ease-out-expo)}
+.stat-pill:hover{box-shadow:var(--shadow-ambient);transform:translateY(-1px)}
+.stat-pill-label{font-size:.62rem;font-weight:500;color:var(--text-2)}
+.stat-pill-val{font-size:.78rem!important;font-weight:700!important;font-family:var(--font-mono)!important;line-height:1}
+.stat-pill-warn{border-color:var(--warning);background:rgba(245,158,11,.04)}
+/* Sparkline prep */
+.stat-sparkline{display:block;width:100%;height:32px;margin-top:8px;opacity:.6}
+.stat-sparkline path{fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+/* Glass utility */
+.glass{background:var(--glass-bg);backdrop-filter:var(--glass-blur);border-color:var(--glass-border)}
+/* Premium transitions */
+.transition-smooth{transition:all .25s var(--ease-out-expo)}
+.transition-spring{transition:all .3s var(--ease-spring)}
+/* Monitor floating panel animations */
+@keyframes monitorPanelIn{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+@keyframes monitorToastIn{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:translateX(0)}}
+@keyframes monitorToastOut{from{opacity:1;transform:translateX(0)}to{opacity:0;transform:translateX(24px)}}
+#monitorFab:hover{box-shadow:var(--shadow-modal),0 0 20px rgba(59,130,246,.2)}
+.monitor-dot-active{animation:monitorDotPulse 2s infinite}
+@keyframes monitorDotPulse{0%{box-shadow:0 0 0 0 rgba(59,130,246,.5)}70%{box-shadow:0 0 0 6px rgba(59,130,246,0)}100%{box-shadow:0 0 0 0 rgba(59,130,246,0)}}
 
 /* Form inputs */
 .form-control,.form-control-sm{width:100%;padding:7px 11px;border:1px solid var(--border-default);background:var(--bg-deep);color:var(--text-1);font-size:.82rem;font-family:var(--font-body);transition:border-color .15s,box-shadow .15s;border-radius:var(--radius-sm)!important}
 .form-control-sm{font-size:.78rem;padding:5px 9px}
-.form-control:focus,.form-control-sm:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+.form-control:focus,.form-control-sm:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
 
 /* Settings */
 .settings-layout{display:flex;gap:0;min-height:500px}
 .settings-sidebar{width:210px;background:var(--bg-surface);border-right:1px solid var(--border-subtle);padding:8px 0;flex-shrink:0}
-.settings-sidebar-btn{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;text-align:left;background:none;border:none;border-left:3px solid transparent;padding:9px 18px;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-2);cursor:pointer;transition:all .12s}
+.settings-sidebar-btn{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;text-align:left;background:none;border:none;border-left:3px solid transparent;padding:9px 18px;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-2);cursor:pointer;transition:all .15s var(--ease-out-expo)}
 .settings-sidebar-btn:hover{background:var(--bg-hover);color:var(--text-1)}
 .settings-sidebar-btn.active{background:var(--primary-glow);color:var(--primary);font-weight:700;border-left-color:var(--primary)}
 .settings-sidebar-label{min-width:0;flex:1}
@@ -2761,7 +4051,7 @@ tr.updated{animation:rowFlash .8s}
 .bulk-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .company-meta{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
 .checkbox-cell{text-align:center;width:34px}
-.modal-shell{position:fixed;top:0;left:0;width:100%;height:100%;padding:18px;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);z-index:9998;display:none;align-items:center;justify-content:center}
+.modal-shell{position:fixed;top:0;left:0;width:100%;height:100%;padding:18px;background:rgba(15,23,42,.6);backdrop-filter:blur(8px);z-index:9998;display:none;align-items:center;justify-content:center}
 .modal-shell.open{display:flex}
 .modal-panel{background:var(--bg-card);border:1px solid var(--border-default);width:min(760px,100%);max-height:90vh;overflow-y:auto;box-shadow:var(--shadow-modal);border-radius:var(--radius-lg)!important}
 .modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border-subtle)}
@@ -2781,7 +4071,8 @@ tr.updated{animation:rowFlash .8s}
 .stat-card-primary{background:linear-gradient(135deg,rgba(59,130,246,.25),rgba(29,78,216,.35));color:var(--text-1);border:1px solid rgba(59,130,246,.2)}
 
 /* Chart containers */
-.chart-panel{background:var(--bg-card);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-card);padding:20px;border:1px solid var(--border-subtle)}
+.chart-panel{background:var(--bg-card);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-card);padding:18px;border:1px solid var(--border-subtle);transition:box-shadow .25s var(--ease-out-expo),transform .25s var(--ease-out-expo)}
+.chart-panel:hover{box-shadow:var(--shadow-card),0 6px 24px rgba(15,23,42,.06)}
 @keyframes modalIn{from{opacity:0;transform:scale(.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
 /* Launch Modal Provider Cards */
 .launch-provider-card{flex:1;display:flex;flex-direction:column;align-items:center;padding:12px 8px 10px;border:2px solid #e2e8f0;border-radius:14px;cursor:pointer;transition:all .2s;background:#fff;gap:5px;position:relative;min-width:0;text-align:center}
@@ -2797,9 +4088,72 @@ tr.updated{animation:rowFlash .8s}
 .launch-provider-card.selected.claude .lp-check{background:#CC785C}
 .launch-provider-card.selected.codex .lp-check{background:#10a37f}
 .launch-provider-card.selected.gemini .lp-check{background:#4285F4}
+body.perf-mode{
+--glass-bg:#ffffff;
+--glass-blur:none;
+--glass-border:rgba(148,163,184,.18);
+--shadow-ambient:0 1px 2px rgba(15,23,42,.05);
+--shadow-card:0 1px 3px rgba(15,23,42,.06),0 8px 18px rgba(15,23,42,.04);
+--shadow-modal:0 8px 24px rgba(15,23,42,.12);
+}
+body.perf-mode .app-header,
+body.perf-mode #mainTabNav,
+body.perf-mode .glass,
+body.perf-mode .toast-msg,
+body.perf-mode .modal-shell{
+backdrop-filter:none!important;
+-webkit-backdrop-filter:none!important;
+}
+body.perf-mode .sn.changed,
+body.perf-mode tr.updated,
+body.perf-mode .live-dot.on,
+body.perf-mode .monitor-dot-active,
+body.perf-mode .toast-msg,
+body.perf-mode .spin,
+body.perf-mode .think-spin{
+animation:none!important;
+}
+body.perf-mode .app-header *,
+body.perf-mode #mainTabNav *,
+body.perf-mode .chart-panel,
+body.perf-mode .sc,
+body.perf-mode .tc,
+body.perf-mode .awaiting-card,
+body.perf-mode .sent-card,
+body.perf-mode .stat-pill,
+body.perf-mode .btn,
+body.perf-mode #monitorFab{
+transition:none!important;
+}
+body.perf-mode #statsRow > div:hover,
+body.perf-mode .sc:hover,
+body.perf-mode .tc:hover,
+body.perf-mode .awaiting-card:hover,
+body.perf-mode .sent-card:hover,
+body.perf-mode .chart-panel:hover,
+body.perf-mode .stat-pill:hover,
+body.perf-mode #monitorFab:hover,
+body.perf-mode .launch-provider-card:hover{
+transform:none!important;
+box-shadow:var(--shadow-card)!important;
+}
+body.perf-mode .main-table tbody tr,
+body.perf-mode .awaiting-card,
+body.perf-mode .sent-card{
+content-visibility:auto;
+contain:layout paint style;
+}
+body.perf-mode .main-table tbody tr{contain-intrinsic-size:56px}
+body.perf-mode .awaiting-card,
+body.perf-mode .sent-card{contain-intrinsic-size:420px}
+body.perf-mode #monitorEventList > div{
+content-visibility:auto;
+contain:layout paint style;
+contain-intrinsic-size:84px;
+}
 </style>
 </head>
-<body>
+<body class="${APP_BUILD_SOURCE === 'installed' ? 'desktop-build perf-mode' : ''}">
 <!-- Toast container -->
 <div class="toast-container" id="toastContainer"></div>
 
@@ -2877,8 +4231,8 @@ tr.updated{animation:rowFlash .8s}
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.64 5.64l1.77 1.77M16.59 16.59l1.77 1.77M5.64 18.36l1.77-1.77M16.59 7.41l1.77-1.77" stroke="white" stroke-width="2.2" stroke-linecap="round"/></svg>
           </div>
           <div>
-            <div id="launchProviderTitle" style="color:#fff;font-size:1.15rem;font-weight:900;letter-spacing:.02em">AI を起動</div>
-            <div id="launchProviderSubtitle" style="color:rgba(255,255,255,.78);font-size:.72rem;margin-top:2px">起動する AI とモードを選択してください</div>
+            <div id="launchProviderTitle" style="color:#fff;font-size:1.15rem;font-weight:900;letter-spacing:.02em">${_lang === 'ja' ? 'AI を起動' : 'Launch AI'}</div>
+            <div id="launchProviderSubtitle" style="color:rgba(255,255,255,.78);font-size:.72rem;margin-top:2px">${_lang === 'ja' ? '起動する AI とモードを選択してください' : 'Select AI and mode to launch'}</div>
           </div>
         </div>
         <button onclick="closeLaunchModal()" style="background:rgba(255,255,255,.15);border:none;color:#fff;width:30px;height:30px;border-radius:50%;cursor:pointer;font-size:1.1rem;display:flex;align-items:center;justify-content:center;transition:background .15s" onmouseover="this.style.background='rgba(255,255,255,.28)'" onmouseout="this.style.background='rgba(255,255,255,.15)'">&times;</button>
@@ -2924,6 +4278,20 @@ tr.updated{animation:rowFlash .8s}
           <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:3px">${_lang === 'ja' ? '通常利用' : 'Recommended'}</div>
           <div id="launchProviderNote" style="font-size:.76rem;color:#475569;line-height:1.6">${_lang === 'ja' ? '選択した AI に合わせて、起動モードの実際の意味をここに表示します。' : 'Provider-specific mode guidance will appear here.'}</div>
         </div>
+        <div id="launchSetupDiagnostics" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:11px 14px">
+          <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:6px">${_lang === 'ja' ? 'セットアップ診断' : 'Setup diagnostics'}</div>
+          <div id="launchSetupDiagnosticsBody" style="font-size:.74rem;color:#475569;line-height:1.6">${_lang === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...'}</div>
+        </div>
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px 14px">
+          <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:8px">${_t['launch.submitPolicy.title'] || (_lang === 'ja' ? '送信ポリシー' : 'Submission policy')}</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <select id="launchAutoSendSafeSelect" onchange="setLaunchAutoSendSafe(this.value === 'true')" style="width:100%">
+              <option value="false">${_t['launch.submitPolicy.approval'] || (_lang === 'ja' ? '確認待ちで止める（推奨）' : 'Stop for approval (recommended)')}</option>
+              <option value="true">${_t['launch.submitPolicy.autoSendSafe'] || (_lang === 'ja' ? '安全なフォームは自動送信する' : 'Auto-send safe forms')}</option>
+            </select>
+            <div id="launchAutoSendSafeHelp" style="font-size:.7rem;color:#64748b;line-height:1.6">${_t['launch.submitPolicy.help'] || (_lang === 'ja' ? 'CAPTCHA・手動確認・営業NG・判断が難しいフォームは自動送信しません。' : 'CAPTCHA, manual review, excluded forms, and uncertain cases will still stop for approval.')}</div>
+          </div>
+        </div>
         <div id="launchModeOptions" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <!-- auto -->
         <div id="launchOpt_auto" onclick="selectLaunchMode('auto')" style="border:2px solid #e2e8f0;border-radius:14px;padding:14px;cursor:pointer;transition:all .18s;position:relative;background:#fff" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 20px rgba(59,130,246,.12)'" onmouseout="this.style.transform='';this.style.boxShadow=''">
@@ -2944,8 +4312,8 @@ tr.updated{animation:rowFlash .8s}
           <div style="background:#fef2f2;border-radius:10px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;margin-top:16px">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>
           </div>
-          <div id="launchOptTitle_bypassPermissions" style="font-weight:700;font-size:.8rem;color:#1e293b;margin-bottom:4px">bypassPermissions</div>
-          <div id="launchOptDesc_bypassPermissions" style="font-size:.7rem;color:#64748b;line-height:1.5">最も強いモードです。権限確認をほぼ飛ばします。通常は auto を優先してください。</div>
+<div id="launchOptTitle_bypassPermissions" style="font-weight:700;font-size:.8rem;color:#1e293b;margin-bottom:4px">bypassPermissions</div>
+<div id="launchOptDesc_bypassPermissions" style="font-size:.7rem;color:#64748b;line-height:1.5">最も強い起動モードです。CLI の承認は大きく減りますが、プロバイダーによっては MCP / ブラウザ操作の確認が一度だけ残ることがあります。</div>
         </div>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #e2e8f0;border-radius:12px;background:#fff">
@@ -2988,11 +4356,11 @@ tr.updated{animation:rowFlash .8s}
     </div>
     <!-- フッター -->
     <div style="padding:12px 20px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #f1f5f9">
-      <div id="launchSelectedLabel" style="font-size:.72rem;color:#64748b;font-weight:600">AI とモードを選択してください</div>
+      <div id="launchSelectedLabel" style="font-size:.72rem;color:#64748b;font-weight:600">${_lang === 'ja' ? 'AI とモードを選択してください' : 'Select AI and mode'}</div>
       <div style="display:flex;gap:8px">
-        <button onclick="closeLaunchModal()" style="background:#f1f5f9;border:none;padding:9px 20px;font-size:.78rem;font-weight:600;cursor:pointer;color:#64748b;border-radius:10px;transition:background .15s" onmouseover="this.style.background='#e2e8f0'" onmouseout="this.style.background='#f1f5f9'">キャンセル</button>
-        <button id="launchExternalBtn" onclick="confirmExternalLaunch()" style="background:#fff;border:1px solid #cbd5e1;color:#334155;padding:9px 16px;font-size:.76rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.03em;transition:all .15s" onmouseover="this.style.borderColor='#94a3b8';this.style.color='#334155'" onmouseout="this.style.borderColor='#cbd5e1';this.style.color='#334155'">外部で開く</button>
-        <button id="launchConfirmBtn" onclick="confirmLaunch()" style="background:linear-gradient(135deg,#CC785C,#E8935A);border:none;color:#fff;padding:9px 24px;font-size:.78rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.04em;box-shadow:0 4px 14px rgba(204,120,92,.4);transition:all .15s" onmouseover="this.style.transform='translateY(-1px)'" onmouseout="this.style.transform=''">AI を起動</button>
+        <button onclick="closeLaunchModal()" style="background:#f1f5f9;border:none;padding:9px 20px;font-size:.78rem;font-weight:600;cursor:pointer;color:#64748b;border-radius:10px;transition:background .15s" onmouseover="this.style.background='#e2e8f0'" onmouseout="this.style.background='#f1f5f9'">${_lang === 'ja' ? 'キャンセル' : 'Cancel'}</button>
+        <button id="launchExternalBtn" onclick="confirmExternalLaunch()" style="background:#fff;border:1px solid #cbd5e1;color:#334155;padding:9px 16px;font-size:.76rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.03em;transition:all .15s" onmouseover="this.style.borderColor='#94a3b8';this.style.color='#334155'" onmouseout="this.style.borderColor='#cbd5e1';this.style.color='#334155'">${_lang === 'ja' ? '外部で開く' : 'Open External'}</button>
+        <button id="launchConfirmBtn" onclick="confirmLaunch()" style="background:linear-gradient(135deg,#CC785C,#E8935A);border:none;color:#fff;padding:9px 24px;font-size:.78rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.04em;box-shadow:0 4px 14px rgba(204,120,92,.4);transition:all .15s" onmouseover="this.style.transform='translateY(-1px)'" onmouseout="this.style.transform=''">${_lang === 'ja' ? 'AI を起動' : 'Launch AI'}</button>
       </div>
     </div>
   </div>
@@ -3107,124 +4475,65 @@ tr.updated{animation:rowFlash .8s}
   </button>
 </div>
 
-<div style="padding:16px">
+<div style="padding:16px;display:flex;gap:16px;align-items:flex-start">
+  <!-- Main content column -->
+  <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:12px">
 
-  <!-- Unified Analytics Panel (always visible) -->
-  <div id="analyticsRow" style="display:grid;grid-template-columns:1.1fr 1fr 1.8fr;gap:10px;margin-bottom:12px">
-    <!-- Col 1: 全体進捗 + 統計内訳 -->
-    <div class="chart-panel" style="display:flex;flex-direction:column;gap:0">
-      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2);margin-bottom:7px">全体進捗</div>
-      <div style="display:flex;align-items:baseline;gap:5px;margin-bottom:6px">
-        <span id="analyticsPercent" style="font-size:2rem;font-weight:800;color:var(--primary);line-height:1">0</span>
-        <span style="font-size:.85rem;color:var(--primary);font-weight:700">%</span>
-        <span id="analyticsRatio" style="font-size:.65rem;color:var(--text-2);background:var(--bg-raised);padding:1px 6px;border-radius:3px;margin-left:2px">0 / 0 送信済み</span>
+  <!-- Unified Analytics Panel -->
+  <div id="analyticsRow" class="chart-panel" style="padding:18px 20px;display:flex;flex-direction:column;margin-bottom:0">
+    <!-- Top: Percentage + Ratio + Live badge -->
+    <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:10px">
+      <div style="display:flex;align-items:baseline;gap:10px">
+        <div style="display:flex;align-items:baseline;gap:2px">
+          <span id="analyticsPercent" style="font-size:2.4rem;font-family:var(--font-mono);font-weight:600;letter-spacing:-.03em;color:var(--text-1);line-height:1">0</span>
+          <span style="font-size:1.1rem;color:var(--text-3);font-weight:600;font-family:var(--font-mono)">%</span>
+        </div>
+        <div style="display:flex;align-items:baseline;gap:4px">
+          <span id="analyticsSubmittedNum" style="font-family:var(--font-mono);font-size:1rem;font-weight:700;color:var(--success);line-height:1">0</span>
+          <span id="analyticsRatio" style="font-size:.7rem;color:var(--text-3);font-family:var(--font-mono)">/ 0</span>
+          <span style="font-size:.65rem;font-weight:700;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;margin-left:2px">${_lang === 'ja' ? '送信済み' : 'Sent'}</span>
+        </div>
       </div>
-      <div style="height:5px;background:var(--bg-raised);border-radius:3px;overflow:hidden;margin-bottom:3px">
-        <div id="analyticsProgressBar" style="height:100%;background:linear-gradient(90deg,var(--primary),#6366f1);border-radius:3px;transition:width .6s;width:0%"></div>
+      <div style="display:flex;align-items:center;gap:5px;padding:3px 8px;background:var(--bg-surface);border:1px solid var(--border-default);border-radius:4px;font-size:.6rem;font-family:var(--font-mono);color:var(--text-3)">
+        <span style="width:5px;height:5px;border-radius:50%;background:var(--success);flex-shrink:0"></span>
+        Live
       </div>
-      <div class="progress-pipeline" id="pipeline" style="border-radius:3px;overflow:hidden;gap:1px;margin-bottom:4px">
+    </div>
+    <!-- Pipeline segment bar -->
+    <div style="display:flex;flex-direction:column;gap:3px;margin-bottom:12px">
+      <div style="height:6px;background:var(--bg-raised);border-radius:999px;overflow:hidden;border:1px solid var(--border-subtle)">
+        <div id="analyticsProgressBar" style="height:100%;background:linear-gradient(90deg,var(--primary),#6366f1);border-radius:999px;transition:width .6s;width:0%"></div>
+      </div>
+      <div class="progress-pipeline" id="pipeline" style="border-radius:3px;overflow:hidden;gap:1px;height:4px">
         <div class="pip-seg" style="background:var(--bg-raised);flex:1"></div>
       </div>
-      <div style="display:flex;gap:8px;font-size:.57rem;color:var(--text-3);flex-wrap:wrap;margin-bottom:9px">
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#f59e0b;flex-shrink:0"></span>${_t['progress.filled']}</span>
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#10b981;flex-shrink:0"></span>${_t['progress.sent']}</span>
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:#ef4444;flex-shrink:0"></span>${_t['progress.error']}</span>
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:var(--bg-raised);border:1px solid var(--border-default);flex-shrink:0"></span>${_t['progress.unprocessed']}</span>
-        <span id="progressLabel" style="margin-left:auto;font-family:var(--font-mono);font-size:.57rem;color:var(--text-3)">-</span>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px">
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #6366f1">
-          <div class="sn" id="s-approachable" style="color:#6366f1;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.target']}</div>
-        </div>
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #94a3b8">
-          <div class="sn" id="s-hasFormUrl" style="color:#94a3b8;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.hasForm']}</div>
-        </div>
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #3b82f6">
-          <div class="sn" id="s-formFill" style="color:#3b82f6;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.filled']}</div>
-        </div>
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #f59e0b">
-          <div class="sn" id="s-awaitingApproval" style="color:#f59e0b;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.awaiting']}</div>
-        </div>
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #10b981">
-          <div class="sn" id="s-submitted" style="color:#10b981;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.sent']}</div>
-        </div>
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #ef4444">
-          <div class="sn" id="s-error" style="color:#ef4444;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.error']}</div>
-        </div>
-        <div style="padding:4px 7px;background:var(--bg-deep);border-radius:5px;border-left:2px solid #64748b;grid-column:span 2">
-          <div class="sn" id="s-excluded" style="color:#64748b;font-size:.95rem;font-weight:700;line-height:1.3">-</div>
-          <div class="sl" style="font-size:.58rem;margin-top:1px">${_t['stats.excluded']}</div>
-        </div>
+      <span id="progressLabel" style="font-family:var(--font-mono);font-size:.55rem;color:var(--text-3);text-align:right">-</span>
+    </div>
+    <!-- Stat pills row -->
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding-bottom:14px;border-bottom:1px solid var(--border-default)">
+      <div class="stat-pill" style="border-left-color:#6366f1"><span class="stat-pill-label">${_t['stats.target']}</span><span class="sn stat-pill-val" id="s-approachable" style="color:#6366f1">-</span></div>
+      <div class="stat-pill" style="border-left-color:#94a3b8"><span class="stat-pill-label">${_t['stats.hasForm']}</span><span class="sn stat-pill-val" id="s-hasFormUrl" style="color:#94a3b8">-</span></div>
+      <div class="stat-pill" style="border-left-color:#3b82f6"><span class="stat-pill-label">${_t['stats.filled']}</span><span class="sn stat-pill-val" id="s-formFill" style="color:#3b82f6">-</span></div>
+      <div class="stat-pill stat-pill-warn" style="border-left-color:#f59e0b"><span class="stat-pill-label" style="color:#f59e0b;font-weight:700">${_t['stats.awaiting']}</span><span class="sn stat-pill-val" id="s-awaitingApproval" style="color:#f59e0b">-</span></div>
+      <div class="stat-pill" style="border-left-color:#10b981"><span class="stat-pill-label">${_t['stats.sent']}</span><span class="sn stat-pill-val" id="s-submitted" style="color:#10b981">-</span></div>
+      <div class="stat-pill" style="border-left-color:#ef4444"><span class="stat-pill-label">${_t['stats.error']}</span><span class="sn stat-pill-val" id="s-error" style="color:#ef4444">-</span></div>
+      <div class="stat-pill" style="border-left-color:#64748b;opacity:.6"><span class="stat-pill-label">${_t['stats.excluded']}</span><span class="sn stat-pill-val" id="s-excluded" style="color:#64748b">-</span></div>
+    </div>
+    <!-- Trend chart (full width) -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;margin-bottom:6px">
+      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2)">${_lang === 'ja' ? '処理推移' : 'Trend'}</div>
+      <div style="display:flex;gap:12px;font-size:.58rem;color:var(--text-3)">
+        <span style="display:flex;align-items:center;gap:3px"><span style="width:5px;height:5px;border-radius:50%;background:#10b981;flex-shrink:0"></span>${_lang === 'ja' ? '送信済' : 'Sent'}</span>
+        <span style="display:flex;align-items:center;gap:3px"><span style="width:5px;height:5px;border-radius:50%;background:#f59e0b;flex-shrink:0"></span>${_lang === 'ja' ? '要対応' : 'Action'}</span>
+        <span style="display:flex;align-items:center;gap:3px"><span style="width:5px;height:2px;border-top:1.5px dashed #ef4444;flex-shrink:0"></span>${_lang === 'ja' ? 'エラー' : 'Error'}</span>
       </div>
     </div>
-    <!-- Col 2: ステータス内訳 -->
-    <div class="chart-panel">
-      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2);margin-bottom:8px">ステータス内訳</div>
-      <div style="height:200px;position:relative"><canvas id="statusDonutChart"></canvas></div>
-    </div>
-    <!-- Col 3: 処理推移 -->
-    <div class="chart-panel">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2)">処理推移</div>
-        <div style="display:flex;gap:10px;font-size:.6rem;color:var(--text-2)">
-          <span><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#f59e0b;margin-right:3px"></span>要対応</span>
-          <span><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#10b981;margin-right:3px"></span>送信済</span>
-        </div>
-      </div>
-      <div style="height:200px;position:relative"><canvas id="trendAreaChart"></canvas></div>
-    </div>
+    <div style="height:170px;position:relative"><canvas id="trendAreaChart"></canvas></div>
+    <!-- Hidden donut (keeps JS reference intact) -->
+    <div style="display:none"><canvas id="statusDonutChart"></canvas></div>
   </div>
 
-  <div id="liveMonitorCard" style="background:#fff;border:1px solid var(--outline-variant);border-radius:8px;margin-bottom:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)">
-    <div style="display:flex;align-items:center;gap:10px;padding:9px 14px;background:linear-gradient(135deg,#1e293b 0%,#334155 100%);user-select:none">
-      <span id="monitorDot" style="width:8px;height:8px;border-radius:50%;background:#94a3b8;flex-shrink:0;transition:background .3s"></span>
-      <span style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#e2e8f0;flex:1">${_lang === 'ja' ? '進行状況ログ' : 'Progress Log'}</span>
-      <div id="monitorStatusChip" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.1);color:#94a3b8;font-size:.63rem;font-weight:700;padding:2px 8px;border-radius:4px;letter-spacing:.04em">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
-      <button id="liveMonitorToggleBtn" onclick="toggleLiveMonitor()" style="display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#e2e8f0;font-size:.68rem;font-weight:700;padding:5px 10px;border-radius:999px;cursor:pointer;transition:all .15s" onmouseover="this.style.background='rgba(255,255,255,.14)'" onmouseout="this.style.background='rgba(255,255,255,.08)'">
-        <span id="liveMonitorChevron" style="color:#cbd5e1;font-size:14px;line-height:1;transition:transform .25s">▾</span>
-        <span id="liveMonitorToggleLabel">${_lang === 'ja' ? '閉じる' : 'Collapse'}</span>
-      </button>
-    </div>
-    <div id="liveMonitorBody" style="display:grid;grid-template-columns:minmax(0,1.05fr) minmax(280px,.95fr)">
-      <div style="display:flex;flex-direction:column;min-height:260px;border-right:1px solid var(--outline-variant)">
-        <div style="padding:12px 14px;border-bottom:1px solid var(--outline-variant);display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
-          <div>
-            <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline)">${_lang === 'ja' ? '進行状況ログ' : 'Progress Log'}</div>
-            <div id="monitorActiveSummary" style="margin-top:5px;font-size:.8rem;color:var(--on-surface-variant)">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
-          </div>
-          <div id="monitorUpdatedAt" style="font-size:.66rem;font-family:var(--font-mono);color:var(--outline);white-space:nowrap">-</div>
-        </div>
-        <div id="monitorEventList" style="display:flex;flex-direction:column;max-height:340px;overflow:auto;background:#fff;overscroll-behavior:contain"></div>
-      </div>
-      <div style="padding:12px 14px;background:var(--surface-lowest);display:flex;flex-direction:column;gap:8px">
-        <div>
-          <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline)">${_lang === 'ja' ? '最新アクティビティ' : 'Latest Activity'}</div>
-          <div id="monitorCompany" style="margin-top:5px;font-size:.88rem;font-weight:700;color:var(--on-surface)">-</div>
-        </div>
-        <div style="background:var(--bg-surface);border-radius:6px;padding:10px 12px">
-          <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline);margin-bottom:4px">${_lang === 'ja' ? '最新ステップ' : 'Latest Step'}</div>
-          <div id="monitorStep" style="font-size:.82rem;color:var(--on-surface);font-weight:500">-</div>
-        </div>
-        <div>
-          <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline);margin-bottom:4px">${_lang === 'ja' ? 'URL' : 'URL'}</div>
-          <a id="monitorCurrentUrl" href="#" target="_blank" style="display:block;font-size:.75rem;color:var(--primary);font-family:var(--font-mono);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:6px 8px;background:var(--bg-surface);border-radius:4px">-</a>
-        </div>
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline)">${_lang === 'ja' ? '最新スクショ' : 'Latest Screenshot'}</div>
-          <a id="monitorScreenshotLink" href="#" target="_blank" style="display:none;font-size:.68rem;color:var(--primary);text-decoration:none;font-weight:600">${_lang === 'ja' ? '別タブで開く ↗' : 'Open ↗'}</a>
-        </div>
-        <div id="monitorScreenshotWrap" style="flex:1;min-height:200px;max-height:340px;overflow:auto;overscroll-behavior:contain;border:1px dashed var(--outline-variant);border-radius:6px;background:var(--surface-low);display:flex;align-items:flex-start;justify-content:flex-start;color:var(--outline);font-size:.75rem;text-align:center;padding:12px">${_lang === 'ja' ? 'スクリーンショット待機中' : 'Waiting for screenshot'}</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Companies tab -->
+  <!-- Companies tab (inside main column) -->
   <div class="tab-content active" id="tab-companies">
     <div class="company-toolbar" style="flex-direction:column;gap:0">
       <!-- Row 1: Quick filter tabs + Action buttons -->
@@ -3315,6 +4624,19 @@ tr.updated{animation:rowFlash .8s}
 
   <!-- CLI Activity tab -->
   <div class="tab-content" id="tab-logs">
+    <div style="background:#fff;border:1px solid var(--outline-variant);margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant)">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-weight:700;font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface)">${_lang==='ja' ? 'リアルタイムCLI' : 'Live CLI'}</span>
+          <span style="font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="cliStreamLastEvent">—</span>
+        </div>
+      </div>
+      <div id="cliThinkingRow" style="display:none;align-items:center;gap:8px;padding:10px 16px;background:rgba(99,102,241,.08);border-bottom:1px solid rgba(99,102,241,.16)">
+        <span class="think-spin"></span>
+        <span id="cliThinkingText" style="font-size:.76rem;color:#6366f1;font-style:italic;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${_lang==='ja' ? '思考中...' : 'Thinking...'}</span>
+      </div>
+      <div id="cliStream" style="max-height:180px;overflow:auto;padding:10px 16px;background:var(--bg-card)"></div>
+    </div>
     <!-- Activity log table -->
     <div style="background:#fff;border:1px solid var(--outline-variant)">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant)">
@@ -3920,6 +5242,15 @@ tr.updated{animation:rowFlash .8s}
           </div>
 
           <div class="settings-group">
+            <label>${_t['field.autoSendEligibleForms']}</label>
+            <select id="pf-autoSendEligibleForms">
+              <option value="false">${_t['field.yesNo.no']}</option>
+              <option value="true">${_t['field.yesNo.yes']}</option>
+            </select>
+            <div class="help-text">${_t['help.autoSendEligibleForms']}</div>
+          </div>
+
+          <div class="settings-group">
             <label>${_t['field.userAgent']}</label>
             <input type="text" id="pf-userAgent" placeholder="${_t['ph.userAgent']}">
           </div>
@@ -3978,27 +5309,109 @@ tr.updated{animation:rowFlash .8s}
       </div>
     </div>
   </div>
-</div><!-- /padding:16px -->
+  </div><!-- /main-column -->
+</div><!-- /padding:16px flex container -->
+
+<!-- Floating Chat-style Live Monitor -->
+<!-- Toast notification (shows when panel is closed) -->
+<div id="monitorToast" style="position:fixed;bottom:80px;right:24px;z-index:9990;max-width:320px;background:var(--bg-card);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-modal);padding:10px 14px;display:none;animation:monitorToastIn .3s var(--ease-spring);cursor:pointer" onclick="toggleMonitorPanel()">
+  <div style="display:flex;align-items:flex-start;gap:8px">
+    <span id="monitorToastDot" style="width:8px;height:8px;border-radius:50%;background:var(--primary);flex-shrink:0;margin-top:3px"></span>
+    <div style="min-width:0;flex:1">
+      <div id="monitorToastCompany" style="font-size:.75rem;font-weight:700;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</div>
+      <div id="monitorToastStep" style="font-size:.68rem;color:var(--text-2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">-</div>
+    </div>
+    <span style="font-size:.6rem;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0" id="monitorToastTime">--:--</span>
+  </div>
+</div>
+
+<!-- Floating toggle button -->
+<button id="monitorFab" onclick="toggleMonitorPanel()" style="position:fixed;bottom:24px;right:24px;z-index:9991;width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#0f172a,#1e293b);color:#e2e8f0;border:none;cursor:pointer;box-shadow:var(--shadow-modal);display:flex;align-items:center;justify-content:center;transition:all .25s var(--ease-out-expo)" onmouseover="this.style.transform='scale(1.08)'" onmouseout="this.style.transform='scale(1)'">
+  <span id="monitorDot" style="position:absolute;top:10px;right:10px;width:10px;height:10px;border-radius:50%;background:#94a3b8;transition:background .3s;border:2px solid #0f172a"></span>
+  <span id="monitorFabBadge" style="display:none;position:absolute;top:0;right:0;min-width:18px;height:18px;background:var(--error);color:#fff;font-size:.6rem;font-weight:800;border-radius:9px;padding:0 5px;line-height:18px;text-align:center;border:2px solid #fff;font-family:var(--font-mono)">0</span>
+  <span class="material-symbols-outlined" style="font-size:22px">chat</span>
+</button>
+
+<!-- Floating panel -->
+<div id="liveMonitorCard" style="position:fixed;bottom:84px;right:24px;z-index:9989;width:380px;height:540px;background:var(--bg-card);border:1px solid var(--border-default);border-radius:var(--radius-lg);overflow:hidden;box-shadow:var(--shadow-modal);display:none;flex-direction:column;animation:monitorPanelIn .25s var(--ease-out-expo)">
+  <!-- Header -->
+  <div style="display:flex;align-items:center;gap:8px;padding:12px 14px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);user-select:none;flex-shrink:0">
+    <span style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#e2e8f0;flex:1">Live Activity</span>
+    <div id="monitorStatusChip" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.1);color:#94a3b8;font-size:.58rem;font-weight:700;padding:2px 8px;border-radius:4px;letter-spacing:.04em">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
+    <button id="liveMonitorToggleBtn" onclick="toggleMonitorPanel()" style="display:inline-flex;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#e2e8f0;font-size:16px;padding:4px;border-radius:6px;cursor:pointer;transition:all .15s;line-height:1" onmouseover="this.style.background='rgba(255,255,255,.2)'" onmouseout="this.style.background='rgba(255,255,255,.08)'">✕</button>
+  </div>
+
+  <!-- Body -->
+  <div id="liveMonitorBody" style="display:flex;flex-direction:column;flex:1;overflow:hidden">
+    <!-- Latest Activity Summary -->
+    <div style="padding:10px 14px;border-bottom:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <div style="font-size:.58rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-3)">${_lang === 'ja' ? '最新アクティビティ' : 'Latest Activity'}</div>
+        <div id="monitorUpdatedAt" style="font-size:.6rem;font-family:var(--font-mono);color:var(--text-3);white-space:nowrap">-</div>
+      </div>
+      <div id="monitorCompany" style="font-size:.82rem;font-weight:700;color:var(--text-1);margin-bottom:4px">-</div>
+      <div style="background:var(--bg-card);border-radius:var(--radius-sm);padding:6px 8px;border:1px solid var(--border-subtle)">
+        <div style="font-size:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-bottom:2px">${_lang === 'ja' ? '最新ステップ' : 'Latest Step'}</div>
+        <div id="monitorStep" style="font-size:.75rem;color:var(--text-1);font-weight:500">-</div>
+      </div>
+    </div>
+
+    <!-- Thinking indicator -->
+    <div id="monitorThinkingRow" style="display:none;align-items:center;gap:8px;padding:7px 14px;background:linear-gradient(90deg,rgba(99,102,241,.07),transparent);border-bottom:1px solid rgba(99,102,241,.12);flex-shrink:0">
+      <span class="think-spin"></span>
+      <span id="monitorThinkingText" style="font-size:.72rem;color:#6366f1;font-style:italic;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">思考中...</span>
+    </div>
+    <div id="monitorActiveSummary" style="display:none">-</div>
+
+    <!-- Event List (scrollable, chat-style) -->
+    <div id="monitorEventList" style="display:flex;flex-direction:column;flex:1;overflow-y:auto;background:var(--bg-card);overscroll-behavior:contain;-webkit-mask-image:linear-gradient(to bottom,black 90%,transparent 100%)"></div>
+
+    <!-- URL -->
+    <div style="padding:8px 14px;border-top:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
+      <div style="font-size:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-bottom:3px">${_lang === 'ja' ? 'URL' : 'URL'}</div>
+      <a id="monitorCurrentUrl" href="#" target="_blank" style="display:block;font-size:.68rem;color:var(--primary);font-family:var(--font-mono);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:4px 6px;background:var(--bg-card);border-radius:var(--radius-sm);border:1px solid var(--border-subtle)">-</a>
+    </div>
+
+    <!-- Screenshot -->
+    <div style="padding:8px 14px;border-top:1px solid var(--border-subtle);background:var(--bg-surface);flex-shrink:0">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <div style="font-size:.55rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3)">${_lang === 'ja' ? '最新スクショ' : 'Latest Screenshot'}</div>
+        <a id="monitorScreenshotLink" href="#" target="_blank" style="display:none;font-size:.6rem;color:var(--primary);text-decoration:none;font-weight:600">${_lang === 'ja' ? '別タブ ↗' : 'Open ↗'}</a>
+      </div>
+      <div id="monitorScreenshotWrap" style="min-height:80px;max-height:140px;overflow:auto;overscroll-behavior:contain;border:1px dashed var(--border-default);border-radius:var(--radius-sm);background:var(--bg-deep);display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:.7rem;text-align:center;padding:8px">${_lang === 'ja' ? 'スクリーンショット待機中' : 'Waiting for screenshot'}</div>
+    </div>
+  </div>
+</div>
 </main>
 
 <script>
 const LANG = ${serializeForInlineScript(_lang)};
 const I18N = ${serializeForInlineScript(_t)};
 const AVAILABLE_AI_PROVIDERS = ${serializeForInlineScript(providerOptions)};
+const DASHBOARD_SESSION_TOKEN = ${serializeForInlineScript(ensureDashboardSessionToken())};
+const DASHBOARD_SESSION_COOKIE_NAME = ${serializeForInlineScript(getDashboardSessionCookieName())};
 const NATIVE_DIRECTORY_PICKER_AVAILABLE = ${process.versions.electron ? 'true' : 'false'};
+const BUILD_SOURCE = ${serializeForInlineScript(APP_BUILD_SOURCE)};
 function t(key, params) {
   let text = I18N[key] || key;
   if (params) Object.entries(params).forEach(([k,v]) => { text = text.replace('{'+k+'}', v); });
   return text;
 }
-const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 function withSessionQuery(urlLike) {
   const url = new URL(urlLike, window.location.origin);
+  if (DASHBOARD_SESSION_TOKEN && !url.searchParams.has('session')) {
+    url.searchParams.set('session', DASHBOARD_SESSION_TOKEN);
+  }
   return url.pathname + url.search + url.hash;
 }
 const nativeFetch = window.fetch.bind(window);
 window.fetch = function(input, init = {}) {
-  return nativeFetch(input, { credentials: 'same-origin', ...init });
+  const headers = new Headers(init.headers || {});
+  if (DASHBOARD_SESSION_TOKEN && !headers.has('x-sales-claw-session')) {
+    headers.set('x-sales-claw-session', DASHBOARD_SESSION_TOKEN);
+  }
+  return nativeFetch(input, { ...init, credentials: 'same-origin', headers });
 };
 function createSessionEventSource(urlLike) {
   return new EventSource(withSessionQuery(urlLike));
@@ -4006,6 +5419,9 @@ function createSessionEventSource(urlLike) {
 function createSessionWebSocket(pathname) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const endpoint = new URL(proto + '//' + location.host + pathname);
+  if (DASHBOARD_SESSION_TOKEN && !endpoint.searchParams.has('session')) {
+    endpoint.searchParams.set('session', DASHBOARD_SESSION_TOKEN);
+  }
   return new WebSocket(endpoint.toString());
 }
 const TARGET_COLUMN_FIELDS = ['no','status','companyName','type','url','formUrl','notes','captcha','progress'];
@@ -4036,6 +5452,9 @@ let _ptyWs = null;
 let _ptyWsRetryTimer = null;
 let _termDrawerOpen = false;
 let _currentAiProvider = 'claude';
+let _currentAiAutoSendSafe = false;
+let _launchAutoSendSafe = false;
+let _launchDiagnosticsToken = 0;
 function getAiProviderMeta(providerId) {
   return AVAILABLE_AI_PROVIDERS.find((provider) => provider.id === providerId) || AVAILABLE_AI_PROVIDERS[0] || { id: 'claude', displayName: 'Claude' };
 }
@@ -4048,24 +5467,24 @@ function getLaunchModeUi(providerId) {
   if (providerId === 'codex') {
     return {
       note: isJa
-        ? 'Codex は full-auto 系で自動処理します。手動確認したいときだけ on-request を使ってください。'
-        : 'Codex uses full-auto modes for automation. Use on-request only when you want manual confirmation.',
+        ? 'Codex のフォーム入力は managed セッション前提です。タブを残したいときはダッシュボードから起動したまま no-prompt auto 系で使ってください。なお Codex は bypass でも MCP の許可ダイアログが一度だけ出ることがあります。'
+        : 'Codex form fill now expects a managed dashboard session. Keep it launched from the dashboard when you need browser tabs to stay open.',
       help: isJa
-        ? 'Codex の自動フォーム入力は <strong>full-auto</strong> か <strong>danger bypass</strong> 前提です。<strong>on-request</strong> 系はログイン確認や手動デバッグ向けで、途中停止しやすくなります。'
-        : 'Codex form fill expects <strong>full-auto</strong> or <strong>danger bypass</strong>. <strong>On-request</strong> modes are for login checks or manual debugging and may pause.',
+        ? 'Codex の自動フォーム入力は <strong>managed セッション + no-prompt auto</strong> か <strong>managed セッション + danger bypass</strong> 前提です。<strong>on-request</strong> 系はログイン確認や手動デバッグ向けで、途中停止しやすくなります。なお <strong>danger bypass</strong> でも、Codex 本体の MCP 権限ルールが未保存だと Playwright 操作で一度だけ確認が出ることがあります。'
+        : 'Codex form fill expects a <strong>managed session + no-prompt auto</strong> or <strong>managed session + danger bypass</strong>. <strong>On-request</strong> modes are for login checks or manual debugging and may pause.',
       modes: {
         auto: {
-          label: isJa ? 'full-auto（推奨）' : 'Full-auto (recommended)',
+          label: isJa ? 'no-prompt auto（推奨）' : 'No-prompt auto (recommended)',
           description: isJa
-            ? 'Codex の --full-auto で起動します。通常のキュー投入やフォーム処理はこのモードです。'
-            : 'Launches Codex with --full-auto. Use this for normal queued runs and form work.',
+            ? 'Codex の -a never / -s danger-full-access で起動します。通常の承認待ちはかなり減りますが、Playwright MCP の操作種別で Codex 側の確認が一度だけ出る場合があります。'
+            : 'Launches Codex with -a never / -s danger-full-access. Use this for queued runs when you do not want approval prompts.',
           tag: isJa ? '推奨' : 'Recommended',
           tagTone: 'recommend',
         },
         bypassPermissions: {
           label: isJa ? 'danger bypass' : 'Danger bypass',
           description: isJa
-            ? 'Codex の --dangerously-bypass-approvals-and-sandbox を使います。詰まるときだけ使ってください。'
+            ? 'Codex の --dangerously-bypass-approvals-and-sandbox を使います。CLI の承認は最も減りますが、Codex 本体の MCP 許可ダイアログが一度だけ残る場合があります。'
             : 'Uses Codex --dangerously-bypass-approvals-and-sandbox. Reserve this for fallback cases.',
           tag: isJa ? '高権限' : 'High access',
           tagTone: 'danger',
@@ -4092,11 +5511,11 @@ function getLaunchModeUi(providerId) {
   if (providerId === 'gemini') {
     return {
       note: isJa
-        ? 'Gemini は auto で auto_edit、強制実行では yolo を使います。完全放置より、途中確認を前提に見てください。'
-        : 'Gemini uses auto_edit for auto and yolo for aggressive runs. Treat it as guided automation rather than fully hands-off.',
+        ? 'Gemini のフォーム入力は managed セッション前提です。タブを残したいときはダッシュボードから起動したまま auto_edit / yolo を使ってください。Gemini 側の browser / MCP 確認が残る場合もあります。'
+        : 'Gemini form fill now expects a managed dashboard session. Keep it launched from the dashboard when you need browser tabs to remain open.',
       help: isJa
-        ? 'Gemini の自動フォーム入力は <strong>auto_edit</strong> か <strong>yolo</strong> 前提です。<strong>default approvals</strong> は確認待ちで止まりやすいため、ログイン確認向けです。'
-        : 'Gemini form fill expects <strong>auto_edit</strong> or <strong>yolo</strong>. <strong>Default approvals</strong> is mainly for login checks and often pauses.',
+        ? 'Gemini の自動フォーム入力は <strong>managed セッション + auto_edit</strong> か <strong>managed セッション + yolo</strong> 前提です。<strong>default approvals</strong> は確認待ちで止まりやすいため、ログイン確認向けです。'
+        : 'Gemini form fill expects a <strong>managed session + auto_edit</strong> or <strong>managed session + yolo</strong>. <strong>Default approvals</strong> is mainly for login checks and often pauses.',
       modes: {
         auto: {
           label: isJa ? 'auto_edit（推奨）' : 'auto_edit (recommended)',
@@ -4109,7 +5528,7 @@ function getLaunchModeUi(providerId) {
         bypassPermissions: {
           label: 'yolo',
           description: isJa
-            ? 'Gemini CLI の --approval-mode yolo を使います。止まりやすいケースの切り札です。'
+            ? 'Gemini CLI の --approval-mode yolo を使います。最も強い approval-mode ですが、Gemini 側の browser / MCP 確認が残る場合があります。'
             : 'Uses Gemini CLI --approval-mode yolo. Keep this as the fallback when auto_edit still pauses.',
           tag: isJa ? '高権限' : 'High access',
           tagTone: 'danger',
@@ -4135,8 +5554,8 @@ function getLaunchModeUi(providerId) {
   }
   return {
     note: isJa
-      ? 'Claude は auto を通常運用の既定にし、必要な場合だけ bypassPermissions に切り替えてください。'
-      : 'Use auto as the normal mode for Claude, and switch to bypassPermissions only when needed.',
+      ? 'Claude もフォーム入力時は managed セッション前提です。通常は auto を使い、必要な場合だけ bypassPermissions に切り替えてください。'
+      : 'Claude form fill also expects a managed session. Use auto as the normal mode and switch to bypassPermissions only when needed.',
     help: isJa
       ? 'Claude の自動フォーム入力は <strong>auto</strong> または <strong>bypassPermissions</strong> 前提です。<strong>default</strong> / <strong>acceptEdits</strong> はログイン確認や手動監視には使えますが、承認待ちで止まることがあります。'
       : 'Claude form fill expects <strong>auto</strong> or <strong>bypassPermissions</strong>. <strong>default</strong> / <strong>acceptEdits</strong> are mainly for login checks or manual monitoring.',
@@ -4152,7 +5571,7 @@ function getLaunchModeUi(providerId) {
       bypassPermissions: {
         label: isJa ? '権限スキップ（危険）' : 'Bypass permissions (danger)',
         description: isJa
-          ? '最も強いモードです。権限確認をほぼ飛ばします。通常は auto を優先してください。'
+          ? '最も強いモードです。Claude CLI 側の権限確認をほぼ飛ばします。通常は auto を優先してください。'
           : 'The strongest mode. It skips most permission prompts, so prefer auto when possible.',
         tag: isJa ? '危険' : 'Danger',
         tagTone: 'danger',
@@ -4191,6 +5610,124 @@ function getLaunchModeDisplayLabel(providerId, mode) {
   if (providerId === 'gemini' && mode === 'auto_edit') return labels.auto || 'auto_edit';
   return mode || '';
 }
+function getLaunchAutoSendPolicyLabel(enabled) {
+  return enabled
+    ? (LANG === 'ja' ? '安全なフォームは自動送信' : 'Auto-send safe forms')
+    : (LANG === 'ja' ? '確認待ちで停止' : 'Stop for approval');
+}
+function getAutoSendPolicyLabel(enabled) {
+  return getLaunchAutoSendPolicyLabel(enabled);
+}
+function renderLaunchSelectedLabel() {
+  const lbl = document.getElementById('launchSelectedLabel');
+  if (!lbl) return;
+  const providerLabel = getAiProviderLabel(_currentAiProvider);
+  const labels = getLaunchModeLabels(_currentAiProvider);
+  const currentMode = _launchModalMode || _currentClaudeMode || 'auto';
+  const policy = getLaunchAutoSendPolicyLabel(_launchAutoSendSafe);
+  lbl.textContent = (LANG === 'ja' ? '選択中: ' : 'Selected: ')
+    + providerLabel
+    + ' / '
+    + (labels[currentMode] || currentMode)
+    + ' / '
+    + policy;
+}
+function renderLaunchDiagnosticRow(tone, title, detail) {
+  const palette = tone === 'ok'
+    ? { bg: '#ecfdf5', fg: '#065f46', border: 'rgba(16,185,129,.18)' }
+    : tone === 'warn'
+      ? { bg: '#fffbeb', fg: '#92400e', border: 'rgba(245,158,11,.22)' }
+      : { bg: '#fef2f2', fg: '#991b1b', border: 'rgba(239,68,68,.2)' };
+  return '<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 10px;border:1px solid ' + palette.border + ';background:' + palette.bg + ';border-radius:10px">'
+    + '<span style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:999px;background:#fff;font-size:.68rem;font-weight:900;color:' + palette.fg + ';flex-shrink:0">'
+    + (tone === 'ok' ? '✓' : tone === 'warn' ? '!' : '×')
+    + '</span>'
+    + '<div style="min-width:0"><div style="font-weight:700;color:' + palette.fg + ';font-size:.74rem">' + esc(title) + '</div><div style="font-size:.71rem;color:#475569;line-height:1.5;margin-top:1px">' + esc(detail || '') + '</div></div>'
+    + '</div>';
+}
+function renderLaunchSetupDiagnostics(data) {
+  const body = document.getElementById('launchSetupDiagnosticsBody');
+  if (!body) return;
+  if (!data) {
+    body.textContent = LANG === 'ja' ? '診断情報を取得できませんでした。' : 'Could not load setup diagnostics.';
+    return;
+  }
+  const rows = [];
+  rows.push(renderLaunchDiagnosticRow(data.cliInstalled ? 'ok' : 'error',
+    LANG === 'ja' ? 'CLI インストール' : 'CLI installation',
+    data.cliInstalled
+      ? ((LANG === 'ja' ? '実行可能です。' : 'Detected and callable.') + (data.installCommand ? ' ' + data.installCommand : ''))
+      : ((LANG === 'ja' ? '未導入です。' : 'Not installed.') + ' ' + (data.installCommand || ''))));
+  rows.push(renderLaunchDiagnosticRow(data.cliLoggedIn ? 'ok' : 'warn',
+    LANG === 'ja' ? 'ログイン状態' : 'Login status',
+    data.cliLoggedIn
+      ? (LANG === 'ja' ? '認証済みです。' : 'Authenticated.')
+      : (data.cliAuthError || (LANG === 'ja' ? 'ログインが必要です。' : 'Authentication is required.'))));
+  rows.push(renderLaunchDiagnosticRow(data.npm && data.npm.available ? 'ok' : 'warn',
+    'npm',
+    data.npm && data.npm.available
+      ? ((LANG === 'ja' ? '自動インストールに使えます。' : 'Available for automatic installs.') + (data.npm.version ? ' v' + data.npm.version : ''))
+      : ((data.npm && data.npm.error) || (LANG === 'ja' ? 'npm が見つからないため自動インストールは使えません。' : 'npm is unavailable, so automatic install cannot run.'))));
+  rows.push(renderLaunchDiagnosticRow(data.playwrightPackage && data.playwrightPackage.available ? 'ok' : 'warn',
+    LANG === 'ja' ? 'Playwright MCP パッケージ' : 'Playwright MCP package',
+    data.playwrightPackage && data.playwrightPackage.available
+      ? (LANG === 'ja' ? 'npm exec で起動できます。' : 'Available via npm exec.')
+      : ((data.playwrightPackage && data.playwrightPackage.error) || (LANG === 'ja' ? 'Playwright MCP を起動できません。' : 'Playwright MCP bootstrap failed.'))));
+  if (data.providerPlaywright && data.providerPlaywright.configured !== null) {
+    rows.push(renderLaunchDiagnosticRow(data.providerPlaywright.configured ? 'ok' : 'warn',
+      LANG === 'ja' ? 'CLI 側の MCP 登録' : 'CLI MCP registration',
+      data.providerPlaywright.configured
+        ? (LANG === 'ja' ? 'Playwright MCP がこの CLI に登録済みです。' : 'Playwright MCP is registered in this CLI.')
+        : ((data.providerPlaywright && data.providerPlaywright.error) || (LANG === 'ja' ? 'Playwright MCP が未登録です。起動時に自動設定を試みます。' : 'Playwright MCP is not registered yet. Launch will try to configure it.'))));
+  }
+  if (data.workspaceTrusted) {
+    rows.push(renderLaunchDiagnosticRow(data.workspaceTrusted.configured ? 'ok' : 'warn',
+      LANG === 'ja' ? 'Workspace trust' : 'Workspace trust',
+      data.workspaceTrusted.configured
+        ? (LANG === 'ja' ? 'このプロジェクトは信頼済みです。' : 'This project is trusted.')
+        : ((data.workspaceTrusted && data.workspaceTrusted.note) || (LANG === 'ja' ? '初回起動時に trust 設定が必要です。' : 'Trust must be granted before the first automation run.'))));
+  }
+  if (data.launchExamples) {
+    const parts = [];
+    if (data.launchExamples.auto) parts.push('auto: ' + data.launchExamples.auto);
+    if (data.launchExamples.bypassPermissions) parts.push('bypass: ' + data.launchExamples.bypassPermissions);
+    if (parts.length) {
+      rows.push(renderLaunchDiagnosticRow('ok',
+        LANG === 'ja' ? '実際の起動フラグ' : 'Effective launch flags',
+        parts.join(' / ')));
+    }
+  }
+  if (data.approvalCaveat) {
+    rows.push(renderLaunchDiagnosticRow(data.approvalCaveat.tone || 'warn',
+      LANG === 'ja' ? '承認まわりの注意' : 'Approval caveat',
+      LANG === 'ja'
+        ? (data.approvalCaveat.ja || data.approvalCaveat.message || '')
+        : (data.approvalCaveat.en || data.approvalCaveat.message || '')));
+  }
+  rows.push(renderLaunchDiagnosticRow('warn',
+    LANG === 'ja' ? '確認待ちタブの保持' : 'Awaiting tab retention',
+    data.tabRetentionNote || (LANG === 'ja' ? 'AIフォーム入力は managed セッション前提です。' : 'Form fill expects a managed session.')));
+  body.innerHTML = rows.join('');
+}
+async function loadLaunchSetupDiagnostics(providerId = _currentAiProvider) {
+  const body = document.getElementById('launchSetupDiagnosticsBody');
+  if (!body) return;
+  const token = ++_launchDiagnosticsToken;
+  body.textContent = LANG === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...';
+  try {
+    const res = await fetch('/api/ai/setup-diagnostics?provider=' + encodeURIComponent(providerId));
+    const data = await res.json();
+    if (token !== _launchDiagnosticsToken) return;
+    if (!res.ok || data.ok === false) {
+      renderLaunchSetupDiagnostics(null);
+      return;
+    }
+    renderLaunchSetupDiagnostics(data);
+  } catch (_) {
+    if (token !== _launchDiagnosticsToken) return;
+    renderLaunchSetupDiagnostics(null);
+  }
+}
 function updateLaunchProviderUi(providerId) {
   const meta = getAiProviderMeta(providerId || _currentAiProvider);
   const providerLabel = getAiProviderLabel(meta.id);
@@ -4219,6 +5756,10 @@ function updateLaunchProviderUi(providerId) {
   const help = document.getElementById('launchModeHelpNote');
   if (help) {
     help.innerHTML = modeUi.help;
+  }
+  const submissionSelect = document.getElementById('launchAutoSendSafeSelect');
+  if (submissionSelect) {
+    submissionSelect.value = _launchAutoSendSafe ? 'true' : 'false';
   }
   ['default', 'acceptEdits', 'auto', 'bypassPermissions'].forEach((mode) => {
     const metaUi = (modeUi.modes || {})[mode] || {};
@@ -4264,8 +5805,8 @@ function updateLaunchProviderUi(providerId) {
   const externalBtn = document.getElementById('launchExternalBtn');
   if (externalBtn) {
     externalBtn.textContent = LANG === 'ja'
-      ? (providerLabel + ' を外部で開く')
-      : ('Open ' + providerLabel + ' externally');
+      ? (providerLabel + ' の作業画面を外部で開く')
+      : ('Open ' + providerLabel + ' work session externally');
   }
   const confirmBtn = document.getElementById('launchConfirmBtn');
   if (confirmBtn) {
@@ -4276,10 +5817,10 @@ function updateLaunchProviderUi(providerId) {
     confirmBtn.style.boxShadow = '0 4px 14px ' + _theme.shadow;
   }
   const selectedLabel = document.getElementById('launchSelectedLabel');
-  if (selectedLabel) {
-    const labels = getLaunchModeLabels(meta.id);
-    const currentMode = _launchModalMode || _currentClaudeMode || 'auto';
-    selectedLabel.textContent = (LANG === 'ja' ? '選択中: ' : 'Selected: ') + providerLabel + ' / ' + (labels[currentMode] || currentMode);
+  if (selectedLabel) renderLaunchSelectedLabel();
+  const modal = document.getElementById('launchModal');
+  if (modal && modal.style.display === 'flex') {
+    loadLaunchSetupDiagnostics(meta.id);
   }
 }
 function setClaudeMode(mode) {
@@ -4289,6 +5830,16 @@ function setClaudeMode(mode) {
   const dml = document.getElementById('termDrawerModeLabel');
   if (dml) dml.textContent = getLaunchModeDisplayLabel(_currentAiProvider, mode);
   updateLaunchModalSelection(mode);
+}
+
+function setLaunchAutoSendSafe(enabled, options = {}) {
+  _launchAutoSendSafe = !!enabled;
+  if (options.commitCurrent) {
+    _currentAiAutoSendSafe = _launchAutoSendSafe;
+  }
+  const select = document.getElementById('launchAutoSendSafeSelect');
+  if (select) select.value = _launchAutoSendSafe ? 'true' : 'false';
+  renderLaunchSelectedLabel();
 }
 
   function setLaunchAdvancedModesOpen(open) {
@@ -4305,7 +5856,7 @@ function setClaudeMode(mode) {
     setLaunchAdvancedModesOpen(!_launchAdvancedModesOpen);
   }
 
-  function updateLaunchModalSelection(mode) {
+function updateLaunchModalSelection(mode) {
     const current = mode || 'auto';
     _launchModalMode = current;
     const shouldOpenAdvanced = ['default', 'acceptEdits'].includes(current);
@@ -4326,20 +5877,17 @@ function setClaudeMode(mode) {
     card.style.background = bgColor;
     if (check) check.style.display = isSelected ? 'flex' : 'none';
   });
-  const lbl = document.getElementById('launchSelectedLabel');
-  const labels = getLaunchModeLabels(_currentAiProvider);
-  if (lbl) {
-    const providerLabel = getAiProviderLabel(_currentAiProvider);
-    lbl.textContent = (LANG === 'ja' ? '選択中: ' : 'Selected: ') + providerLabel + ' / ' + (labels[current] || current);
-  }
+  renderLaunchSelectedLabel();
 }
 
   function openLaunchModal(mode) {
+    setLaunchAutoSendSafe(_currentAiAutoSendSafe);
     updateLaunchProviderUi(_currentAiProvider);
     setLaunchAdvancedModesOpen(['default', 'acceptEdits'].includes(mode || _currentClaudeMode));
     updateLaunchModalSelection(mode || _currentClaudeMode || 'auto');
     const modal = document.getElementById('launchModal');
     if (modal) modal.style.display = 'flex';
+    loadLaunchSetupDiagnostics(_currentAiProvider);
   }
 
 function closeLaunchModal() {
@@ -4358,30 +5906,33 @@ function selectLaunchMode(mode) {
 async function confirmLaunch() {
   const mode = _launchModalMode || _currentClaudeMode || 'auto';
   _currentClaudeMode = mode;
+  _currentAiAutoSendSafe = _launchAutoSendSafe;
   closeLaunchModal();
-  await launchClaude(mode, _currentAiProvider);
+  await launchClaude(mode, _currentAiProvider, _launchAutoSendSafe);
 }
 
 async function confirmExternalLaunch() {
   const mode = _launchModalMode || _currentClaudeMode || 'auto';
   _currentClaudeMode = mode;
+  _currentAiAutoSendSafe = _launchAutoSendSafe;
   closeLaunchModal();
-  await launchClaudeExternal(mode, _currentAiProvider);
+  await launchClaudeExternal(mode, _currentAiProvider, _launchAutoSendSafe);
 }
 
 // Launch AI (in-process spawn via API)
-async function launchClaude(mode = _currentClaudeMode, providerId = _currentAiProvider) {
+async function launchClaude(mode = _currentClaudeMode, providerId = _currentAiProvider, autoSendSafe = _launchAutoSendSafe) {
   const providerLabel = getAiProviderLabel(providerId);
   try {
-    const res = await fetch('/api/launch-ai', {
+    const res = await safeFetch('/api/launch-ai', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ mode, provider: providerId })
-    });
+      body: JSON.stringify({ mode, provider: providerId, autoSendSafe: !!autoSendSafe })
+    }, providerLabel + ' を起動中...');
     const data = await res.json();
     if (data.ok) {
       _currentAiProvider = data.provider || providerId;
-      showToast(t('app.launchAi.success', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, mode) + ']', 'success');
+      _currentAiAutoSendSafe = !!(data.autoSendSafe ?? autoSendSafe);
+      showToast(t('app.launchAi.success', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, mode) + ' / ' + getAutoSendPolicyLabel(_currentAiAutoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']', 'success');
       document.querySelector('.tab-btn[data-tab="logs"]')?.click();
       setTimeout(() => { pollClaudeStatus(); }, 800);
     } else {
@@ -4392,18 +5943,19 @@ async function launchClaude(mode = _currentClaudeMode, providerId = _currentAiPr
   }
 }
 
-async function launchClaudeExternal(mode = _currentClaudeMode, providerId = _currentAiProvider) {
+async function launchClaudeExternal(mode = _currentClaudeMode, providerId = _currentAiProvider, autoSendSafe = _launchAutoSendSafe) {
   const providerLabel = getAiProviderLabel(providerId);
   try {
-    const res = await fetch('/api/launch-ai-external', {
+    const res = await safeFetch('/api/launch-ai-external', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ mode, provider: providerId })
-    });
+      body: JSON.stringify({ mode, provider: providerId, autoSendSafe: !!autoSendSafe })
+    }, providerLabel + ' の作業画面を外部で開いています...');
     const data = await res.json();
     if (data.ok) {
       _currentAiProvider = data.provider || providerId;
-      showToast(t('app.launchAi.external', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, mode) + ']', 'success');
+      _currentAiAutoSendSafe = !!(data.autoSendSafe ?? autoSendSafe);
+      showToast(t('app.launchAi.external', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, mode) + ' / ' + getAutoSendPolicyLabel(_currentAiAutoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']', 'success');
       setTimeout(() => { pollClaudeStatus(); }, 800);
     } else {
       showToast(t('app.launchAi.error', { provider: providerLabel }) + ': ' + (data.error || ''), 'error');
@@ -4439,6 +5991,7 @@ async function pollClaudeStatus() {
     if (!dot) return;
     const providerId = data.provider || data.selectedProvider || _currentAiProvider;
     const providerLabel = data.providerLabel || getAiProviderLabel(providerId);
+    _currentAiAutoSendSafe = !!data.autoSendSafe;
     if (!launchModalOpen) {
       _currentAiProvider = providerId;
       updateLaunchProviderUi(data.selectedProvider || providerId);
@@ -4457,7 +6010,7 @@ async function pollClaudeStatus() {
     if (data.managed) {
       // ダッシュボードが起動・管理中 → green
       dot.className = 'live-dot on';
-      label.textContent = t('ai.status.connected', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, data.mode || 'default') + ']';
+      label.textContent = t('ai.status.connected', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, data.mode || 'default') + ' / ' + getAutoSendPolicyLabel(!!data.autoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']';
       btn.style.display = 'none';
       if (stopBtn) stopBtn.style.display = '';
       const dml = document.getElementById('termDrawerModeLabel');
@@ -4466,7 +6019,7 @@ async function pollClaudeStatus() {
       if (tml) tml.textContent = getLaunchModeDisplayLabel(providerId, data.mode || 'default');
     } else if (data.headless && data.running) {
       dot.className = 'live-dot on';
-      label.textContent = t('ai.status.connected', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, data.mode || 'headless') + ']';
+      label.textContent = t('ai.status.connected', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, data.mode || 'headless') + ' / ' + getAutoSendPolicyLabel(!!data.autoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']';
       btn.style.display = 'none';
       if (stopBtn) stopBtn.style.display = '';
       const dml = document.getElementById('termDrawerModeLabel');
@@ -4531,9 +6084,11 @@ async function installClaudeCli() {
     if (data.ok) {
       showToast(t('ai.install.success', { provider: providerLabel }), 'success');
       setTimeout(pollClaudeStatus, 500);
+      loadLaunchSetupDiagnostics(_currentAiProvider);
     } else {
       showToast(t('ai.install.failed', { provider: providerLabel }) + ': ' + (data.error || ''), 'error');
       setTimeout(pollClaudeStatus, 500);
+      loadLaunchSetupDiagnostics(_currentAiProvider);
     }
   } catch (e) {
     showToast(t('ai.install.failed', { provider: providerLabel }) + ': ' + e.message, 'error');
@@ -4564,6 +6119,126 @@ const actionBadge=a=>{
 
 let currentFilter='all';
 let prevStats={};
+let _activeMainTab = 'companies';
+const _sectionRenderState = {
+  liveMonitor: { signature: '', rendered: false },
+  companies: { signature: '', rendered: false },
+  logs: { signature: '', rendered: false },
+  awaiting: { signature: '', rendered: false },
+  sent: { signature: '', rendered: false },
+};
+
+function getActiveMainTab() {
+  const active = document.querySelector('.tab-btn.active');
+  return (active && active.dataset && active.dataset.tab) || _activeMainTab || 'companies';
+}
+
+function shouldRenderSection(section, signature, forceSection) {
+  const state = _sectionRenderState[section] || { signature: '', rendered: false };
+  if (forceSection && forceSection === section) return true;
+  return !state.rendered || state.signature !== signature;
+}
+
+function markSectionRendered(section, signature) {
+  if (!_sectionRenderState[section]) {
+    _sectionRenderState[section] = { signature: '', rendered: false };
+  }
+  _sectionRenderState[section].signature = signature;
+  _sectionRenderState[section].rendered = true;
+}
+
+function compactSignatureValue(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/[|:\\n\\r]/g, ' ').slice(0, 200);
+}
+
+function buildCompanySectionSignature(companies) {
+  return (companies || []).map((company) => [
+    company.no,
+    compactSignatureValue(company.name),
+    compactSignatureValue(company.type),
+    compactSignatureValue(company.lastAction),
+    compactSignatureValue(company.lastActionAt),
+    compactSignatureValue(company.formUrl),
+    compactSignatureValue(company.sentMessage),
+    compactSignatureValue(company.contactCount),
+    compactSignatureValue(company.isApproachable),
+    compactSignatureValue(company.isOutreachTarget),
+    compactSignatureValue(company.isDetachedFromTargetList),
+    compactSignatureValue(company.outreachStatus),
+    compactSignatureValue(company.outreachDetail),
+    compactSignatureValue(company.lastErrorDetail),
+    compactSignatureValue(company.screenshotAuditState),
+    compactSignatureValue(company.readyForManualApproval),
+    compactSignatureValue(company.manualReviewReason),
+  ].join('|')).join('\\n');
+}
+
+function buildLogSectionSignature(recentLogs) {
+  return (recentLogs || []).map((log) => [
+    compactSignatureValue(log.timestamp),
+    compactSignatureValue(log.companyNo),
+    compactSignatureValue(log.companyName),
+    compactSignatureValue(log.action),
+    compactSignatureValue(typeof log.details === 'object' ? JSON.stringify(log.details) : log.details),
+  ].join('|')).join('\\n');
+}
+
+function buildAwaitingSectionSignature(companies) {
+  return (companies || []).map((company) => [
+    company.no,
+    compactSignatureValue(company.awaitingAt),
+    compactSignatureValue(company.lastAction),
+    compactSignatureValue(company.sentMessage),
+    compactSignatureValue(company.screenshotAuditState),
+    compactSignatureValue(company.inputScreenshotName),
+    compactSignatureValue(company.confirmScreenshotName),
+    compactSignatureValue(company.manualReviewReason),
+    compactSignatureValue(company.manualReviewDetail),
+    compactSignatureValue(company.formUrl),
+  ].join('|')).join('\\n');
+}
+
+function buildSentSectionSignature(companies) {
+  return (companies || []).map((company) => [
+    company.no,
+    compactSignatureValue(company.sentAt),
+    compactSignatureValue(company.sentMessage),
+    compactSignatureValue(company.formUrl),
+    compactSignatureValue(company.contactCount),
+    compactSignatureValue(company.inputScreenshotName),
+    compactSignatureValue(company.confirmScreenshotName),
+    compactSignatureValue(company.contactHistory ? JSON.stringify(company.contactHistory) : ''),
+  ].join('|')).join('\\n');
+}
+
+function buildLiveMonitorSectionSignature(monitor) {
+  if (!monitor) return '';
+  const events = Array.isArray(monitor.events) ? monitor.events : [];
+  return [
+    compactSignatureValue(monitor.companyNo),
+    compactSignatureValue(monitor.companyName),
+    compactSignatureValue(monitor.latestStep),
+    compactSignatureValue(monitor.currentUrl),
+    compactSignatureValue(monitor.latestScreenshotName),
+    compactSignatureValue(monitor.updatedAt),
+    events.slice(0, 14).map((event) => [
+      compactSignatureValue(event.companyNo),
+      compactSignatureValue(event.companyName),
+      compactSignatureValue(event.status),
+      compactSignatureValue(event.step),
+      compactSignatureValue(event.updatedAt),
+    ].join('|')).join('\\n'),
+  ].join('\\n');
+}
+let _lastDashboardDataCacheKey = '';
+const _renderSectionKeys = {
+  companyTable: '',
+  recentLogs: '',
+  awaitingList: '',
+  sentList: '',
+  liveMonitor: '',
+};
 
 function updateStat(id,val){
   const el=document.getElementById(id);
@@ -4582,6 +6257,69 @@ function showToast(message, type) {
   toast.textContent = message;
   container.appendChild(toast);
   setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity .3s'; setTimeout(() => toast.remove(), 300); }, 3000);
+}
+
+// Loading overlay
+function showLoading(message) {
+  let overlay = document.getElementById('loadingOverlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'loadingOverlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.3);z-index:99999;display:flex;align-items:center;justify-content:center';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#fff;border-radius:12px;padding:24px 32px;display:flex;align-items:center;gap:12px;box-shadow:0 8px 32px rgba(0,0,0,.2)';
+    box.innerHTML = '<span class="spin" style="border-top-color:var(--primary)"></span>';
+    const txt = document.createElement('span');
+    txt.id = 'loadingText';
+    txt.style.cssText = 'font-size:.85rem;color:var(--text-1);font-weight:500';
+    txt.textContent = message || '処理中...';
+    box.appendChild(txt);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  } else {
+    const txt = document.getElementById('loadingText');
+    if (txt) txt.textContent = message || '処理中...';
+    overlay.style.display = 'flex';
+  }
+}
+function hideLoading() {
+  const overlay = document.getElementById('loadingOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+// Safe fetch wrapper with loading + error toast
+async function safeFetch(url, options, loadingMessage) {
+  if (loadingMessage) showLoading(loadingMessage);
+  try {
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      hideLoading();
+      handleDashboardSessionExpired();
+      throw createDashboardSessionError('Session expired');
+    }
+    if (!res.ok) {
+      const errData = await res.json().catch(function(){return {};});
+      const errMsg = errData.error || errData.message || ('HTTP ' + res.status);
+      if (isDashboardSessionErrorMessage(errMsg)) {
+        hideLoading();
+        handleDashboardSessionExpired();
+        throw createDashboardSessionError('Session expired');
+      }
+      hideLoading();
+      showToast(errMsg, 'error');
+      var sfErr = new Error(errMsg);
+      sfErr.code = 'SAFE_FETCH_ERROR';
+      throw sfErr;
+    }
+    hideLoading();
+    return res;
+  } catch (e) {
+    hideLoading();
+    if (e.code !== 'DASHBOARD_SESSION_EXPIRED' && e.code !== 'SAFE_FETCH_ERROR') {
+      showToast(e.message || '通信エラーが発生しました', 'error');
+    }
+    throw e;
+  }
 }
 
 let selectedCompanyNos = new Set();
@@ -4630,6 +6368,21 @@ function truncateUiTextClient(value, maxLength = 120) {
   return text.length > maxLength ? text.slice(0, maxLength - 1) + '…' : text;
 }
 
+var _progressLabels = {
+  '': LANG === 'ja' ? '未アプローチ' : 'Not approached',
+  'site_analysis': LANG === 'ja' ? 'サイト分析済み' : 'Site analyzed',
+  'message_draft': LANG === 'ja' ? 'メッセージ生成済み' : 'Message drafted',
+  'form_fill': LANG === 'ja' ? 'フォーム入力済み' : 'Form filled',
+  'confirm_reached': LANG === 'ja' ? '確認画面到達' : 'Confirm reached',
+  'awaiting_approval': LANG === 'ja' ? '確認待ち' : 'Awaiting approval',
+  'submitted': LANG === 'ja' ? '送信済み' : 'Submitted',
+  'skipped': LANG === 'ja' ? 'スキップ済み' : 'Skipped',
+  'error': LANG === 'ja' ? 'エラー' : 'Error',
+};
+function getProgressLabel(action) {
+  return _progressLabels[action] || action;
+}
+
 function populateCompanyFilterOptions(companies) {
   const typeSelect = document.getElementById('companyTypeFilter');
   const progressSelect = document.getElementById('companyProgressFilter');
@@ -4638,15 +6391,30 @@ function populateCompanyFilterOptions(companies) {
   const currentType = typeSelect.value || '';
   const currentProgress = progressSelect.value || '';
   const typeOptions = Array.from(new Set((companies || []).map((company) => String(company.type || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ja'));
-  const progressOptions = Array.from(new Set((companies || []).map((company) => String(company.lastAction || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ja'));
+
+  // 進捗オプション: 実データ + 「未アプローチ」を追加
+  var progressSet = new Set();
+  var hasNoAction = false;
+  (companies || []).forEach(function(company) {
+    var action = String(company.lastAction || '').trim();
+    if (action) { progressSet.add(action); } else { hasNoAction = true; }
+  });
+  // 定義順でソート
+  var progressOrder = ['','site_analysis','message_draft','form_fill','confirm_reached','awaiting_approval','submitted','skipped','error'];
+  var progressOptions = progressOrder.filter(function(key) {
+    if (key === '') return hasNoAction;
+    return progressSet.has(key);
+  });
+  // progressOrderに含まれないカスタムアクションも追加
+  progressSet.forEach(function(action) { if (progressOrder.indexOf(action) === -1) progressOptions.push(action); });
 
   typeSelect.innerHTML = '<option value="">' + (LANG === 'ja' ? '種別: すべて' : 'Type: All') + '</option>'
-    + typeOptions.map((value) => '<option value="' + esc(value.toLowerCase()) + '">' + esc(value) + '</option>').join('');
+    + typeOptions.map(function(value) { return '<option value="' + esc(value.toLowerCase()) + '">' + esc(value) + '</option>'; }).join('');
   progressSelect.innerHTML = '<option value="">' + (LANG === 'ja' ? '進捗: すべて' : 'Progress: All') + '</option>'
-    + progressOptions.map((value) => '<option value="' + esc(value.toLowerCase()) + '">' + esc(value) + '</option>').join('');
+    + progressOptions.map(function(key) { return '<option value="' + esc(key === '' ? '__none__' : key.toLowerCase()) + '">' + esc(getProgressLabel(key)) + '</option>'; }).join('');
 
-  if (currentType && Array.from(typeSelect.options).some((option) => option.value === currentType)) typeSelect.value = currentType;
-  if (currentProgress && Array.from(progressSelect.options).some((option) => option.value === currentProgress)) progressSelect.value = currentProgress;
+  if (currentType && Array.from(typeSelect.options).some(function(option) { return option.value === currentType; })) typeSelect.value = currentType;
+  if (currentProgress && Array.from(progressSelect.options).some(function(option) { return option.value === currentProgress; })) progressSelect.value = currentProgress;
 }
 
 function applyCompanyFilters() {
@@ -4663,7 +6431,7 @@ function applyCompanyFilters() {
   document.querySelectorAll('#mt tbody tr').forEach((tr) => {
     const matchQ = !q || (tr.dataset.search || '').includes(q);
     const matchType = !typeFilter || (tr.dataset.typeExact || '') === typeFilter;
-    const matchProgress = !progressFilter || (tr.dataset.progressExact || '') === progressFilter;
+    const matchProgress = !progressFilter || (progressFilter === '__none__' ? !(tr.dataset.progressExact || '') : (tr.dataset.progressExact || '') === progressFilter);
     const visible = matchQ && matchType && matchProgress && rowMatchesCurrentFilter(tr);
     tr.style.display = visible ? '' : 'none';
     if (visible) visibleCompanyNos.add(String(tr.dataset.no));
@@ -5044,9 +6812,13 @@ let mutationRefreshFollowupTimer = null;
 let scheduledRefreshTimer = null;
 let scheduledRefreshForce = false;
 let _latestDashboardData = null;
+let analyticsInitScheduled = false;
+let analyticsInitialized = false;
 let es = null;
 let reconnectTimer = null;
 let offlinePollTimer = null;
+let hiddenRefreshPending = false;
+let hiddenCliLogBuffer = [];
 
 function screenshotUrl(fileName) {
   return withSessionQuery('/screenshots/' + encodeURIComponent(fileName) + '?v=' + renderVersion);
@@ -5082,7 +6854,138 @@ function syncScreenshotRenderVersion(data) {
   }
 }
 
+function buildCompanyTableRenderKey(companies) {
+  return JSON.stringify((companies || []).map((company) => [
+    company.no,
+    company.name || '',
+    company.type || '',
+    company.url || '',
+    company.formUrl || '',
+    company.lastAction || '',
+    company.lastActionAt || '',
+    company.outreachStatus || '',
+    company.outreachDetail || '',
+    company.contactCount || 0,
+    company.isApproachable ? 1 : 0,
+    company.isOutreachTarget ? 1 : 0,
+    company.isDetachedFromTargetList ? 1 : 0,
+    company.canManageInTargetList ? 1 : 0,
+    company.sentAt || '',
+    company.awaitingAt || '',
+    company.lastErrorDetail || '',
+    company.manualReviewReason || '',
+    company.readyForApproval ? 1 : 0,
+    company.readyForManualApproval ? 1 : 0,
+    company.directSubmitDetected ? 1 : 0,
+    company.sentMessage ? company.sentMessage.slice(0, 120) : '',
+    company.inputScreenshotName || '',
+    company.confirmScreenshotName || '',
+    company.screenshotAuditState || '',
+  ]));
+}
+
+function buildRecentLogsRenderKey(recentLogs) {
+  return JSON.stringify((recentLogs || []).map((log) => [
+    log.timestamp || '',
+    log.companyNo || '',
+    log.companyName || '',
+    log.action || '',
+    typeof log.details === 'object' ? JSON.stringify(log.details) : (log.details || ''),
+  ]));
+}
+
+function buildAwaitingListRenderKey(companies) {
+  return JSON.stringify((companies || [])
+    .filter((company) => company && (company.lastAction === 'awaiting_approval' || (company.lastAction === 'confirm_reached' && !company.sentAt)))
+    .map((company) => [
+      company.no,
+      company.name || '',
+      company.type || '',
+      company.lastAction || '',
+      company.awaitingAt || '',
+      company.sentMessage || '',
+      company.formUrl || '',
+      company.inputScreenshotName || '',
+      company.confirmScreenshotName || '',
+      company.screenshotAuditState || '',
+      company.readyForApproval ? 1 : 0,
+      company.readyForManualApproval ? 1 : 0,
+      company.manualReviewReason || '',
+      company.manualReviewDetail || '',
+      company.directSubmitDetected ? 1 : 0,
+    ]));
+}
+
+function buildSentListRenderKey(companies) {
+  return JSON.stringify((companies || [])
+    .filter((company) => company && company.sentAt)
+    .map((company) => [
+      company.no,
+      company.name || '',
+      company.type || '',
+      company.sentAt || '',
+      company.formUrl || '',
+      company.contactCount || 0,
+      company.sentMessage || '',
+      company.inputScreenshotName || '',
+      company.confirmScreenshotName || '',
+      JSON.stringify(company.contactHistory || []),
+    ]));
+}
+
+function buildLiveMonitorRenderKey(monitor) {
+  if (!monitor) return '';
+  return JSON.stringify({
+    status: monitor.status || '',
+    updatedAt: monitor.updatedAt || '',
+    activeCount: monitor.activeCount || 0,
+    companyNo: monitor.companyNo || '',
+    companyName: monitor.companyName || '',
+    step: monitor.step || '',
+    currentUrl: monitor.currentUrl || '',
+    latestScreenshotName: monitor.latestScreenshotName || '',
+    events: (monitor.events || []).map((event) => [
+      event.companyNo || '',
+      event.companyName || '',
+      event.status || '',
+      event.step || '',
+      event.updatedAt || '',
+      event.currentUrl || '',
+      event.latestScreenshotName || '',
+    ]),
+  });
+}
+
+function applyPerformanceMode(companies) {
+  const companyCount = Array.isArray(companies) ? companies.length : 0;
+  const shouldEnable = BUILD_SOURCE === 'installed' || companyCount >= 150;
+  document.body.classList.toggle('perf-mode', shouldEnable);
+}
+
+function ensureAnalyticsInitialized() {
+  if (analyticsInitialized || analyticsInitScheduled) return;
+  analyticsInitScheduled = true;
+  const trigger = () => {
+    ensureChartAssets()
+      .then(() => {
+        initCharts();
+        analyticsInitialized = true;
+        if (typeof _latestDashboardData !== 'undefined' && _latestDashboardData) updateCharts(_latestDashboardData);
+      })
+      .catch(() => {})
+      .finally(() => {
+        analyticsInitScheduled = false;
+      });
+  };
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(trigger, { timeout: BUILD_SOURCE === 'installed' ? 4500 : 1500 });
+  } else {
+    setTimeout(trigger, BUILD_SOURCE === 'installed' ? 2800 : 800);
+  }
+}
+
 function requestDashboardRefresh(options = {}) {
+  if (document.hidden && !options.force) return;
   const delay = Number.isFinite(Number(options.delay)) ? Math.max(0, Number(options.delay)) : 120;
   if (options.force) scheduledRefreshForce = true;
   if (scheduledRefreshTimer) return;
@@ -5217,6 +7120,21 @@ function renderLiveMonitor(monitor) {
     screenshotLink.style.display = 'none';
     screenshotWrap.innerHTML = LANG === 'ja' ? 'スクリーンショット待機中' : 'Waiting for screenshot';
   }
+
+  // Chat-bot style notification when panel is closed
+  if (typeof _lastMonitorEventCount !== 'undefined' && events.length > _lastMonitorEventCount && _lastMonitorEventCount > 0) {
+    const newCount = events.length - _lastMonitorEventCount;
+    if (!_liveMonitorOpen) {
+      _monitorUnreadCount += newCount;
+      updateMonitorBadge();
+      const latest = events[0];
+      if (latest) {
+        const cLabel = latest.companyName ? ((latest.companyNo ? '#' + latest.companyNo + ' ' : '') + latest.companyName) : '-';
+        showMonitorToast(cLabel, latest.step || '-', latest.status || 'idle');
+      }
+    }
+  }
+  _lastMonitorEventCount = events.length;
 }
 
 function renderStatusBanner(data) {
@@ -5259,6 +7177,7 @@ document.addEventListener('click', function(e) {
 });
 
 async function refreshData(options = {}) {
+  if (document.hidden && !options.force) return;
   const isForce = !!options.force;
   const now = Date.now();
   if (refreshInFlight) {
@@ -5288,7 +7207,11 @@ async function refreshData(options = {}) {
     const res = await fetch('/api/data', { cache: 'no-store', signal: controller ? controller.signal : undefined });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Failed to load dashboard data.');
+    if (!isForce && data && data.cacheKey && data.cacheKey === _lastDashboardDataCacheKey) {
+      return;
+    }
     render(data);
+    _lastDashboardDataCacheKey = data && data.cacheKey ? data.cacheKey : '';
   } catch (e) {
     const isAbort = !!(e && (e.name === 'AbortError' || /aborted|abort/i.test(String(e.message || ''))));
     if (!isAbort) {
@@ -5314,8 +7237,15 @@ function render(data){
   _latestDashboardData = data;
   renderStatusBanner(data);
   const{companies,stats,recentLogs,liveMonitor}=data;
+  const activeTab = getActiveMainTab();
   _allCompanies=companies;
-  renderLiveMonitor(liveMonitor);
+  applyPerformanceMode(companies);
+  const liveMonitorKey = buildLiveMonitorRenderKey(liveMonitor);
+  if (_renderSectionKeys.liveMonitor !== liveMonitorKey) {
+    renderLiveMonitor(liveMonitor);
+    _renderSectionKeys.liveMonitor = liveMonitorKey;
+    markSectionRendered('liveMonitor', liveMonitorKey);
+  }
 
   // Stats
   updateStat('s-approachable', stats.approachable);
@@ -5325,16 +7255,20 @@ function render(data){
   updateStat('s-submitted', stats.submitted);
   updateStat('s-error', stats.error);
   updateStat('s-excluded', stats.excluded);
+  if (activeTab === 'companies') ensureAnalyticsInitialized();
 
   // Company table
-  const body=document.getElementById('companyBody');
+  const companyTableKey = buildCompanyTableRenderKey(companies);
   const validCompanyNos = new Set(companies.filter((company) => company.canManageInTargetList).map((company) => String(company.no)));
   selectedCompanyNos = new Set(Array.from(selectedCompanyNos).filter((companyNo) => validCompanyNos.has(companyNo)));
-  const oldRows={};
-  body.querySelectorAll('tr').forEach(tr=>oldRows[tr.dataset.no]=tr.dataset.la);
+  const shouldRenderCompaniesNow = activeTab === 'companies' && shouldRenderSection('companies', companyTableKey);
+  if (shouldRenderCompaniesNow) {
+    const body=document.getElementById('companyBody');
+    const oldRows={};
+    body.querySelectorAll('tr').forEach(tr=>oldRows[tr.dataset.no]=tr.dataset.la);
 
-  let html='';
-  companies.forEach(c=>{
+    let html='';
+    companies.forEach(c=>{
     const f=!c.isApproachable?'excluded':c.lastAction==='submitted'?'submitted':c.lastAction==='error'?'error':c.formUrl?'has-form':'no-form';
     const excl=c.isApproachable?'':'excluded';
     const isNew=oldRows[c.no]!==undefined&&oldRows[c.no]!==(c.lastAction||'');
@@ -5402,43 +7336,57 @@ function render(data){
       +'<td>'+c.no+'</td>'
       +'<td title="'+esc(c.name)+(c.isOutreachTarget?' [営業対象]':'')+(c.isDetachedFromTargetList?' [履歴のみ]':'')+'">'+companyUrlHtml+((targetBadge||detachedBadge)?'<div class="company-meta">'+targetBadge+detachedBadge+'</div>':'')+'</td>'
       +'<td title="'+esc(c.type)+'"><small>'+esc(c.type)+'</small></td>'
-      +'<td title="'+(c.lastAction||'-')+(c.lastErrorDetail?' | '+esc(c.lastErrorDetail):'')+'">'+progressHtml+'</td>'
+      +'<td title="'+esc(c.lastAction||'-')+(c.lastErrorDetail?' | '+esc(c.lastErrorDetail):'')+'">'+progressHtml+'</td>'
       +'<td class="text-center">'+cntHtml+'</td>'
-      +'<td title="'+(c.formUrl||'-')+'">'+(c.formUrl?'<a href="'+esc(c.formUrl)+'" target="_blank" onclick="event.stopPropagation()" title="'+esc(c.formUrl)+'">'+esc(c.formUrl).substring(0,30)+'…</a>':'-')+'</td>'
+      +'<td title="'+esc(c.formUrl||'-')+'">'+(c.formUrl?'<a href="'+esc(c.formUrl)+'" target="_blank" onclick="event.stopPropagation()" title="'+esc(c.formUrl)+'">'+esc(c.formUrl).substring(0,30)+'…</a>':'-')+'</td>'
       +'<td title="'+(c.sentMessage?esc(c.sentMessage).substring(0,100):'')+'">'+msgHtml+'</td>'
       +'<td class="action-cell" onclick="event.stopPropagation()">'+actionHtml+'</td>'
       +'</tr>';
-  });
-  body.innerHTML=html;
-  populateCompanyFilterOptions(companies);
-  syncCompanySelectionUi();
-  applyCompanyFilters();
+    });
+    body.innerHTML=html;
+    populateCompanyFilterOptions(companies);
+    syncCompanySelectionUi();
+    applyCompanyFilters();
+    _renderSectionKeys.companyTable = companyTableKey;
+    markSectionRendered('companies', companyTableKey);
+  }
 
   // Log table
-  const lbody=document.getElementById('logBody');
-  lbody.innerHTML=recentLogs.map(l=>{
-    const t=new Date(l.timestamp).toLocaleString('ja-JP');
-    const actionBg={error:'#da1e28',submitted:'#198038',confirm_reached:'#f59e0b',analyzing:'#0043ce',form_fill:'#6929c4',skip:'#6f6f6f'};
-    const bg=actionBg[l.action]||'#393939';
-    const fgDark=['confirm_reached'];
-    const fg=fgDark.includes(l.action)?'#000':'#fff';
-    const d=typeof l.details==='object'?JSON.stringify(l.details):l.details||'';
-    return'<tr><td class="ts">'+t+'</td><td>'+l.companyNo+'</td><td>'+esc(l.companyName)+'</td>'
-      +'<td><span style="background:'+bg+';color:'+fg+';font-size:.62rem;font-weight:700;padding:1px 8px;letter-spacing:.04em;white-space:nowrap">'+esc(l.action)+'</span></td>'
-      +'<td><small style="color:var(--on-surface-variant)">'+esc(d).substring(0,120)+'</small></td></tr>';
-  }).join('');
+  const recentLogsKey = buildRecentLogsRenderKey(recentLogs);
+  const logCountEl = document.getElementById('logCount');
+  if (logCountEl) logCountEl.textContent = recentLogs.length + ' items';
+  const shouldRenderLogsNow = activeTab === 'logs' && shouldRenderSection('logs', recentLogsKey);
+  if (shouldRenderLogsNow) {
+    const lbody=document.getElementById('logBody');
+    lbody.innerHTML=recentLogs.map(l=>{
+      const t=new Date(l.timestamp).toLocaleString('ja-JP');
+      const actionBg={error:'#da1e28',submitted:'#198038',confirm_reached:'#f59e0b',analyzing:'#0043ce',form_fill:'#6929c4',skip:'#6f6f6f'};
+      const bg=actionBg[l.action]||'#393939';
+      const fgDark=['confirm_reached'];
+      const fg=fgDark.includes(l.action)?'#000':'#fff';
+      const d=typeof l.details==='object'?JSON.stringify(l.details):l.details||'';
+      return'<tr><td class="ts">'+t+'</td><td>'+l.companyNo+'</td><td>'+esc(l.companyName)+'</td>'
+        +'<td><span style="background:'+bg+';color:'+fg+';font-size:.62rem;font-weight:700;padding:1px 8px;letter-spacing:.04em;white-space:nowrap">'+esc(l.action)+'</span></td>'
+        +'<td><small style="color:var(--on-surface-variant)">'+esc(d).substring(0,120)+'</small></td></tr>';
+    }).join('');
+    _renderSectionKeys.recentLogs = recentLogsKey;
+    markSectionRendered('logs', recentLogsKey);
+  }
 
   // Awaiting list
   const awaitingCompanies=companies.filter(c=>
     c.lastAction==='awaiting_approval'||
     (c.lastAction==='confirm_reached'&&!c.sentAt)
   );
-  const awEl=document.getElementById('awaitingList');
   document.getElementById('awaitingCount').textContent=awaitingCompanies.length||'';
-  if(awaitingCompanies.length===0){
-    awEl.innerHTML='<div class="text-center text-muted py-4">'+t('awaiting.empty')+'</div>';
-  }else{
-    awEl.innerHTML=awaitingCompanies.map(c=>{
+  const awaitingListKey = buildAwaitingListRenderKey(companies);
+  const shouldRenderAwaitingNow = activeTab === 'awaiting' && shouldRenderSection('awaiting', awaitingListKey);
+  if (shouldRenderAwaitingNow) {
+    const awEl=document.getElementById('awaitingList');
+    if(awaitingCompanies.length===0){
+      awEl.innerHTML='<div class="text-center text-muted py-4">'+t('awaiting.empty')+'</div>';
+    }else{
+      awEl.innerHTML=awaitingCompanies.map(c=>{
       const date=c.awaitingAt?new Date(c.awaitingAt).toLocaleString('ja-JP'):'-';
       const msgBody=c.sentMessage
         ? esc(c.sentMessage).split(String.fromCharCode(10)).join('<br>')
@@ -5501,15 +7449,21 @@ function render(data){
         +'</div>';
     }).join('');
   }
+    markSectionRendered('awaiting', awaitingListKey);
+    _renderSectionKeys.awaitingList = awaitingListKey;
+  }
 
   // Sent list
   const sentCompanies=companies.filter(c=>c.sentAt).sort((a,b)=>new Date(b.sentAt)-new Date(a.sentAt));
-  const sentEl=document.getElementById('sentList');
   document.getElementById('sentCount').textContent=sentCompanies.length+' items';
-  if(sentCompanies.length===0){
-    sentEl.innerHTML='<div class="text-center text-muted py-4">'+t('sent.empty')+'</div>';
-  }else{
-    sentEl.innerHTML=sentCompanies.map(c=>{
+  const sentListKey = buildSentListRenderKey(companies);
+  const shouldRenderSentNow = activeTab === 'sent' && shouldRenderSection('sent', sentListKey);
+  if (shouldRenderSentNow) {
+    const sentEl=document.getElementById('sentList');
+    if(sentCompanies.length===0){
+      sentEl.innerHTML='<div class="text-center text-muted py-4">'+t('sent.empty')+'</div>';
+    }else{
+      sentEl.innerHTML=sentCompanies.map(c=>{
       const count=c.contactCount||1;
       const countBadge=count>=2?'<span style="background:#0052dd;color:#fff;font-size:.62rem;font-weight:700;padding:1px 8px;margin-left:4px">'+count+'x</span>':'<span style="background:#6f6f6f;color:#fff;font-size:.62rem;font-weight:700;padding:1px 8px;margin-left:4px">1st</span>';
       let historyHtml='';
@@ -5565,13 +7519,16 @@ function render(data){
         +'</div>';
     }).join('');
   }
+    markSectionRendered('sent', sentListKey);
+    _renderSectionKeys.sentList = sentListKey;
+  }
 
   const _ts = new Date().toLocaleString('ja-JP');
   document.getElementById('lastUpdate').textContent=t('app.lastUpdate')+': '+_ts;
   const _sl=document.getElementById('sidebarLastUpdate');if(_sl)_sl.textContent=_ts;
   const _hl=document.getElementById('headerLastUpdate');if(_hl)_hl.textContent=_ts;
   updatePipeline(stats);
-  if (typeof _analyticsOpen !== 'undefined' && _analyticsOpen) updateCharts(data);
+  if (typeof _analyticsOpen !== 'undefined' && _analyticsOpen && analyticsInitialized) updateCharts(data);
 }
 
 // Approve / Skip
@@ -5702,7 +7659,7 @@ function showCompanyDetail(no, event) {
   if (event && event.target.tagName === 'A') return;
   const c = _allCompanies.find(x => x.no === no);
   if (!c) return;
-  const e2 = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const e2 = esc; // esc() includes &, <, >, ", ' escaping
   const cnt = c.contactCount || 0;
   const sc = {error:'#ef4444',submitted:'#10b981',awaiting_approval:'#f59e0b',confirm_reached:'#f59e0b',form_fill:'#6366f1',analyzing:'#3b82f6',site_analysis:'#3b82f6',skipped:'#94a3b8'}[c.lastAction] || '#94a3b8';
   const overlay = document.createElement('div');
@@ -5913,6 +7870,18 @@ function connectEvents(){
   es.onmessage=function(e){
     try{
       const d=JSON.parse(e.data);
+      if (document.hidden) {
+        if (d.type === 'cli-log') {
+          hiddenCliLogBuffer.push({ message: d.message, logType: d.logType, time: d.time });
+          if (hiddenCliLogBuffer.length > 180) {
+            hiddenCliLogBuffer = hiddenCliLogBuffer.slice(-180);
+          }
+          if (d.logType === 'action') hiddenRefreshPending = true;
+        } else if (d.type !== 'claude-stdout') {
+          hiddenRefreshPending = true;
+        }
+        return;
+      }
       if(d.type==='cli-log'){
         appendCliLog(d.message,d.logType,d.time);
         if(d.logType==='action') requestDashboardRefresh({ delay: 180 });
@@ -5943,7 +7912,7 @@ function connectEvents(){
       },3000);
     }
     if(!offlinePollTimer){
-      offlinePollTimer=setInterval(()=>requestDashboardRefresh({ delay: 0 }),15000);
+      offlinePollTimer=setInterval(()=>requestDashboardRefresh({ delay: 0 }),30000);
     }
   };
   es.onopen=function(){
@@ -6039,10 +8008,10 @@ function initCharts() {
         }]
       },
       options: {
-        responsive: true, maintainAspectRatio: false, cutout: '62%',
+        responsive: true, maintainAspectRatio: false, cutout: '72%',
         plugins: {
-          legend: { position: 'right', labels: { boxWidth: 10, usePointStyle: true, padding: 10, font: { size: 11 } } },
-          tooltip: { callbacks: { label: (c) => ' ' + c.label + ': ' + c.raw + '件' } }
+          legend: { position: 'right', labels: { boxWidth: 8, usePointStyle: true, pointStyle: 'circle', padding: 12, font: { size: 11, family: "'Inter','Noto Sans JP',sans-serif" } } },
+          tooltip: { backgroundColor: '#0f172a', titleFont: { size: 11 }, bodyFont: { size: 11, family: "'JetBrains Mono',monospace" }, padding: 10, cornerRadius: 6, callbacks: { label: (c) => ' ' + c.label + ': ' + c.raw + '件' } }
         }
       }
     });
@@ -6051,28 +8020,29 @@ function initCharts() {
   // Area chart - 処理推移 (last 7 days)
     const ctxA = document.getElementById('trendAreaChart');
   if (ctxA && !_trendChart) {
-    const grad1 = ctxA.getContext('2d').createLinearGradient(0,0,0,180);
-    grad1.addColorStop(0,'rgba(245,158,11,0.35)'); grad1.addColorStop(1,'rgba(245,158,11,0)');
-    const grad2 = ctxA.getContext('2d').createLinearGradient(0,0,0,180);
-    grad2.addColorStop(0,'rgba(16,185,129,0.35)'); grad2.addColorStop(1,'rgba(16,185,129,0)');
-    Chart.defaults.font.family = "'Inter','Noto Sans JP',sans-serif";
-    Chart.defaults.color = '#8fa0b5';
+    const grad1 = ctxA.getContext('2d').createLinearGradient(0,0,0,170);
+    grad1.addColorStop(0,'rgba(245,158,11,0.25)'); grad1.addColorStop(1,'rgba(245,158,11,0)');
+    const grad2 = ctxA.getContext('2d').createLinearGradient(0,0,0,170);
+    grad2.addColorStop(0,'rgba(16,185,129,0.25)'); grad2.addColorStop(1,'rgba(16,185,129,0)');
+    Chart.defaults.font.family = "'JetBrains Mono','Inter','Noto Sans JP',monospace";
+    Chart.defaults.color = '#94a3b8';
     _trendChart = new Chart(ctxA.getContext('2d'), {
       type: 'line',
       data: {
         labels: ['6日前','5日前','4日前','3日前','2日前','昨日','今日'],
         datasets: [
-          { label:'要対応', data:[0,0,0,0,0,0,0], borderColor:'#f59e0b', backgroundColor:grad1, borderWidth:2, tension:0.4, fill:true, pointRadius:0 },
-          { label:'送信済', data:[0,0,0,0,0,0,0], borderColor:'#10b981', backgroundColor:grad2, borderWidth:2, tension:0.4, fill:true, pointRadius:0 }
+          { label:'送信済', data:[0,0,0,0,0,0,0], borderColor:'#10b981', backgroundColor:grad2, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#10b981', pointBorderWidth:2 },
+          { label:'要対応', data:[0,0,0,0,0,0,0], borderColor:'#f59e0b', backgroundColor:grad1, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#f59e0b', pointBorderWidth:2 },
+          { label:'エラー', data:[0,0,0,0,0,0,0], borderColor:'#ef4444', backgroundColor:'transparent', borderWidth:1.5, borderDash:[4,4], tension:0.3, fill:false, pointRadius:0, pointHoverRadius:3, pointBackgroundColor:'#ef4444' }
         ]
       },
       options: {
         responsive: true, maintainAspectRatio: false,
         interaction: { mode:'index', intersect:false },
-        plugins: { legend: { display:false } },
+        plugins: { legend: { display:false }, tooltip: { backgroundColor:'#0f172a', titleColor:'#fff', bodyColor:'#e5e7eb', titleFont:{size:11,weight:'bold'}, bodyFont:{size:11,family:"'JetBrains Mono',monospace"}, padding:10, cornerRadius:4, usePointStyle:true, boxPadding:4 } },
         scales: {
-          y: { beginAtZero:true, border:{display:false}, grid:{color:'#f1f5f9'}, ticks:{stepSize:1} },
-          x: { border:{display:false}, grid:{display:false} }
+          y: { beginAtZero:true, border:{display:false}, grid:{color:'rgba(15,23,42,.03)'}, ticks:{maxTicksLimit:5, font:{size:10}, padding:8} },
+          x: { border:{display:false}, grid:{display:false}, ticks:{font:{size:10}} }
         }
       }
     });
@@ -6098,8 +8068,9 @@ function updateCharts(data) {
   // Update trend chart with per-day data
   if (_trendChart && data.trendData) {
     _trendChart.data.labels = data.trendData.labels;
-    _trendChart.data.datasets[0].data = data.trendData.actionNeeded;
-    _trendChart.data.datasets[1].data = data.trendData.sent;
+    _trendChart.data.datasets[0].data = data.trendData.sent;
+    _trendChart.data.datasets[1].data = data.trendData.actionNeeded;
+    if (data.trendData.errors && _trendChart.data.datasets[2]) _trendChart.data.datasets[2].data = data.trendData.errors;
     _trendChart.update('none');
   }
 
@@ -6111,48 +8082,110 @@ function updateCharts(data) {
   const pEl = document.getElementById('analyticsPercent');
   const rEl = document.getElementById('analyticsRatio');
   const bEl = document.getElementById('analyticsProgressBar');
+  const subNumEl = document.getElementById('analyticsSubmittedNum');
   if (pEl) pEl.textContent = pct;
-  if (rEl) rEl.textContent = done + ' / ' + total + ' 送信済み';
+  if (subNumEl) subNumEl.textContent = done;
+  if (rEl) rEl.textContent = '/ ' + total;
   if (bEl) bEl.style.width = pct + '%';
 }
 
-let _liveMonitorOpen = true;
-function setLiveMonitorOpen(nextOpen, { persist = true } = {}) {
-  _liveMonitorOpen = !!nextOpen;
-  const body = document.getElementById('liveMonitorBody');
-  const chevron = document.getElementById('liveMonitorChevron');
-  const label = document.getElementById('liveMonitorToggleLabel');
-  if (body) body.style.display = _liveMonitorOpen ? 'grid' : 'none';
-  if (chevron) chevron.style.transform = _liveMonitorOpen ? 'rotate(0deg)' : 'rotate(-90deg)';
-  if (label) label.textContent = _liveMonitorOpen
-    ? (LANG === 'ja' ? '閉じる' : 'Collapse')
-    : (LANG === 'ja' ? '開く' : 'Expand');
-  if (persist) {
-    try { localStorage.setItem('liveMonitorOpen', _liveMonitorOpen ? '1' : '0'); } catch(_) {}
+let _liveMonitorOpen = false;
+let _monitorUnreadCount = 0;
+let _monitorToastTimer = null;
+let _lastMonitorEventCount = 0;
+
+function toggleMonitorPanel() {
+  _liveMonitorOpen = !_liveMonitorOpen;
+  const panel = document.getElementById('liveMonitorCard');
+  const fab = document.getElementById('monitorFab');
+  const toast = document.getElementById('monitorToast');
+  if (panel) {
+    if (_liveMonitorOpen) {
+      panel.style.display = 'flex';
+      panel.style.animation = 'monitorPanelIn .25s var(--ease-out-expo)';
+      _monitorUnreadCount = 0;
+      updateMonitorBadge();
+      if (toast) toast.style.display = 'none';
+    } else {
+      panel.style.display = 'none';
+    }
+  }
+  if (fab) {
+    fab.querySelector('.material-symbols-outlined').textContent = _liveMonitorOpen ? 'close' : 'chat';
+  }
+  try { localStorage.setItem('liveMonitorOpen', _liveMonitorOpen ? '1' : '0'); } catch(_) {}
+}
+
+function updateMonitorBadge() {
+  const badge = document.getElementById('monitorFabBadge');
+  if (!badge) return;
+  if (_monitorUnreadCount > 0 && !_liveMonitorOpen) {
+    badge.style.display = 'block';
+    badge.textContent = _monitorUnreadCount > 9 ? '9+' : String(_monitorUnreadCount);
+  } else {
+    badge.style.display = 'none';
   }
 }
 
-function toggleLiveMonitor() {
-  setLiveMonitorOpen(!_liveMonitorOpen);
+function showMonitorToast(company, step, status) {
+  if (_liveMonitorOpen) return;
+  const toast = document.getElementById('monitorToast');
+  const toastCompany = document.getElementById('monitorToastCompany');
+  const toastStep = document.getElementById('monitorToastStep');
+  const toastTime = document.getElementById('monitorToastTime');
+  const toastDot = document.getElementById('monitorToastDot');
+  if (!toast) return;
+  const dotColors = { processing:'#3b82f6', awaiting_approval:'#f59e0b', error:'#ef4444', submitted:'#10b981', completed:'#10b981' };
+  if (toastCompany) toastCompany.textContent = company || '-';
+  if (toastStep) toastStep.textContent = step || '-';
+  if (toastTime) toastTime.textContent = new Date().toLocaleTimeString(LANG === 'ja' ? 'ja-JP' : undefined, { hour:'2-digit', minute:'2-digit' });
+  if (toastDot) toastDot.style.background = dotColors[status] || 'var(--primary)';
+  toast.style.display = 'block';
+  toast.style.animation = 'monitorToastIn .3s var(--ease-spring)';
+  if (_monitorToastTimer) clearTimeout(_monitorToastTimer);
+  _monitorToastTimer = setTimeout(() => {
+    if (toast) { toast.style.animation = 'monitorToastOut .2s forwards'; setTimeout(() => { toast.style.display = 'none'; }, 200); }
+  }, 5000);
 }
+
+// Compat shims for old callers
+function setLiveMonitorOpen(nextOpen, { persist = true } = {}) {
+  if (!!nextOpen !== _liveMonitorOpen) toggleMonitorPanel();
+}
+function toggleLiveMonitor() { toggleMonitorPanel(); }
+
 (function() {
   const s = (function() { try { return localStorage.getItem('liveMonitorOpen'); } catch(_) { return null; } })();
-  if (s === '0') setTimeout(() => setLiveMonitorOpen(false, { persist: false }), 0);
-  else setTimeout(() => setLiveMonitorOpen(true, { persist: false }), 0);
+  // Start closed by default (chat-bot style)
+  setTimeout(() => { if (s === '1') toggleMonitorPanel(); }, 100);
 })();
 
 let _analyticsOpen = true;
-// Analytics panel is always visible — auto-init charts on page load
-(function() {
-  setTimeout(() => {
-    ensureChartAssets()
-      .then(() => {
-        initCharts();
-        if (typeof _latestDashboardData !== 'undefined' && _latestDashboardData) updateCharts(_latestDashboardData);
-      })
-      .catch(() => {});
-  }, 400);
-})();
+function scheduleAnalyticsInit() {
+  ensureAnalyticsInitialized();
+}
+// Analytics panel is always visible, but chart boot can wait for idle time.
+scheduleAnalyticsInit();
+
+// Escape key to close modals/overlays
+document.addEventListener('keydown', function(e) {
+  if (e.key !== 'Escape') return;
+  // Close dynamically created overlays (company detail, message view)
+  var overlays = document.querySelectorAll('[style*="position:fixed"][style*="z-index:9999"]');
+  if (overlays.length > 0) { overlays[overlays.length - 1].remove(); return; }
+  // Close loading overlay
+  var loading = document.getElementById('loadingOverlay');
+  if (loading && loading.style.display !== 'none') { loading.style.display = 'none'; return; }
+  // Close launch modal
+  var launchModal = document.getElementById('launchModal');
+  if (launchModal && launchModal.style.display !== 'none') { launchModal.style.display = 'none'; return; }
+  // Close docs modal
+  var docsModal = document.getElementById('docsModal');
+  if (docsModal && docsModal.style.display !== 'none') { docsModal.style.display = 'none'; return; }
+  // Close company form modal
+  var companyModal = document.getElementById('companyFormModal');
+  if (companyModal && companyModal.style.display !== 'none') { companyModal.style.display = 'none'; return; }
+});
 
 // Initial data fetch
 refreshData({toastOnError:true});
@@ -6160,7 +8193,7 @@ connectEvents();
 
 // Claude CLI status — initial check + periodic polling
 pollClaudeStatus();
-_claudeStatusTimer = setInterval(pollClaudeStatus, 15000);
+_claudeStatusTimer = setInterval(pollClaudeStatus, 30000);
 
 // Auto-update status polling
 async function pollUpdateStatus() {
@@ -6194,22 +8227,111 @@ async function pollUpdateStatus() {
   } catch(e) { /* ignore */ }
 }
 pollUpdateStatus();
-setInterval(pollUpdateStatus, 30000);
+setInterval(pollUpdateStatus, 60000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  if (hiddenCliLogBuffer.length > 0) {
+    const buffered = hiddenCliLogBuffer.slice();
+    hiddenCliLogBuffer = [];
+    buffered.forEach((entry) => appendCliLog(entry.message, entry.logType, entry.time));
+  }
+  if (hiddenRefreshPending) {
+    hiddenRefreshPending = false;
+    requestDashboardRefresh({ force: true, delay: 0 });
+  }
+  pollClaudeStatus();
+  pollUpdateStatus();
+});
 
 // CLI log stream
-const cliColors={info:'#8bc5ed',action:'#3fb950',error:'#f85149',warn:'#e3b341',step:'#d2a8ff'};
-const cliLabels={info:'INF',action:'ACT',error:'ERR',warn:'WRN',step:'STP'};
+const cliColors={info:'#8bc5ed',action:'#3fb950',error:'#f85149',warn:'#e3b341',step:'#d2a8ff',thinking:'#818cf8'};
+const cliLabels={info:'INF',action:'ACT',error:'ERR',warn:'WRN',step:'STP',thinking:'THK'};
+
+function updateMonitorThinking(msg) {
+  const row = document.getElementById('monitorThinkingRow');
+  const text = document.getElementById('monitorThinkingText');
+  const chip = document.getElementById('monitorStatusChip');
+  const dot = document.getElementById('monitorDot');
+  if (!row) return;
+  if (msg) {
+    if (text) text.textContent = msg;
+    row.style.display = 'flex';
+    if (chip) { chip.innerHTML = '<span class="think-spin" style="border-top-color:#fff;border-color:rgba(255,255,255,.2)"></span> ' + (LANG==='ja'?'思考中':'Thinking'); chip.style.color='#c4b5fd'; chip.style.background='rgba(99,102,241,.3)'; }
+    if (dot) { dot.style.background='#818cf8'; }
+  } else {
+    row.style.display = 'none';
+    if (chip) { chip.innerHTML = LANG==='ja'?'待機中':'Idle'; chip.style.color='#94a3b8'; chip.style.background='rgba(255,255,255,.1)'; }
+    if (dot) { dot.style.background='#94a3b8'; }
+  }
+}
+
+function updateCliThinking(msg) {
+  const row = document.getElementById('cliThinkingRow');
+  const text = document.getElementById('cliThinkingText');
+  if (!row) return;
+  if (msg) {
+    if (text) text.textContent = msg;
+    row.style.display = 'flex';
+  } else {
+    row.style.display = 'none';
+  }
+}
+
 function appendCliLog(msg,type,time){
   const el=document.getElementById('cliStream');
   const ts=time?new Date(time).toLocaleTimeString('ja-JP'):'';
   const lastEventEl=document.getElementById('cliLastEvent');
-  if (lastEventEl) lastEventEl.textContent=ts;
+  const streamLastEventEl=document.getElementById('cliStreamLastEvent');
+
+  // Remove existing thinking rows first
+  if(el) el.querySelectorAll('.cli-thinking-line').forEach(n=>n.remove());
+
+  if(type==='thinking'){
+    updateMonitorThinking(msg);
+    updateCliThinking(msg);
+    if (streamLastEventEl && ts) streamLastEventEl.textContent=ts;
+    if(!el)return;
+    const line=document.createElement('div');
+    line.className='cli-thinking-line';
+    const spinner=document.createElement('span');
+    spinner.className='think-spin';
+    const txt=document.createElement('span');
+    txt.style.cssText='font-size:.76rem;color:#818cf8;font-style:italic;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    txt.textContent=msg;
+    line.appendChild(spinner);
+    line.appendChild(txt);
+    el.appendChild(line);
+    el.scrollTop=el.scrollHeight;
+    while(el.children.length>300){ el.removeChild(el.firstElementChild); }
+    return;
+  }
+
+  // Non-thinking: clear thinking indicator and update timestamp
+  updateMonitorThinking(null);
+  updateCliThinking(null);
+  if(lastEventEl) lastEventEl.textContent=ts;
+  if(streamLastEventEl) streamLastEventEl.textContent=ts;
   if(!el)return;
+
   const color=cliColors[type]||'#c9d1d9';
   const label=cliLabels[type]||'LOG';
   const line=document.createElement('div');
   line.className='cli-line';
-  line.innerHTML='<span style="color:#484f58;user-select:none">'+ts+'</span> <span style="background:'+color+';color:#0d1117;font-size:.62rem;font-weight:700;padding:0 5px;vertical-align:middle">'+label+'</span> <span style="color:'+color+'">'+esc(msg)+'</span>';
+  const tsSpan=document.createElement('span');
+  tsSpan.style.cssText='color:#484f58;user-select:none';
+  tsSpan.textContent=ts;
+  const labelSpan=document.createElement('span');
+  labelSpan.style.cssText='background:'+color+';color:#0d1117;font-size:.62rem;font-weight:700;padding:0 5px;vertical-align:middle';
+  labelSpan.textContent=label;
+  const msgSpan=document.createElement('span');
+  msgSpan.style.color=color;
+  msgSpan.textContent=msg;
+  line.appendChild(tsSpan);
+  line.appendChild(document.createTextNode(' '));
+  line.appendChild(labelSpan);
+  line.appendChild(document.createTextNode(' '));
+  line.appendChild(msgSpan);
   el.appendChild(line);
   el.scrollTop=el.scrollHeight;
   while(el.children.length>300){
@@ -6415,7 +8537,13 @@ document.querySelectorAll('.tab-btn').forEach(b=>{
     document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));
     b.classList.add('active');
     document.getElementById('tab-'+b.dataset.tab).classList.add('active');
+    _activeMainTab = b.dataset.tab || 'companies';
+    _analyticsOpen = _activeMainTab === 'companies';
     if(b.dataset.tab==='settings') loadSettings();
+    if (_activeMainTab === 'companies') ensureAnalyticsInitialized();
+    if (_latestDashboardData && b.dataset.tab !== 'settings') {
+      render(_latestDashboardData);
+    }
     if (b.dataset.tab === 'cli') {
       ensureXtermAssets()
         .then(() => {
@@ -6708,7 +8836,7 @@ function populatePreferences(pf) {
     dashboardPort:'number', dashboardHost:'text', language:'select', timezone:'text', dateFormat:'text',
     screenshotDir:'text', dataDir:'text', emailSearchKeyword:'text', emailProvider:'select',
     maxRetries:'number', pageTimeout:'number', formFillTimeout:'number',
-    headless:'select', locale:'text', requireApprovalBeforeSend:'select',
+    headless:'select', locale:'text', requireApprovalBeforeSend:'select', autoSendEligibleForms:'select',
     userAgent:'text', logLevel:'select', maxLogEntries:'number', exportFilenamePrefix:'text',
     aiProvider:'select'
   };
@@ -6729,6 +8857,8 @@ function populatePreferences(pf) {
   if (aiModelClaude) aiModelClaude.value = aiModels.claude || pf.claudeModel || '';
   if (aiModelCodex) aiModelCodex.value = aiModels.codex || '';
   if (aiModelGemini) aiModelGemini.value = aiModels.gemini || '';
+  _currentAiAutoSendSafe = !!pf.autoSendEligibleForms;
+  _launchAutoSendSafe = _currentAiAutoSendSafe;
   if (pf.aiProvider) {
     _currentAiProvider = pf.aiProvider;
     updateLaunchProviderUi(_currentAiProvider);
@@ -7253,6 +9383,7 @@ async function saveSection(section) {
         headless: document.getElementById('pf-headless').value === 'true',
         locale: document.getElementById('pf-locale').value,
         requireApprovalBeforeSend: document.getElementById('pf-requireApprovalBeforeSend').value === 'true',
+        autoSendEligibleForms: document.getElementById('pf-autoSendEligibleForms').value === 'true',
         userAgent: document.getElementById('pf-userAgent').value,
         logLevel: document.getElementById('pf-logLevel').value,
         maxLogEntries: parseInt(document.getElementById('pf-maxLogEntries').value) || 10000,
@@ -7267,11 +9398,11 @@ async function saveSection(section) {
       };
     }
 
-    const res = await fetch('/api/settings/' + section, {
+    const res = await safeFetch('/api/settings/' + section, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
-    });
+    }, '設定を保存中...');
     const result = await res.json();
   if (result.ok) {
       _settingsCache = { ...(_settingsCache || {}), [section]: data };
@@ -7281,6 +9412,8 @@ async function saveSection(section) {
       if (section === 'targetList') loadTargetPreview();
       if (section === 'preferences') {
         _currentAiProvider = data.aiProvider || _currentAiProvider;
+        _currentAiAutoSendSafe = !!data.autoSendEligibleForms;
+        _launchAutoSendSafe = _currentAiAutoSendSafe;
         updateLaunchProviderUi(_currentAiProvider);
         setTimeout(pollClaudeStatus, 300);
       }
@@ -7351,7 +9484,9 @@ const server = http.createServer(async (req, res) => {
   const pathname = requestUrl.pathname;
 
   if (pathname === '/events' || pathname.startsWith('/screenshots/') || pathname.startsWith('/api/')) {
-    const auth = isAuthorizedDashboardRequest(req);
+    // Internal CLI log endpoint: verify shared secret (X-CLI-Token header required)
+    const isInternalCliLog = pathname === '/api/cli-log' && req.headers['x-cli-token'] === CLI_LOG_SECRET;
+    const auth = isInternalCliLog ? { ok: true } : isAuthorizedDashboardRequest(req);
     if (!auth.ok) {
       if (pathname.startsWith('/api/approve') || pathname.startsWith('/api/install-claude-cli') || pathname.startsWith('/api/install-ai-cli')) {
         appendDiagnosticEvent('auth_rejected', {
@@ -7362,7 +9497,9 @@ const server = http.createServer(async (req, res) => {
         });
         console.warn(`[dashboard-auth] ${req.method} ${pathname} rejected: ${auth.error}`);
       }
-      jsonResponse(res, auth.statusCode, { ok: false, error: auth.error });
+      jsonResponse(res, auth.statusCode, { ok: false, error: auth.error }, {
+        'Set-Cookie': buildDashboardSessionCookieHeaders(),
+      });
       return;
     }
   }
@@ -7511,6 +9648,12 @@ const server = http.createServer(async (req, res) => {
       const section = req.url.split('/').pop();
       const data = await parseJsonBody(req);
       settings.replaceSection(section, data);
+
+      // 設定変更を監査ログに記録
+      try {
+        const { logAction } = require('./action-logger.cjs');
+        logAction(-1, 'SYSTEM', 'settings_changed', 'セクション「' + section + '」を更新');
+      } catch (_) {}
 
       refreshWatchTargets();
       notifyClients({ type: 'update', reason: 'settings-saved', time: Date.now() });
@@ -7941,13 +10084,26 @@ const server = http.createServer(async (req, res) => {
 
   // CLI log post
   if (req.url === '/api/cli-log' && req.method === 'POST') {
+    const CLI_LOG_MAX = 64 * 1024;
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    let bodyOverflow = false;
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > CLI_LOG_MAX) {
+        bodyOverflow = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Payload too large' }));
+        req.destroy();
+      }
+    });
     req.on('end', () => {
+      if (bodyOverflow) return;
       try {
         const { message, type } = JSON.parse(body);
+        const CLI_LOG_ALLOWED_TYPES = new Set(['info', 'step', 'error', 'action', 'warn', 'warning', 'thinking', 'debug']);
+        const safeType = CLI_LOG_ALLOWED_TYPES.has(type) ? type : 'info';
         sseClients.forEach(r => {
-          r.write(`data: ${JSON.stringify({ type: 'cli-log', message, logType: type || 'info', time: new Date().toISOString() })}\n\n`);
+          r.write(`data: ${JSON.stringify({ type: 'cli-log', message: String(message || '').slice(0, 4000), logType: safeType, time: new Date().toISOString() })}\n\n`);
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -7971,12 +10127,37 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET /api/ai/setup-diagnostics — bootstrap diagnostics for the selected provider
+  if (pathname === '/api/ai/setup-diagnostics' && req.method === 'GET') {
+    try {
+      const requestedProvider = requestUrl.searchParams.get('provider') || getSelectedAiProvider();
+      const diagnostics = await probeAiSetupDiagnostics(requestedProvider);
+      jsonResponse(res, 200, { ok: true, ...diagnostics });
+    } catch (e) {
+      jsonResponse(res, 500, { ok: false, error: e.message });
+    }
+    return;
+  }
+
   // POST /api/install-ai-cli — attempt automatic global install
   if ((pathname === '/api/install-claude-cli' || pathname === '/api/install-ai-cli') && req.method === 'POST') {
     try {
       const body = await parseJsonBody(req).catch(() => ({}));
       const providerId = normalizeProviderId(body.provider || getSelectedAiProvider());
       const provider = getProvider(providerId);
+      const npmStatus = await probeNpmStatus();
+      if (!npmStatus.available) {
+        const installError = `${provider.cliLabel} の自動インストールには npm が必要です。${npmStatus.error || ''}`.trim();
+        setProviderInstallState(providerId, 'failed', installError);
+        jsonResponse(res, 409, {
+          ok: false,
+          provider: providerId,
+          providerLabel: provider.displayName,
+          error: installError,
+          command: getInstallCommand(providerId),
+        });
+        return;
+      }
       const installSpec = getInstallSpawnArgs(providerId);
       setProviderInstallState(providerId, 'installing', null);
       invalidateAiStatusCache(providerId);
@@ -8051,57 +10232,15 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await parseJsonBody(req).catch(() => ({}));
       const { mode = 'default', cols = 120, rows = 30 } = body;
+      const autoSendSafe = body.autoSendSafe === true;
       const providerId = normalizeProviderId(body.provider || getSelectedAiProvider());
-      const provider = getProvider(providerId);
-
-      // Stop existing PTY if any
-      if (claudePty) {
-        await stopManagedClaudePty();
-        claudePty = null;
-      }
-
-      if (providerId === 'codex') {
-        ensureCodexWorkspaceTrusted(PROJECT_ROOT);
-      }
-      const playwrightSetup = await ensureProviderPlaywrightMcp(providerId);
-      if (!playwrightSetup.ok) {
-        throw new Error(playwrightSetup.error);
-      }
-
-      const nodePty = require('node-pty');
-      const executable = await resolveClaudeExecutable(providerId);
-      const flags = buildLaunchArgs(providerId, mode, {
-        model: getConfiguredAiModel(providerId),
-        sessionId: providerId === 'claude' ? crypto.randomUUID() : null,
+      const result = await startManagedAiSession(mode, providerId, {
+        cols,
+        rows,
+        allowReuse: false,
+        autoSendSafe,
       });
-      const spawnSpec = buildManagedSpawnSpec(providerId, executable, flags);
-      const ptyProc = nodePty.spawn(spawnSpec.command, spawnSpec.args, {
-        name: 'xterm-256color',
-        cols: Math.max(2, cols),
-        rows: Math.max(1, rows),
-        cwd: PROJECT_ROOT,
-        env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
-      });
-
-      claudePty = ptyProc;
-      claudeProcessMode = mode;
-      activeAiProvider = providerId;
-      invalidateAiStatusCache(providerId);
-
-      ptyProc.onData((data) => {
-        broadcastPty({ type: 'output', data, provider: providerId });
-      });
-
-      ptyProc.onExit(({ exitCode }) => {
-        if (claudePty === ptyProc) {
-          claudePty = null;
-          invalidateAiStatusCache(providerId);
-        }
-        broadcastPty({ type: 'exit', code: exitCode, provider: providerId });
-        notifyClients({ type: 'claude-exit', code: exitCode, provider: providerId, time: Date.now() });
-      });
-
-      jsonResponse(res, 200, { ok: true, mode, provider: providerId, providerLabel: provider.displayName });
+      jsonResponse(res, 200, result);
     } catch (e) {
       jsonResponse(res, 500, { ok: false, error: e.message });
     }
@@ -8114,14 +10253,7 @@ const server = http.createServer(async (req, res) => {
       const body = await parseJsonBody(req).catch(() => ({}));
       const providerId = normalizeProviderId(body.provider || getSelectedAiProvider());
       const { mode = 'default' } = body;
-      if (providerId === 'codex') {
-        ensureCodexWorkspaceTrusted(PROJECT_ROOT);
-      }
-      const playwrightSetup = await ensureProviderPlaywrightMcp(providerId);
-      if (!playwrightSetup.ok) {
-        throw new Error(playwrightSetup.error);
-      }
-      const result = await launchClaudeInExternalTerminal(mode, providerId);
+      const result = await launchClaudeInExternalTerminal(mode, providerId, body.autoSendSafe === true);
       invalidateAiStatusCache(providerId);
       jsonResponse(res, 200, result);
     } catch (e) {
@@ -8152,6 +10284,29 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // 重複キューイング防止: 既にアクティブな企業を除外
+      const { getLiveMonitorSummary } = require('./live-monitor.cjs');
+      const monitorSummary = getLiveMonitorSummary();
+      const activeNos = new Set(
+        (monitorSummary.events || [])
+          .filter(ev => ev && ev.active !== false && !['awaiting_approval','submitted','completed','skipped','error'].includes(ev.status))
+          .map(ev => Number(ev.companyNo))
+      );
+      const alreadyQueued = found.companies.filter(c => activeNos.has(Number(c.no)));
+      if (alreadyQueued.length > 0) {
+        const names = alreadyQueued.map(c => c.companyName || c.name || '#' + c.no).join(', ');
+        jsonResponse(res, 409, { ok: false, error: '以下の企業は既に処理中です: ' + names + '。完了後に再度キューしてください。' });
+        return;
+      }
+
+      // 2回目以降のアプローチ判定: 送信済み企業にはcontactNoを付与
+      const { getHistory } = require('./contact-history.cjs');
+      const companiesWithContactNo = found.companies.map(c => {
+        const history = getHistory(c.no);
+        const contactNo = (history && Array.isArray(history.contacts)) ? history.contacts.length + 1 : 1;
+        return { ...c, contactNo };
+      });
+
       const ready = await ensureClaudeAutomationReady(providerId);
       if (!ready.ok) {
         appendDiagnosticEvent('ai_form_fill_not_ready', {
@@ -8164,8 +10319,80 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const result = await queueAiFormFill(found.companies, providerId);
-      jsonResponse(res, 200, result);
+      const phaseA = await executeBackendPhaseABatch(companiesWithContactNo, providerId);
+      if (phaseA.successes.length === 0) {
+        appendDiagnosticEvent('ai_form_fill_phase_a_failed', {
+          companyNos,
+          provider: providerId,
+          successCount: 0,
+          failureCount: phaseA.failures.length,
+          elapsedMs: phaseA.elapsedMs,
+        });
+        jsonResponse(res, 409, {
+          ok: false,
+          error: 'Phase A（企業分析+文面生成）が全件失敗しました。ログを確認してください。',
+          phaseA: {
+            successCount: 0,
+            failureCount: phaseA.failures.length,
+            elapsedMs: phaseA.elapsedMs,
+            failures: phaseA.failures.map((entry) => ({
+              companyNo: entry.companyNo,
+              companyName: entry.companyName,
+              error: entry.error,
+            })),
+          },
+        });
+        return;
+      }
+
+      const successfulCompanies = companiesWithContactNo.filter((company) =>
+        phaseA.successes.some((entry) => String(entry.companyNo) === String(company.no))
+      ).map((company) => {
+        const phaseAResult = phaseA.successes.find((entry) => String(entry.companyNo) === String(company.no));
+        return {
+          ...company,
+          formUrl: (phaseAResult && phaseAResult.formUrl) || company.formUrl || '',
+          phaseA: phaseAResult ? {
+            analysis: phaseAResult.analysis || null,
+            message: phaseAResult.message || '',
+            analysisElapsedMs: phaseAResult.elapsedMs,
+            formUrl: phaseAResult.formUrl || company.formUrl || '',
+            formResolutionMethod: phaseAResult.formResolutionMethod || null,
+          } : null,
+        };
+      });
+      const phaseAByCompany = new Map(
+        phaseA.successes.map((entry) => [
+          String(entry.companyNo),
+          {
+            analysis: entry.analysis || null,
+            message: entry.message || '',
+            elapsedMs: entry.elapsedMs,
+            formUrl: entry.formUrl || '',
+            formResolutionMethod: entry.formResolutionMethod || null,
+          },
+        ])
+      );
+
+      const result = await queueAiFormFill(successfulCompanies, providerId, {
+        autoSendSafe: getManagedAiAutoSendSafe(),
+        phaseAByCompany,
+        phaseASuccesses: phaseA.successes,
+        phaseAFailures: phaseA.failures,
+      });
+      jsonResponse(res, 200, {
+        ...result,
+        phaseA: {
+          successCount: phaseA.successes.length,
+          failureCount: phaseA.failures.length,
+          elapsedMs: phaseA.elapsedMs,
+          failures: phaseA.failures.map((entry) => ({
+            companyNo: entry.companyNo,
+            companyName: entry.companyName,
+            error: entry.error,
+          })),
+        },
+      });
     } catch (e) {
       appendDiagnosticEvent('ai_form_fill_internal_error', { error: e.message });
       jsonResponse(res, 500, { ok: false, error: e.message });
@@ -8329,7 +10556,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Set-Cookie': buildDashboardSessionCookie(),
+    'Set-Cookie': buildDashboardSessionCookieHeaders(),
   });
   res.end(buildPage());
 });
@@ -8337,6 +10564,15 @@ const server = http.createServer(async (req, res) => {
 async function startDashboardServer() {
   if (dashboardRuntime && server.listening) return dashboardRuntime;
   if (serverStartPromise) return serverStartPromise;
+
+  ensureStandaloneDashboardLockHooks();
+  if (!standaloneDashboardLockHeld) {
+    const lock = await claimStandaloneDashboardLock();
+    if (!lock.ok) {
+      dashboardRuntime = lock.runtime || readRuntime();
+      return dashboardRuntime;
+    }
+  }
 
   serverStartPromise = (async () => {
     const preferredPort = settings.getPort();
@@ -8358,6 +10594,9 @@ async function startDashboardServer() {
       port: typeof address === 'object' && address ? address.port : preferredPort,
       preferredPort,
     });
+
+    // CLI log shared secret を環境変数に公開（子プロセスが継承）
+    process.env.SALES_CLAW_CLI_TOKEN = CLI_LOG_SECRET;
 
     refreshWatchTargets();
     startHeartbeat();
@@ -8383,7 +10622,7 @@ async function startDashboardServer() {
 server.on('upgrade', (request, socket, head) => {
   const requestUrl = new URL(request.url || '/', 'http://127.0.0.1');
   if (requestUrl.pathname === '/terminal') {
-    const auth = isAuthorizedDashboardRequest(request);
+    const auth = isAuthorizedDashboardRequest(request, { allowTokenWithoutOrigin: true });
     if (!auth.ok) {
       rejectUpgradeRequest(socket, auth.statusCode, auth.error);
       return;
@@ -8409,24 +10648,13 @@ server.on('close', () => {
 });
 
 if (require.main === module) {
-  process.on('exit', releaseStandaloneDashboardLock);
-  process.on('SIGINT', () => {
-    releaseStandaloneDashboardLock();
-    process.exit(0);
-  });
-  process.on('SIGTERM', () => {
-    releaseStandaloneDashboardLock();
-    process.exit(0);
-  });
-
   (async () => {
-    const lock = await claimStandaloneDashboardLock();
-    if (!lock.ok) {
-      const runtimeUrl = lock.runtime && lock.runtime.url ? lock.runtime.url : 'http://127.0.0.1';
+    const runtime = await startDashboardServer();
+    if (!server.listening) {
+      const runtimeUrl = runtime && runtime.url ? runtime.url : 'http://127.0.0.1';
       console.log(`[Dashboard] 既存の dashboard-server が起動中です: ${runtimeUrl}`);
       return;
     }
-    await startDashboardServer();
   })().catch((error) => {
     console.error('[Dashboard] 起動失敗:', error.message);
     releaseStandaloneDashboardLock();

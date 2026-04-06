@@ -12,6 +12,10 @@ const runtimeUserDataDir = path.join(app.getPath('userData'), 'runtime');
 if (!process.env.SALES_CLAW_USER_DATA_DIR) {
   process.env.SALES_CLAW_USER_DATA_DIR = runtimeUserDataDir;
 }
+if (process.platform === 'win32') {
+  // Windows では GPU process が大きく張り付きやすく、全体のカクつきに繋がるため無効化する。
+  app.disableHardwareAcceleration();
+}
 
 const settingsManager = require('./src/settings-manager.cjs');
 const { resolveDataPath } = require('./src/data-paths.cjs');
@@ -145,6 +149,8 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      backgroundThrottling: true,
+      spellcheck: false,
     },
   });
 

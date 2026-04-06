@@ -108,10 +108,49 @@ function readState() {
   }
 }
 
+function acquireFileLock(filePath) {
+  const lockFile = filePath + '.lock';
+  const maxWait = 3000;
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      return lockFile;
+    } catch (_) {
+      try {
+        const stat = fs.statSync(lockFile);
+        if (Date.now() - stat.mtimeMs > 5000) { fs.unlinkSync(lockFile); continue; }
+      } catch (__) { continue; }
+      const waitEnd = Date.now() + 50;
+      while (Date.now() < waitEnd) { /* busy wait */ }
+    }
+  }
+  console.warn('[live-monitor] File lock timeout after ' + maxWait + 'ms, force-acquiring: ' + lockFile);
+  try { fs.unlinkSync(lockFile); } catch (_) {}
+  try { fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' }); } catch (_) {}
+  return lockFile;
+}
+
+function releaseFileLock(lockFile) {
+  try { fs.unlinkSync(lockFile); } catch (_) {}
+}
+
 function writeState(state) {
   ensureDataDir();
   const filePath = getLiveMonitorFile();
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2), 'utf8');
+  const tmpFile = filePath + '.tmp.' + process.pid;
+  fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf8');
+  try {
+    fs.renameSync(tmpFile, filePath);
+  } catch (e) {
+    if (process.platform === 'win32' && (e.code === 'EPERM' || e.code === 'EBUSY')) {
+      fs.copyFileSync(tmpFile, filePath);
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    } else {
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+      throw e;
+    }
+  }
   monitorCache.filePath = filePath;
   monitorCache.signature = getFileSignature(filePath);
   monitorCache.data = state;
@@ -158,9 +197,14 @@ function appendEvent(state, previous, next, kind) {
 
 function updateLiveMonitor(companyNo, patch = {}) {
   const key = String(companyNo);
+  const filePath = getLiveMonitorFile();
+  const lockFile = acquireFileLock(filePath);
+  let next;
+  try {
+  monitorCache.signature = null;
   const state = readState();
   const previous = state.sessions[key] || null;
-  const next = {
+  next = {
     ...(previous || {}),
     ...normalizeEntry(companyNo, patch),
     active: patch.active !== undefined ? patch.active : true,
@@ -177,64 +221,88 @@ function updateLiveMonitor(companyNo, patch = {}) {
   state.updatedAt = next.updatedAt;
   appendEvent(state, previous, next, patch.kind || (shouldCloseSession ? 'finish' : 'update'));
   writeState(state);
+  } finally {
+    releaseFileLock(lockFile);
+  }
   return serializeEntry(next);
 }
 
 function finishLiveMonitor(companyNo, patch = {}) {
-  const key = String(companyNo);
-  const state = readState();
-  const previous = state.sessions[key] || null;
-  const next = {
-    ...(previous || { companyNo: Number(companyNo) }),
-    ...normalizeEntry(companyNo, patch),
-    active: false,
-    finishedAt: patch.finishedAt || new Date().toISOString(),
-  };
-  delete state.sessions[key];
-  state.lastEvent = next;
-  state.updatedAt = next.updatedAt;
-  appendEvent(state, previous, next, patch.kind || 'finish');
-  writeState(state);
-  return serializeEntry(next);
+  const filePath = getLiveMonitorFile();
+  const lockFile = acquireFileLock(filePath);
+  try {
+    const key = String(companyNo);
+    monitorCache.signature = null;
+    const state = readState();
+    const previous = state.sessions[key] || null;
+    const next = {
+      ...(previous || { companyNo: Number(companyNo) }),
+      ...normalizeEntry(companyNo, patch),
+      active: false,
+      finishedAt: patch.finishedAt || new Date().toISOString(),
+    };
+    delete state.sessions[key];
+    state.lastEvent = next;
+    state.updatedAt = next.updatedAt;
+    appendEvent(state, previous, next, patch.kind || 'finish');
+    writeState(state);
+    return serializeEntry(next);
+  } finally {
+    releaseFileLock(lockFile);
+  }
 }
 
 function clearLiveMonitor(companyNo) {
-  const key = String(companyNo);
-  const state = readState();
-  if (!state.sessions[key]) return false;
-  delete state.sessions[key];
-  state.updatedAt = new Date().toISOString();
-  writeState(state);
-  return true;
+  const filePath = getLiveMonitorFile();
+  const lockFile = acquireFileLock(filePath);
+  try {
+    const key = String(companyNo);
+    monitorCache.signature = null;
+    const state = readState();
+    if (!state.sessions[key]) return false;
+    delete state.sessions[key];
+    state.updatedAt = new Date().toISOString();
+    writeState(state);
+    return true;
+  } finally {
+    releaseFileLock(lockFile);
+  }
 }
 
 function removeCompanyMonitor(companyNo) {
-  const key = String(companyNo);
-  const state = readState();
-  let changed = false;
+  const filePath = getLiveMonitorFile();
+  const lockFile = acquireFileLock(filePath);
+  try {
+    const key = String(companyNo);
+    monitorCache.signature = null;
+    const state = readState();
+    let changed = false;
 
-  if (state.sessions && state.sessions[key]) {
-    delete state.sessions[key];
-    changed = true;
-  }
-
-  if (Array.isArray(state.events)) {
-    const nextEvents = state.events.filter((entry) => String(entry && entry.companyNo) !== key);
-    if (nextEvents.length !== state.events.length) {
-      state.events = nextEvents;
+    if (state.sessions && state.sessions[key]) {
+      delete state.sessions[key];
       changed = true;
     }
-  }
 
-  if (state.lastEvent && String(state.lastEvent.companyNo) === key) {
-    state.lastEvent = null;
-    changed = true;
-  }
+    if (Array.isArray(state.events)) {
+      const nextEvents = state.events.filter((entry) => String(entry && entry.companyNo) !== key);
+      if (nextEvents.length !== state.events.length) {
+        state.events = nextEvents;
+        changed = true;
+      }
+    }
 
-  if (!changed) return false;
-  state.updatedAt = new Date().toISOString();
-  writeState(state);
-  return true;
+    if (state.lastEvent && String(state.lastEvent.companyNo) === key) {
+      state.lastEvent = null;
+      changed = true;
+    }
+
+    if (!changed) return false;
+    state.updatedAt = new Date().toISOString();
+    writeState(state);
+    return true;
+  } finally {
+    releaseFileLock(lockFile);
+  }
 }
 
 function getLiveMonitorSummary() {

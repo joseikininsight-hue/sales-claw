@@ -58,9 +58,48 @@ function readJsonCached(filePath, fallbackValue) {
   }
 }
 
+function acquireFileLock(filePath) {
+  const lockFile = filePath + '.lock';
+  const maxWait = 3000;
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      return lockFile;
+    } catch (_) {
+      try {
+        const stat = fs.statSync(lockFile);
+        if (Date.now() - stat.mtimeMs > 5000) { fs.unlinkSync(lockFile); continue; }
+      } catch (__) { continue; }
+      const waitEnd = Date.now() + 50;
+      while (Date.now() < waitEnd) { /* busy wait */ }
+    }
+  }
+  console.warn('[contact-history] File lock timeout, force-acquiring: ' + filePath);
+  try { fs.unlinkSync(filePath + '.lock'); } catch (_) {}
+  try { fs.writeFileSync(filePath + '.lock', String(process.pid), { flag: 'wx' }); } catch (_) {}
+  return filePath + '.lock';
+}
+
+function releaseFileLock(lockFile) {
+  try { fs.unlinkSync(lockFile); } catch (_) {}
+}
+
 function writeJsonCached(filePath, data) {
   ensureDataDir();
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  const tmpFile = filePath + '.tmp.' + process.pid;
+  fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
+  try {
+    fs.renameSync(tmpFile, filePath);
+  } catch (e) {
+    if (process.platform === 'win32' && (e.code === 'EPERM' || e.code === 'EBUSY')) {
+      fs.copyFileSync(tmpFile, filePath);
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+    } else {
+      try { fs.unlinkSync(tmpFile); } catch (_) {}
+      throw e;
+    }
+  }
   historyCache.filePath = filePath;
   historyCache.signature = getFileSignature(filePath);
   historyCache.data = data;
@@ -83,31 +122,38 @@ function saveHistory(data) {
  * @returns {number} 何回目の連絡か（1, 2, 3...）
  */
 function recordContact(companyNo, companyName, record) {
-  const history = loadHistory();
-  const key = String(companyNo);
+  const filePath = getHistoryFile();
+  const lockFile = acquireFileLock(filePath);
+  try {
+    historyCache.signature = null;
+    const history = loadHistory();
+    const key = String(companyNo);
 
-  if (!history[key]) {
-    history[key] = {
-      companyNo,
-      companyName,
-      contacts: [],
-    };
+    if (!history[key]) {
+      history[key] = {
+        companyNo,
+        companyName,
+        contacts: [],
+      };
+    }
+
+    const contactNo = history[key].contacts.length + 1;
+
+    history[key].contacts.push({
+      contactNo,
+      date: new Date().toISOString(),
+      message: record.message,
+      formUrl: record.formUrl || '',
+      method: record.method || 'web_form',
+      response: record.response || null,
+      notes: record.notes || '',
+    });
+
+    saveHistory(history);
+    return contactNo;
+  } finally {
+    releaseFileLock(lockFile);
   }
-
-  const contactNo = history[key].contacts.length + 1;
-
-  history[key].contacts.push({
-    contactNo,
-    date: new Date().toISOString(),
-    message: record.message,
-    formUrl: record.formUrl || '',
-    method: record.method || 'web_form',
-    response: record.response || null,
-    notes: record.notes || '',
-  });
-
-  saveHistory(history);
-  return contactNo;
 }
 
 /**
@@ -164,28 +210,42 @@ function getAllHistorySummary() {
  * @param {string} notes - メモ
  */
 function recordResponse(companyNo, contactNo, response, notes) {
-  const history = loadHistory();
-  const key = String(companyNo);
-  if (!history[key]) return false;
+  const filePath = getHistoryFile();
+  const lockFile = acquireFileLock(filePath);
+  try {
+    historyCache.signature = null;
+    const history = loadHistory();
+    const key = String(companyNo);
+    if (!history[key]) return false;
 
-  const contact = history[key].contacts.find(c => c.contactNo === contactNo);
-  if (!contact) return false;
+    const contact = history[key].contacts.find(c => c.contactNo === contactNo);
+    if (!contact) return false;
 
-  contact.response = response;
-  contact.notes = notes || contact.notes;
-  contact.responseDate = new Date().toISOString();
+    contact.response = response;
+    contact.notes = notes || contact.notes;
+    contact.responseDate = new Date().toISOString();
 
-  saveHistory(history);
-  return true;
+    saveHistory(history);
+    return true;
+  } finally {
+    releaseFileLock(lockFile);
+  }
 }
 
 function removeHistory(companyNo) {
-  const history = loadHistory();
-  const key = String(companyNo);
-  if (!Object.prototype.hasOwnProperty.call(history, key)) return false;
-  delete history[key];
-  saveHistory(history);
-  return true;
+  const filePath = getHistoryFile();
+  const lockFile = acquireFileLock(filePath);
+  try {
+    historyCache.signature = null;
+    const history = loadHistory();
+    const key = String(companyNo);
+    if (!Object.prototype.hasOwnProperty.call(history, key)) return false;
+    delete history[key];
+    saveHistory(history);
+    return true;
+  } finally {
+    releaseFileLock(lockFile);
+  }
 }
 
 module.exports = {

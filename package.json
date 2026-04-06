@@ -1,6 +1,6 @@
 {
   "name": "sales-claw",
-  "version": "1.0.9",
+  "version": "1.1.0",
   "description": "Automated B2B company outreach via web contact forms, powered by Claude, Codex, or Gemini CLI plus Playwright",
   "main": "electron-main.js",
   "scripts": {

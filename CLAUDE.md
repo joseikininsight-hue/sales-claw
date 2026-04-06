@@ -50,11 +50,13 @@
 - Claude Codeがその場で企業を分析し、メッセージを作成し、Playwrightでフォームに入力する
 - フォームごとにClaude Codeが構造を見て専用ロジックを書く
 - ダッシュボード（localhost:設定ポート）はUI表示・操作・設定管理
-- **MCP Playwrightで1社ずつタブ切替・確実入力**
+- **MCP Playwrightで1社ずつ新しいタブで確実入力**
   - MCP Playwrightは1ブラウザ共有。並列エージェントから同時にMCPを呼んではいけない
   - 調査フェーズ: サブエージェントが並列で Bash + node -e 実行（MCP不使用）
   - 入力フェーズ: メインがMCP Playwrightで snapshot→ref指定→fill_form で1社ずつ確実入力
-  - 各社を別タブで処理し、タブは閉じない（ユーザーが各タブで送信操作可能）
+  - **★ 各社のフォームは必ず新しいタブで開く（window.open → browser_tabs で切替）**
+  - **★ 入力済みフォームのタブに再度navigateして上書きすることは絶対禁止**
+  - タブは閉じない（ユーザーが各タブでフォーム内容を確認して手動送信する）
 
 ## Configuration
 
@@ -101,8 +103,11 @@ Step 2: メッセージ生成
   → message-builder.cjs の buildCustomMessage(analysis)
   → logAction(no, name, 'message_draft', メッセージ全文)
 
-Step 3: フォームにアクセス
-  → MCP Playwright: browser_navigate でフォームURLを開く
+Step 3: フォームにアクセス ★ 2社目以降は browser_navigate 禁止
+  → 1社目: browser_navigate でフォームURLを開いてOK
+  → 2社目以降: browser_evaluate で window.open(url,'_blank') → browser_tabs → browser_snapshot
+  → ★ 2社目以降で browser_navigate を使うと前の会社の入力済みフォームが消える（絶対禁止）
+  → フォームURLが未登録なら「会社名 問い合わせ」でGoogle検索し、公式ドメインの最上位結果を使う
   → browser_snapshot でフォーム構造を解析
 
 Step 4: フォームに入力 ★ 絶対省略するな
@@ -122,21 +127,46 @@ Step 6: 確認待ちに登録
   → ★ Step 4, 5 が完了していない場合、このステップに進んではいけない
 ```
 
-**複数社の場合:**
+**複数社の場合（2フェーズ並列処理）:**
 ```
 「3社確認待ちまで」と指示された場合:
 → 一気に最後まで進める。途中でメッセージ承認を求めて止まらない。
-→ Step 1-2 は並列エージェントで同時処理可能（MCP不使用）
-→ Step 3-6 はメインが1社ずつ順番にMCP Playwrightで処理（MCP共有のため並列不可）
 
-1. メインでN社選定 + フォーム検証（並列）
-2. 各社の分析→メッセージ生成を並列Agent実行（MCP不使用）
-3. メインがMCP Playwrightで1社ずつフォーム入力→スクショ→確認待ち登録
-4. 全社完了後、結果を集約してユーザーに報告
+フェーズA（並列実行 — MCP不使用）:
+→ 各社の「サイト分析 + メッセージ生成」を並列サブエージェントで同時処理
+→ 方法: Agent ツールで haiku サブエージェントを並列起動:
+    node src/parallel-analysis.cjs '{"no":1,"companyName":"会社名","url":"URL","type":"種別","formUrl":"フォームURL"}'
+→ サブエージェント内で company-analyzer + message-builder を使用
+→ MCP Playwright は使わない（直接 HTTP フェッチのみ）
+→ thinking() + updateLiveMonitor() で進行状況をダッシュボードに通知
+→ 全社のフェーズAが完了するまでフェーズBに進まない
+
+フェーズB（順次実行 — MCP Playwright 使用）:
+→ フェーズA完了後、メインがMCP Playwrightで1社ずつフォーム入力
+→ フェーズAで生成済みのメッセージを使ってフォームに入力
+→ 各社: navigate → snapshot → fill_form → screenshot → awaiting_approval
+→ thinking() + updateLiveMonitor() で進行状況をダッシュボードに通知
+→ タブは閉じずに残す
+
+全社完了後、結果を集約してユーザーに報告
 → 送信判断はダッシュボードの確認待ちタブで人間が行う
 
 「〇〇に送って」の場合:
 → メッセージ案をユーザーに提示 → 承認されたら入力→スクショまで進める
+```
+
+**進行状況通知（必須）:**
+```
+各ステップで cli-logger.cjs を呼んで進行状況をダッシュボードに反映する:
+
+const { thinking, log } = require('./src/cli-logger.cjs');
+
+フェーズA開始: thinking('フェーズA開始: N社の並列分析')
+各社分析開始: thinking('[No.X] 会社名: サイト分析開始')
+各社メッセージ: thinking('[No.X] 会社名: メッセージ生成中')
+フェーズB開始: thinking('フェーズB開始: フォーム入力（順次処理）')
+各社フォーム入力: thinking('[No.X] 会社名: フォーム入力中')
+各社完了: log('[No.X] 会社名: 確認待ち登録完了', 'action')
 ```
 
 ## Message Generation
@@ -240,6 +270,7 @@ sales-claw/
 │   ├── form-helpers.cjs        # フォーム操作ヘルパー
 │   ├── live-monitor.cjs        # 進行状況モニター管理
 │   ├── message-builder.cjs     # メッセージ生成
+│   ├── parallel-analysis.cjs   # 並列サブエージェント用 分析+メッセージ生成
 │   ├── email-fetcher.cjs       # Outlookメール取得
 │   └── cli-logger.cjs          # ダッシュボードCLI Activity通知
 ├── data/

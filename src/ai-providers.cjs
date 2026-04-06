@@ -25,8 +25,8 @@ const PROVIDERS = {
     defaultModel: '',
     defaultMode: 'auto',
     autoModeNote: {
-      ja: 'Codex は full-auto で動かせます。default / acceptEdits は手動確認向けです。',
-      en: 'Codex supports full-auto. Use default / acceptEdits for manual confirmation flows.',
+      ja: 'Codex は no-prompt auto で動かせます。default / acceptEdits は手動確認向けです。なお Codex 本体の MCP 権限ルールにより、Playwright 操作で一度だけ確認が出る場合があります。',
+      en: 'Codex supports no-prompt auto. Use default / acceptEdits for manual confirmation flows. Codex may still show a one-time MCP permission dialog for Playwright actions.',
     },
   },
   gemini: {
@@ -38,8 +38,8 @@ const PROVIDERS = {
     defaultModel: '',
     defaultMode: 'auto',
     autoModeNote: {
-      ja: 'Gemini は auto が auto_edit 相当です。browser / MCP 操作では止まることがあるため、詰まる場合は bypassPermissions を使ってください。',
-      en: 'Gemini maps auto to auto_edit. Browser / MCP flows may still pause, so use bypassPermissions if needed.',
+      ja: 'Gemini は auto が auto_edit 相当です。browser / MCP 操作では止まることがあるため、詰まる場合は bypassPermissions を使ってください。yolo でも Gemini 側の確認が残る場合があります。',
+      en: 'Gemini maps auto to auto_edit. Browser / MCP flows may still pause, so use bypassPermissions if needed. Gemini can still keep its own confirmations even in yolo.',
     },
   },
 };
@@ -134,7 +134,7 @@ function buildLaunchArgs(providerId, mode = 'default', options = {}) {
 
   if (provider.id === 'codex') {
     if (currentMode === 'auto') {
-      flags.push('--full-auto');
+      flags.push('-a', 'never', '-s', 'danger-full-access');
     } else if (currentMode === 'bypassPermissions') {
       flags.push('--dangerously-bypass-approvals-and-sandbox');
     } else {
@@ -168,7 +168,7 @@ function buildHeadlessArgs(providerId, mode = 'auto', options = {}) {
 
   if (provider.id === 'codex') {
     const flags = ['exec'];
-    // Windows headless automation is unreliable with Codex full-auto sandboxing,
+    // Windows headless automation is unreliable with Codex interactive automation,
     // so queued runs always use the no-prompt path.
     flags.push('--dangerously-bypass-approvals-and-sandbox');
     if (model) flags.push('-m', model);

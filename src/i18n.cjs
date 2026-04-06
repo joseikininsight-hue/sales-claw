@@ -139,6 +139,10 @@ const translations = {
     'audit.invalidDecision': 'decision must be "sent" or "skip".',
     'audit.blockedInvalidState': 'This action is not allowed from state {state}.',
     'audit.blockedMissingScreenshot': 'Cannot proceed without a screenshot.',
+    'launch.submitPolicy.title': 'Submission policy',
+    'launch.submitPolicy.approval': 'Stop for approval (recommended)',
+    'launch.submitPolicy.autoSendSafe': 'Auto-send safe forms',
+    'launch.submitPolicy.help': 'CAPTCHA, manual review, excluded forms, and uncertain cases will still stop for approval.',
 
     // Alerts
     'alert.selectCompanies': 'Please select companies.',
@@ -268,7 +272,7 @@ const translations = {
     'app.launchClaude.external': 'Claude launched in an external terminal.',
     'app.launchClaude.error': 'Failed to launch Claude.',
     'app.launchAi.success': '{provider} started.',
-    'app.launchAi.external': '{provider} launched in an external terminal.',
+    'app.launchAi.external': '{provider} work session opened in an external terminal.',
     'app.launchAi.error': 'Failed to launch {provider}.',
     'app.stopAi.success': '{provider} stopped.',
     'claude.status.connected': 'Claude Connected',
@@ -354,6 +358,7 @@ const translations = {
     'help.maxRetries': 'Form submission retry count.',
     'help.headless': 'Run browser without visible window.',
     'help.requireApproval': 'Require manual approval before sending.',
+    'help.autoSendEligibleForms': 'If enabled, the default AI launch policy becomes auto-send for clearly safe forms only. CAPTCHA, manual-review, excluded, and uncertain forms will still stop.',
     'help.targetPreview': 'First 10 rows from the current target list file.',
 
     // Settings field labels (Value Propositions)
@@ -443,6 +448,7 @@ const translations = {
     'field.aiModelCodex': 'Codex Model',
     'field.aiModelGemini': 'Gemini Model',
     'field.requireApproval': 'Require Approval',
+    'field.autoSendEligibleForms': 'Auto-send safe forms',
     'field.userAgent': 'User Agent',
     'field.logLevel': 'Log Level',
     'field.maxLogEntries': 'Max Log Entries',
@@ -753,7 +759,7 @@ const translations = {
     'app.launchClaude.external': '外部ターミナルで Claude を起動しました。',
     'app.launchClaude.error': 'Claude の起動に失敗しました。',
     'app.launchAi.success': '{provider} を起動しました。',
-    'app.launchAi.external': '外部ターミナルで {provider} を起動しました。',
+    'app.launchAi.external': '外部ターミナルで {provider} の作業セッションを開きました。',
     'app.launchAi.error': '{provider} の起動に失敗しました。',
     'app.stopAi.success': '{provider} を停止しました。',
     'claude.status.connected': 'Claude 接続中',
@@ -780,6 +786,10 @@ const translations = {
     'ai.install.started': '{provider} CLI のインストールを開始します...',
     'ai.install.success': '{provider} CLI のインストールに成功しました。',
     'ai.install.failed': '{provider} CLI のインストールに失敗しました。',
+    'launch.submitPolicy.title': '送信ポリシー',
+    'launch.submitPolicy.approval': '確認待ちで止める（推奨）',
+    'launch.submitPolicy.autoSendSafe': '安全なフォームは自動送信する',
+    'launch.submitPolicy.help': 'CAPTCHA・手動確認・営業NG・判断が難しいフォームは自動送信しません。',
     'claude.version': 'バージョン',
 
     // Settings placeholders & help
@@ -839,6 +849,7 @@ const translations = {
     'help.maxRetries': 'フォーム送信失敗時のリトライ回数。',
     'help.headless': 'ブラウザを非表示（バックグラウンド）で実行。',
     'help.requireApproval': '送信前に人間の承認を必須にする。',
+    'help.autoSendEligibleForms': 'ON にすると、AI 起動時の既定値として、安全に送信できるフォームだけ自動送信します。CAPTCHA・手動確認・対象外は停止します。',
     'help.targetPreview': '現在のターゲットリストファイルの先頭10行。',
 
     // Settings field labels (Value Propositions)
@@ -928,6 +939,7 @@ const translations = {
     'field.aiModelCodex': 'Codex モデル',
     'field.aiModelGemini': 'Gemini モデル',
     'field.requireApproval': '送信前承認',
+    'field.autoSendEligibleForms': '安全なフォームは自動送信',
     'field.userAgent': 'User Agent',
     'field.logLevel': 'ログレベル',
     'field.maxLogEntries': 'ログ最大保持件数',

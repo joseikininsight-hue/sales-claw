@@ -30,7 +30,7 @@ function log(message, type) {
   try {
     const req = http.request({
       hostname: target.hostname, port: target.port, path: '/api/cli-log', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'X-CLI-Token': process.env.SALES_CLAW_CLI_TOKEN || '' }
     });
     req.on('error', () => {});
     req.write(payload);
@@ -39,4 +39,8 @@ function log(message, type) {
   console.log(`[${type.toUpperCase()}] ${message}`);
 }
 
-module.exports = { log };
+function thinking(message) {
+  log(message, 'thinking');
+}
+
+module.exports = { log, thinking };
