@@ -11,10 +11,10 @@
 
 「確認待ち」(awaiting_approval) にログを記録する前に、以下の全ステップを**必ず完了**すること:
 
-1. **フォームURLにアクセス** — MCP Playwrightでフォームページを開く
-2. **フォーム構造を解析** — `browser_snapshot` でフィールドを特定
-3. **全フィールドに実際に入力** — `browser_fill_form` で会社名・氏名・メール・電話・本文を入力
-4. **入力済みフォームのスクリーンショット撮影** — `browser_take_screenshot` で `screenshots/ss-{No}-input.png` に保存
+1. **フォームURLにアクセス** — Electronモード: `/api/form-session/create`、MCPモード: `browser_navigate`
+2. **フォーム構造を解析** — Electronモード: `/api/form-session/{id}/structure`、MCPモード: `browser_snapshot`
+3. **全フィールドに実際に入力** — Electronモード: `/api/form-session/{id}/fill`、MCPモード: `browser_fill_form`
+4. **入力済みフォームのスクリーンショット撮影** — Electronモード: `/api/form-session/{id}/screenshot`、MCPモード: `browser_take_screenshot` で `screenshots/ss-{No}-input.png`
 5. **ログ記録** — `form_fill` → `confirm_reached` → `awaiting_approval` の順でログ
 
 ### やってはいけないこと（厳禁）:
@@ -47,16 +47,25 @@
 
 **重要: このプロジェクトはClaude Code CLIが主体で動く。**
 
-- Claude Codeがその場で企業を分析し、メッセージを作成し、Playwrightでフォームに入力する
-- フォームごとにClaude Codeが構造を見て専用ロジックを書く
+- Claude Codeがその場で企業を分析し、メッセージを作成し、フォームに入力する
 - ダッシュボード（localhost:設定ポート）はUI表示・操作・設定管理
-- **MCP Playwrightで1社ずつ新しいタブで確実入力**
-  - MCP Playwrightは1ブラウザ共有。並列エージェントから同時にMCPを呼んではいけない
-  - 調査フェーズ: サブエージェントが並列で Bash + node -e 実行（MCP不使用）
-  - 入力フェーズ: メインがMCP Playwrightで snapshot→ref指定→fill_form で1社ずつ確実入力
-  - **★ 各社のフォームは必ず新しいタブで開く（window.open → browser_tabs で切替）**
-  - **★ 入力済みフォームのタブに再度navigateして上書きすることは絶対禁止**
-  - タブは閉じない（ユーザーが各タブでフォーム内容を確認して手動送信する）
+
+### フォーム入力モード（2種類、優先順位あり）
+
+**【第1優先】Electronモード — Form Session API**
+- Electronアプリが起動しているとき（ダッシュボードにアクセス可能なとき）はこちらを使う
+- POST /api/form-session/create → 構造取得 → マッピングJSON生成 → fill → screenshot
+- MCP Playwright は**使わない**（接続されていなくてOK）
+- ユーザーはダッシュボードの「フォーム確認」ボタンでElectron内フォームを確認して手動送信
+
+**【第2優先・フォールバック】MCP Playwrightモード**
+- Electronが起動していないとき（CLIのみで動かすとき）に使う
+- MCP Playwrightが接続されていないなら**このモードは使えない → エラーにする**
+- 調査フェーズ: サブエージェントが並列で Bash + node -e 実行（MCP不使用）
+- 入力フェーズ: browser_snapshot → browser_fill_form → browser_take_screenshot で1社ずつ入力
+- タブは閉じない（ユーザーが各タブで内容を確認して手動送信）
+
+**モード選択の原則: MCP Playwright が使えないなら即座にElectronモードへ切替える。絶対にMCPを必須条件にしない。**
 
 ## Configuration
 
@@ -95,8 +104,24 @@ cp data/sample-settings.json data/settings.json
 
 **1社あたりの必須フロー（省略不可）:**
 ```
+Step 0: モード検出（必ず最初に実行）
+  → Bash で以下を実行してElectronダッシュボードの疎通確認:
+      node -e "
+        const s = require('./settings-manager.cjs');
+        const port = s.getPort();
+        require('http').get('http://127.0.0.1:'+port+'/api/form-session', r => {
+          process.stdout.write(r.statusCode < 400 ? 'electron' : 'mcp');
+          process.exit(0);
+        }).on('error', () => { process.stdout.write('mcp'); process.exit(0); });
+      "
+  → 出力が 'electron' → Electronモードで進める（Step 3〜6はすべてForm Session API使用）
+  → 出力が 'mcp' → MCP Playwrightが接続されているか確認
+      - MCP Playwright接続済み → MCPフォールバックモードで進める
+      - MCP Playwright未接続  → ユーザーに「Electronアプリを起動してください」と伝えてエラーログを記録して終了
+  ★ 「MCP Playwrightが接続されていない」は単独でエラーにしない。Electronモードで代替できる。
+
 Step 1: 企業サイト分析
-  → company-analyzer.cjs or MCP Playwrightでサイト巡回
+  → company-analyzer.cjs (Bash) でサイト巡回（Playwright不要 — HTTP fetchベース）
   → logAction(no, name, 'site_analysis', 分析結果)
 
 Step 2: メッセージ生成（CLI言語能力を活用）
@@ -176,12 +201,20 @@ Step 7: 確認待ちに登録
 → CLIが自然な日本語で、テンプレート感のない「この会社だけに書いた」文面を生成する
 → templateDraft はCLI生成に失敗した場合のフォールバック
 
-フェーズB（順次実行 — MCP Playwright 使用）:
-→ フェーズA.5完了後、メインがMCP Playwrightで1社ずつフォーム入力
-→ CLI生成済みのメッセージを使ってフォームに入力
-→ 各社: navigate → snapshot → fill_form → screenshot → awaiting_approval
+フェーズB（順次実行 — フォーム入力）:
+→ フェーズA.5完了後、1社ずつフォーム入力（Step 0で決定したモードに従う）
+
+  ─── Electronモード（ダッシュボード起動済み） ─────────────────
+  → 各社: POST /api/form-session/create → GET structure → マッピングJSON → POST fill
+           → POST screenshot → logAction(awaiting_approval)
+  → MCP Playwright は使わない
+
+  ─── MCPフォールバック（Electron未起動 かつ MCP接続済み） ────
+  → 各社: browser_navigate(新タブ) → browser_snapshot → browser_fill_form
+           → browser_take_screenshot → logAction(awaiting_approval)
+  → タブは閉じずに残す
+
 → thinking() + updateLiveMonitor() で進行状況をダッシュボードに通知
-→ タブは閉じずに残す
 
 全社完了後、結果を集約してユーザーに報告
 → 送信判断はダッシュボードの確認待ちタブで人間が行う

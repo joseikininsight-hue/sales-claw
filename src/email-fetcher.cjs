@@ -2,11 +2,23 @@
 // 設定されたキーワードでメールを検索し、やり取り履歴を蓄積する
 // 初回はログインが必要（ブラウザが開くので手動でログイン）
 
-const { chromium } = require('playwright');
 const fs = require('fs');
 const settings = require('./settings-manager.cjs');
 const { ensureDataDir, resolveDataPath } = require('./data-paths.cjs');
 const { log: cliLog } = (() => { try { return require('./cli-logger.cjs'); } catch { return { log: console.warn }; } })();
+
+function requireChromium() {
+  try {
+    return require('playwright').chromium;
+  } catch {
+    throw new Error(
+      'Playwrightがインストールされていません。メール取得には playwright が必要です。\n' +
+      '  npm install playwright\n' +
+      '  npx playwright install chromium\n' +
+      'を実行してからやり直してください。'
+    );
+  }
+}
 
 function getSessionDir() {
   return resolveDataPath('outlook-session');
@@ -51,7 +63,7 @@ async function fetchEmails() {
     cliLog('[security] Ensure this directory is not accessible by other users.', 'warn');
   }
 
-  console.log('=== Outlook Web メール取得 ===\n');
+  const chromium = requireChromium();
 
   const context = await chromium.launchPersistentContext(sessionDir, {
     headless: false,

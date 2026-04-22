@@ -1,17 +1,18 @@
 // 企業サイトを分析し、自社との協業ポイントを特定する
-// Playwrightで企業サイトを巡回 → テキスト抽出 → 構造化分析
+// Playwrightが利用可能ならブラウザで巡回、なければHTTP fetchにフォールバック
 
-const { chromium } = require('playwright');
 const settings = require('./settings-manager.cjs');
+const { log: cliLog } = (() => { try { return require('./cli-logger.cjs'); } catch { return { log: () => {} }; } })();
 
-/**
- * 企業サイトを分析して自社との協業ポイントを特定する
- * @param {string} companyUrl - 企業のWebサイトURL
- * @param {string} companyName - 企業名
- * @param {string} companyType - 企業種別
- * @returns {Object} 分析結果
- */
-async function analyzeCompany(companyUrl, companyName, companyType) {
+function tryLoadPlaywright() {
+  try {
+    return require('playwright').chromium;
+  } catch {
+    return null;
+  }
+}
+
+async function analyzeCompanyWithPlaywright(chromium, companyUrl, companyName, companyType) {
   const prefs = settings.getSection('preferences');
   const browser = await chromium.launch({ headless: prefs.headless !== false });
   const context = await browser.newContext({
@@ -28,7 +29,6 @@ async function analyzeCompany(companyUrl, companyName, companyType) {
     const topText = await page.evaluate(() => document.body.innerText.substring(0, 5000));
     texts.push({ page: 'top', text: topText });
 
-    // サービス/事業ページを探す
     const serviceLinks = await page.evaluate(() => {
       const links = Array.from(document.querySelectorAll('a'));
       return links
@@ -49,15 +49,31 @@ async function analyzeCompany(companyUrl, companyName, companyType) {
         await page.waitForTimeout(1500);
         const pageText = await page.evaluate(() => document.body.innerText.substring(0, 4000));
         texts.push({ page: link.text, text: pageText });
-      } catch (e) {
-        // skip
-      }
+      } catch (_) { /* skip */ }
     }
   } catch (e) {
-    console.log('  サイト分析エラー: ' + e.message.substring(0, 80));
+    cliLog('サイト分析エラー: ' + e.message.substring(0, 80), 'warn');
   }
 
   await browser.close();
+  return texts;
+}
+
+/**
+ * 企業サイトを分析して自社との協業ポイントを特定する
+ * Playwrightが利用不可の場合は parallel-analysis.cjs の HTTP fetch にフォールバック
+ */
+async function analyzeCompany(companyUrl, companyName, companyType) {
+  const chromium = tryLoadPlaywright();
+  let texts = [];
+
+  if (chromium) {
+    texts = await analyzeCompanyWithPlaywright(chromium, companyUrl, companyName, companyType);
+  } else {
+    cliLog('Playwright未インストール: HTTP fetchで分析します', 'warn');
+    const { analyzeCompanyLite } = require('./parallel-analysis.cjs');
+    return analyzeCompanyLite(companyUrl, companyName, companyType);
+  }
 
   const rawJoinedText = texts.map(t => t.text).join('\n');
   const allText = rawJoinedText.toLowerCase();
