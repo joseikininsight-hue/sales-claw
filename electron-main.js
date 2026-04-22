@@ -20,11 +20,14 @@ if (process.platform === 'win32') {
 const settingsManager = require('./src/settings-manager.cjs');
 const { resolveDataPath } = require('./src/data-paths.cjs');
 const { readRuntime } = require('./src/dashboard-runtime.cjs');
+const { FormSessionManager } = require('./src/form-session-manager.cjs');
 
 let mainWindow = null;
 let tray = null;
 let serverStarted = false;
 let dashboardRuntime = null;
+
+const formSessionManager = new FormSessionManager(() => mainWindow);
 
 const APP_VERSION = app.getVersion();
 const BUILD_SOURCE = app.isPackaged ? 'installed' : 'development';
@@ -106,7 +109,7 @@ async function startServer() {
   if (serverStarted && dashboardRuntime) return dashboardRuntime;
   try {
     const { startDashboardServer } = require('./src/dashboard-server.cjs');
-    dashboardRuntime = await startDashboardServer();
+    dashboardRuntime = await startDashboardServer({ formSessionManager });
     serverStarted = true;
     return dashboardRuntime;
   } catch (e) {
@@ -156,6 +159,8 @@ function createWindow() {
 
   mainWindow.loadURL(getDashboardUrl());
   mainWindow.setMenuBarVisibility(false);
+
+  mainWindow.on('resize', () => formSessionManager.onWindowResize());
 
   mainWindow.on('close', (event) => {
     if (!app.isQuiting) {

@@ -1,6 +1,8 @@
 // Sales Claw Dashboard Server
 // fs.watch でファイル変更をイベント検知 → SSE → フロントで差分DOM更新
 
+let _formSessionManager = null; // injected by electron-main via startDashboardServer({ formSessionManager })
+
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -8473,7 +8475,9 @@ function render(data){
     let actionHtml='';
     const cname=esc(c.name).replace(/'/g,"\\'");
     if(c.lastAction==='awaiting_approval'||c.lastAction==='confirm_reached'){
+      const reviewBtnLabel = LANG==='ja' ? 'フォーム確認' : 'Review Form';
       actionHtml='<div class="company-action-grid">'
+        +'<button class="btn btn-primary btn-sm company-action-btn" onclick="openFormReview('+c.no+')">'+reviewBtnLabel+'</button>'
         +'<button class="btn btn-success btn-sm company-action-btn" onclick="approveCompany('+c.no+',\\x27'+cname+'\\x27,\\x27sent\\x27)">'+t('action.markSent')+'</button>'
         +'<button class="btn btn-outline-secondary btn-sm company-action-btn" onclick="skipWithFeedback('+c.no+',\\x27'+cname+'\\x27)">'+t('action.skip')+'</button>'
         +(c.canManageInTargetList
@@ -8812,6 +8816,46 @@ function refreshAfterMutation() {
     mutationRefreshFollowupTimer = null;
     requestDashboardRefresh({ force: true, delay: 0 });
   }, 900);
+}
+
+// ── Form Review (WebContentsView) ──────────────────────────────────────
+let _formReviewOverlayEl = null;
+
+async function openFormReview(companyNo) {
+  try {
+    const sessRes = await fetch('/api/form-session', { headers: { 'x-dashboard-token': DASHBOARD_SESSION_TOKEN } });
+    if (!sessRes.ok) {
+      showToast(LANG === 'ja' ? 'Electronモード以外では利用できません' : 'Only available in Electron mode', 'warn');
+      return;
+    }
+    const sessions = await sessRes.json();
+    const session = (sessions.sessions || []).find(s => String(s.companyNo) === String(companyNo));
+    if (!session) {
+      showToast(LANG === 'ja' ? 'フォームセッションが見つかりません。先にAIを実行してください。' : 'No form session found. Run AI first.', 'warn');
+      return;
+    }
+    await fetch('/api/form-session/' + session.id + '/show', { method: 'POST', headers: { 'x-dashboard-token': DASHBOARD_SESSION_TOKEN } });
+    _showFormReviewOverlay();
+  } catch (e) {
+    console.error('[openFormReview]', e);
+  }
+}
+
+function _showFormReviewOverlay() {
+  if (_formReviewOverlayEl) return;
+  const el = document.createElement('div');
+  el.id = 'formReviewOverlay';
+  el.style.cssText = 'position:fixed;top:0;right:0;width:55%;height:100%;pointer-events:none;z-index:9999;';
+  el.innerHTML = '<button onclick="closeFormReview()" style="position:absolute;top:8px;right:8px;z-index:10000;pointer-events:auto;background:#1e293b;color:#fff;border:none;border-radius:6px;padding:4px 12px;font-size:.8rem;cursor:pointer;">' + (LANG === 'ja' ? '✕ 閉じる' : '✕ Close') + '</button>';
+  document.body.appendChild(el);
+  _formReviewOverlayEl = el;
+}
+
+async function closeFormReview() {
+  try {
+    await fetch('/api/form-session/active/hide', { method: 'POST', headers: { 'x-dashboard-token': DASHBOARD_SESSION_TOKEN } }).catch(() => {});
+  } catch (_) {}
+  if (_formReviewOverlayEl) { _formReviewOverlayEl.remove(); _formReviewOverlayEl = null; }
 }
 
 async function approveCompany(companyNo,companyName,decision){
@@ -11782,6 +11826,165 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Form Session API (/api/form-session/*) ────────────────────────
+  if (pathname.startsWith('/api/form-session')) {
+    if (!_formSessionManager) {
+      jsonResponse(res, 501, { ok: false, error: 'FormSession はElectronモードでのみ利用できます' });
+      return;
+    }
+
+    // POST /api/form-session/create
+    if (pathname === '/api/form-session/create' && req.method === 'POST') {
+      try {
+        const body = await parseJsonBody(req);
+        const formUrl = typeof body.formUrl === 'string' ? body.formUrl.trim() : '';
+        const companyNo = body.companyNo != null ? String(body.companyNo) : '';
+        if (!formUrl) { jsonResponse(res, 400, { ok: false, error: 'formUrl が必要です' }); return; }
+
+        const sessionId = await _formSessionManager.createSession(formUrl, companyNo);
+        jsonResponse(res, 200, { ok: true, sessionId });
+      } catch (e) {
+        jsonResponse(res, 500, { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    // GET /api/form-session (list)
+    if (pathname === '/api/form-session' && req.method === 'GET') {
+      jsonResponse(res, 200, { ok: true, sessions: _formSessionManager.listSessions() });
+      return;
+    }
+
+    // POST /api/form-session/active/hide (hide current session without knowing sessionId)
+    if (pathname === '/api/form-session/active/hide' && req.method === 'POST') {
+      _formSessionManager.hideCurrentSession();
+      jsonResponse(res, 200, { ok: true });
+      return;
+    }
+
+    // session-scoped endpoints: /api/form-session/:id/*
+    const sessionMatch = pathname.match(/^\/api\/form-session\/([^/]+)(?:\/(.+))?$/);
+    if (sessionMatch) {
+      const [, sessionId, action] = sessionMatch;
+
+      // GET .../structure
+      if (action === 'structure' && req.method === 'GET') {
+        try {
+          const fields = await _formSessionManager.getFormStructure(sessionId);
+          jsonResponse(res, 200, { ok: true, fields });
+        } catch (e) {
+          jsonResponse(res, 500, { ok: false, error: e.message });
+        }
+        return;
+      }
+
+      // POST .../fill  — backend validates mappings against settings
+      if (action === 'fill' && req.method === 'POST') {
+        try {
+          const body = await parseJsonBody(req);
+          const rawMappings = Array.isArray(body.mappings) ? body.mappings : [];
+
+          // 許可リスト: settings に存在するキーからのみ値を使用
+          const sender = settings.getSender();
+          const allowedValues = {
+            companyName: sender.companyName || '',
+            contactName: sender.contactName || '',
+            contactTitle: sender.contactTitle || '',
+            department: sender.department || '',
+            email: sender.email || '',
+            phone: sender.phone || '',
+            mobile: sender.mobile || '',
+            fax: sender.fax || '',
+            website: sender.website || '',
+            address: sender.address || '',
+            postalCode: sender.postalCode || '',
+          };
+
+          const validMappings = rawMappings
+            .filter(m => m && typeof m.selector === 'string' && m.selector.trim())
+            .map(m => {
+              // value は settings からの値または AI が生成したメッセージ本文のみ許可
+              const resolved = m.valueKey && allowedValues[m.valueKey] !== undefined
+                ? allowedValues[m.valueKey]
+                : (typeof m.value === 'string' ? m.value : '');
+              return { selector: m.selector.trim(), value: resolved, type: m.type || 'text' };
+            })
+            .filter(m => m.value !== '');
+
+          const results = await _formSessionManager.fillForm(sessionId, validMappings);
+          jsonResponse(res, 200, { ok: true, results });
+        } catch (e) {
+          jsonResponse(res, 500, { ok: false, error: e.message });
+        }
+        return;
+      }
+
+      // POST .../screenshot
+      if (action === 'screenshot' && req.method === 'POST') {
+        try {
+          const body = await parseJsonBody(req);
+          const session = _formSessionManager.getSession(sessionId);
+          if (!session) { jsonResponse(res, 404, { ok: false, error: 'Session not found' }); return; }
+
+          const suffix = body.suffix || 'input';
+          const safeNo = String(session.companyNo).replace(/[^a-zA-Z0-9_-]/g, '_');
+          const screenshotDir = settings.getScreenshotDir();
+          const savePath = path.join(screenshotDir, `ss-${safeNo}-${suffix}.png`);
+
+          const savedPath = await _formSessionManager.captureScreenshot(sessionId, savePath);
+          jsonResponse(res, 200, { ok: true, path: savedPath });
+        } catch (e) {
+          jsonResponse(res, 500, { ok: false, error: e.message });
+        }
+        return;
+      }
+
+      // POST .../show
+      if (action === 'show' && req.method === 'POST') {
+        try {
+          _formSessionManager.showSession(sessionId);
+          jsonResponse(res, 200, { ok: true });
+        } catch (e) {
+          jsonResponse(res, 500, { ok: false, error: e.message });
+        }
+        return;
+      }
+
+      // POST .../hide
+      if (action === 'hide' && req.method === 'POST') {
+        try {
+          _formSessionManager.hideCurrentSession();
+          jsonResponse(res, 200, { ok: true });
+        } catch (e) {
+          jsonResponse(res, 500, { ok: false, error: e.message });
+        }
+        return;
+      }
+
+      // GET .../info
+      if (action === 'info' && req.method === 'GET') {
+        const info = _formSessionManager.getSession(sessionId);
+        if (!info) { jsonResponse(res, 404, { ok: false, error: 'Session not found' }); return; }
+        jsonResponse(res, 200, { ok: true, session: info });
+        return;
+      }
+
+      // DELETE .../  (destroy)
+      if (!action && req.method === 'DELETE') {
+        try {
+          _formSessionManager.destroySession(sessionId);
+          jsonResponse(res, 200, { ok: true });
+        } catch (e) {
+          jsonResponse(res, 500, { ok: false, error: e.message });
+        }
+        return;
+      }
+    }
+
+    jsonResponse(res, 404, { ok: false, error: 'Not found' });
+    return;
+  }
+
   // Dashboard HTML
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
@@ -11794,7 +11997,8 @@ const server = http.createServer(async (req, res) => {
   res.end(buildPage());
 });
 
-async function startDashboardServer() {
+async function startDashboardServer(opts = {}) {
+  if (opts.formSessionManager) _formSessionManager = opts.formSessionManager;
   if (dashboardRuntime && server.listening) return dashboardRuntime;
   if (serverStartPromise) return serverStartPromise;
 

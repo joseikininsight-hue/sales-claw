@@ -106,28 +106,52 @@ Step 2: メッセージ生成（CLI言語能力を活用）
   → フォールバック: buildCustomMessage(analysis) のテンプレート文面
   → logAction(no, name, 'message_draft', メッセージ全文)
 
-Step 3: フォームにアクセス ★ 2社目以降は browser_navigate 禁止
-  → 1社目: browser_navigate でフォームURLを開いてOK
-  → 2社目以降: browser_evaluate で window.open(url,'_blank') → browser_tabs → browser_snapshot
-  → ★ 2社目以降で browser_navigate を使うと前の会社の入力済みフォームが消える（絶対禁止）
-  → フォームURLが未登録なら「会社名 問い合わせ」でGoogle検索し、公式ドメインの最上位結果を使う
+Step 3: フォームセッション作成（Electronモード） / またはMCPフォールバック
+  ─── Electronモード（推奨） ───────────────────────────────
+  → POST /api/form-session/create  { formUrl, companyNo }
+  → sessionId を受け取る（Electron内 WebContentsView がバックグラウンドで開く）
+  → フォームURLが未登録なら「会社名 問い合わせ」でGoogle検索し公式ドメインを使う
+  ─── MCP Playwright フォールバック（Electron非起動時） ────
+  → 1社目: browser_navigate でフォームURLを開く
+  → 2社目以降: browser_evaluate で window.open(url,'_blank') → browser_tabs
   → browser_snapshot でフォーム構造を解析
 
-Step 4: フォームに入力 ★ 絶対省略するな
-  → browser_fill_form で全フィールドに入力
-  → 会社名・氏名・メール・電話・部署・本文を settings から読み取って入力
-  → logAction(no, name, 'form_fill', '入力完了')
+Step 4: フォーム構造解析とマッピング判断
+  ─── Electronモード ──────────────────────────────────────
+  → GET /api/form-session/{sessionId}/structure
+  → 返ってきた [{selector, label, type, required}] を見て、どの項目に何を入れるか判断
+  → 以下のフォーマットでマッピングJSONを生成:
+    [
+      { "selector": "#company", "valueKey": "companyName", "type": "text" },
+      { "selector": "#email",   "valueKey": "email",       "type": "text" },
+      { "selector": "#message", "value": "生成した本文",   "type": "textarea" }
+    ]
+  → valueKey は sender の既知フィールド名（companyName/contactName/email/phone/address等）
+  → 自由テキスト（本文）は value に直接入れる
+  ─── MCP Playwright フォールバック ────────────────────────
+  → browser_fill_form で全フィールドに入力（従来通り）
 
-Step 5: スクリーンショット ★ 絶対省略するな（ファイル名を厳守すること）
-  → フォーム入力後の画面を screenshots/ss-{No}-input.png に保存（必須）
-  → 確認画面や次画面が存在する場合は screenshots/ss-{No}-confirm.png に保存（任意の追加確認用）
-  → ★ input は確認待ち登録の必須スクショ。confirm は取得できる場合のみ追加で残す
-  → ★ input と confirm を両方保存する場合は別ファイルにする
+Step 5: フォームに入力 ★ 絶対省略するな
+  ─── Electronモード ──────────────────────────────────────
+  → POST /api/form-session/{sessionId}/fill  { mappings: [...] }
+  → backend が settings の値を検証してから WebContentsView に入力
+  → logAction(no, name, 'form_fill', '入力完了')
+  ─── MCP Playwright フォールバック ────────────────────────
+  → 従来通り。logAction(no, name, 'form_fill', '入力完了')
+
+Step 6: スクリーンショット ★ 絶対省略するな（ファイル名を厳守すること）
+  ─── Electronモード ──────────────────────────────────────
+  → POST /api/form-session/{sessionId}/screenshot  { suffix: "input" }
+  → Electron が capturePage() で screenshots/ss-{No}-input.png に保存
+  ─── MCP Playwright フォールバック ────────────────────────
+  → browser_take_screenshot で screenshots/ss-{No}-input.png に保存（必須）
   → logAction(no, name, 'confirm_reached', 'スクショ撮影完了')
 
-Step 6: 確認待ちに登録
+Step 7: 確認待ちに登録
   → logAction(no, name, 'awaiting_approval', 'ダッシュボードで確認待ち')
-  → ★ Step 4, 5 が完了していない場合、このステップに進んではいけない
+  → ★ Step 5, 6 が完了していない場合、このステップに進んではいけない
+  → Electronモードでは WebContentsView がバックグラウンドで保持される
+  → ユーザーは確認待ちタブの「フォーム確認」ボタンで Electron 内のフォームを見て送信する
 ```
 
 **複数社の場合（2フェーズ並列処理）:**
