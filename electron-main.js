@@ -28,7 +28,7 @@ let dashboardRuntime = null;
 
 const APP_VERSION = app.getVersion();
 const BUILD_SOURCE = app.isPackaged ? 'installed' : 'development';
-const PLACEHOLDER_UPDATE_OWNERS = new Set(['', 'local-test', 'your-org', 'your-username', 'example']);
+const PLACEHOLDER_UPDATE_OWNERS = new Set(['', 'local', 'local-test', 'your-org', 'your-username', 'example']);
 
 function readAppUpdateConfig() {
   try {

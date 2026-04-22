@@ -155,6 +155,7 @@
     "logLevel": "info",
     "maxLogEntries": 10000,
     "requireApprovalBeforeSend": true,
+    "autoSendEligibleForms": false,
     "exportFilenamePrefix": "outreach_progress"
   }
 }

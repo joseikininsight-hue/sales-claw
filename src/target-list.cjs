@@ -6,6 +6,8 @@ const XLSX = require('xlsx');
 const settings = require('./settings-manager.cjs');
 const { PROJECT_ROOT, resolveDataPath } = require('./data-paths.cjs');
 
+const XLSX_MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+
 const TARGET_FIELDS = ['no', 'status', 'companyName', 'type', 'url', 'formUrl', 'notes', 'captcha', 'progress'];
 const DEFAULT_COLUMN_MAPPING = {
   no: 0,
@@ -44,6 +46,12 @@ const HEADER_HINTS = {
 };
 
 const workbookCache = new Map();
+const importRepairCache = {
+  targetPath: '',
+  signature: null,
+  attempted: false,
+  result: null,
+};
 
 function getFileSignature(filePath) {
   try {
@@ -94,6 +102,11 @@ function normalizeCompanyNo(value) {
   if (Number.isFinite(numberValue)) return numberValue;
   const text = normalizeValue(value);
   return text === '' ? null : text;
+}
+
+function isPlaceholderCompanyName(value) {
+  const normalized = normalizeHeader(value);
+  return normalized === '企業名' || normalized === 'company' || normalized === 'companyname';
 }
 
 function getColumnMapping() {
@@ -201,6 +214,8 @@ function readWorkbookBundle(targetPath, options = {}) {
   }
 
   try {
+    const stat = fs.statSync(targetPath);
+    if (stat.size > XLSX_MAX_FILE_SIZE) throw new Error(`ファイルサイズが上限(50MB)を超えています: ${stat.size} bytes`);
     const workbook = XLSX.readFile(targetPath, { raw: false, defval: '' });
     const sheetNames = workbook.SheetNames || [];
     const sheetName = sheetNames[sheetIndex] || sheetNames[0] || 'Targets';
@@ -249,6 +264,7 @@ function mapRow(row, columnMapping, rowIndex) {
 }
 
 function readTargetList() {
+  repairImportedTargetListIfNeeded();
   const targetPath = settings.getTargetListPath();
   const workbookData = readWorkbookBundle(targetPath);
   if (!workbookData.ok) return workbookData;
@@ -322,6 +338,7 @@ function detectColumnMapping(headers) {
 
 function hasImportableContent(row) {
   if (!row) return false;
+  if (isPlaceholderCompanyName(row.companyName)) return false;
   return !!(row.companyName || row.url || row.formUrl || row.type || row.status || row.progress);
 }
 
@@ -403,6 +420,126 @@ function normalizeImportedCompanies(rows, columnMapping) {
   });
 
   return normalized;
+}
+
+function getImportComparableStem(filePath) {
+  const stem = path.basename(filePath || '', path.extname(filePath || ''));
+  return stem
+    .replace(/^\d+-/, '')
+    .replace(/-target-list$/i, '')
+    .trim()
+    .toLowerCase();
+}
+
+function repairImportedTargetListIfNeeded() {
+  const targetPath = settings.getTargetListPath();
+  if (!targetPath) {
+    return { ok: true, repaired: false, reason: 'no-target-path' };
+  }
+
+  const resolvedTargetPath = path.resolve(targetPath);
+  const signature = getFileSignature(resolvedTargetPath);
+  if (
+    importRepairCache.attempted
+    && importRepairCache.targetPath === resolvedTargetPath
+    && importRepairCache.signature === signature
+  ) {
+    return importRepairCache.result || { ok: true, repaired: false, reason: 'cached' };
+  }
+
+  const defaultResult = { ok: true, repaired: false, reason: 'not-needed' };
+  importRepairCache.targetPath = resolvedTargetPath;
+  importRepairCache.signature = signature;
+  importRepairCache.attempted = true;
+  importRepairCache.result = defaultResult;
+
+  const importDir = path.resolve(getImportDir());
+  if (!resolvedTargetPath.startsWith(importDir) || !/-target-list\.xlsx$/i.test(resolvedTargetPath)) {
+    return defaultResult;
+  }
+
+  const currentData = readWorkbookBundle(resolvedTargetPath);
+  if (!currentData.ok) {
+    const result = { ok: false, repaired: false, reason: currentData.error || 'current-target-read-failed' };
+    importRepairCache.result = result;
+    return result;
+  }
+  const currentCompanies = currentData.rows
+    .slice(1)
+    .map((row, index) => mapRow(row, currentData.columnMapping, index + 1))
+    .filter(hasImportableContent);
+  const currentCount = currentCompanies.length;
+
+  const comparableStem = getImportComparableStem(resolvedTargetPath);
+  const candidatePaths = fs.readdirSync(importDir)
+    .filter((fileName) => /\.(xlsx|xls|csv)$/i.test(fileName))
+    .map((fileName) => path.join(importDir, fileName))
+    .filter((candidatePath) => path.resolve(candidatePath) !== resolvedTargetPath)
+    .filter((candidatePath) => getImportComparableStem(candidatePath) === comparableStem)
+    .filter((candidatePath) => !/-target-list\.xlsx$/i.test(candidatePath));
+
+  let bestCandidate = null;
+  candidatePaths.forEach((candidatePath) => {
+    try {
+      const workbook = XLSX.readFile(candidatePath, { raw: false, defval: '' });
+      const selectedSheet = selectImportSheet(workbook);
+      if (!selectedSheet || !selectedSheet.headers || selectedSheet.headers.length === 0) return;
+      const importMapping = {
+        ...DEFAULT_COLUMN_MAPPING,
+        ...selectedSheet.detected,
+      };
+      const normalizedCompanies = normalizeImportedCompanies(selectedSheet.rows, importMapping);
+      const companyCount = normalizedCompanies.length;
+      if (!bestCandidate || companyCount > bestCandidate.companyCount) {
+        bestCandidate = {
+          sourceFilePath: candidatePath,
+          companyCount,
+          normalizedCompanies,
+        };
+      }
+    } catch (_) {
+      // ignore unreadable candidates
+    }
+  });
+
+  if (!bestCandidate) {
+    importRepairCache.result = { ok: true, repaired: false, reason: 'no-related-import-source' };
+    return importRepairCache.result;
+  }
+
+  const shouldRepair = bestCandidate.companyCount > Math.max(currentCount + 50, Math.ceil(currentCount * 1.5));
+  if (!shouldRepair) {
+    importRepairCache.result = {
+      ok: true,
+      repaired: false,
+      reason: 'current-target-count-looks-reasonable',
+      currentCount,
+      candidateCount: bestCandidate.companyCount,
+    };
+    return importRepairCache.result;
+  }
+
+  const repairedTargetPath = getCanonicalImportFile(path.basename(bestCandidate.sourceFilePath));
+  const canonicalRows = buildCanonicalWorkbookRows(bestCandidate.normalizedCompanies, DEFAULT_COLUMN_MAPPING);
+  const repairedBundle = createEmptyWorkbookBundle(repairedTargetPath, 'xlsx', DEFAULT_COLUMN_MAPPING, 'Targets');
+  saveRows(repairedBundle, canonicalRows);
+  settings.updateSection('targetList', {
+    filePath: toRelativeProjectPath(repairedTargetPath),
+    fileType: 'xlsx',
+    sheetIndex: 0,
+    columnMapping: DEFAULT_COLUMN_MAPPING,
+  });
+
+  importRepairCache.result = {
+    ok: true,
+    repaired: true,
+    previousPath: resolvedTargetPath,
+    repairedPath: repairedTargetPath,
+    previousCount: currentCount,
+    repairedCount: bestCandidate.companyCount,
+    sourceFilePath: bestCandidate.sourceFilePath,
+  };
+  return importRepairCache.result;
 }
 
 function buildCanonicalWorkbookRows(companies, columnMapping) {
@@ -645,6 +782,7 @@ module.exports = {
   getTargetPreview,
   importTargetList,
   normalizeCompanyNo,
+  repairImportedTargetListIfNeeded,
   readTargetList,
   toRelativeProjectPath,
   updateCompany,

@@ -74,6 +74,7 @@ async function analyzeCompanyLite(url, companyName, companyType) {
         }
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           const next = new URL(res.headers.location, targetUrl).href;
+          if (!isSafeUrl(next)) { res.resume(); resolve(''); return; }
           resolve(fetchText(next, redirects - 1));
           return;
         }
@@ -88,9 +89,10 @@ async function analyzeCompanyLite(url, companyName, companyType) {
     });
   }
 
-  // バックオフ付きfetch（最大2回リトライ）
+  // バックオフ付きfetch（最大3回リトライ — レート制限対応）
   async function fetchTextWithBackoff(targetUrl) {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (attempt > 0) {
         const delayMs = 1000 * Math.pow(2, attempt);
         log('[WARN] Rate limited by ' + targetUrl + ', retrying in ' + delayMs + 'ms', 'warn');
@@ -113,32 +115,98 @@ async function analyzeCompanyLite(url, companyName, companyType) {
       .slice(0, 8000);
   }
 
-  const siteText = extractText(await fetchTextWithBackoff(url));
+  // HTMLから構造化情報を抽出（タグ除去前に実行）
+  function extractStructuredContent(html) {
+    const metaDesc = (
+      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{10,})/i) ||
+      html.match(/<meta[^>]+content=["']([^"']{10,})["'][^>]+property=["']og:description["']/i) ||
+      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']{10,})/i) ||
+      html.match(/<meta[^>]+content=["']([^"']{10,})["'][^>]+name=["']description["']/i) ||
+      []
+    )[1] || '';
+
+    const headings = [];
+    for (const m of html.matchAll(/<h[123][^>]*>([\s\S]*?)<\/h[123]>/gi)) {
+      const text = m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (text.length > 3 && text.length < 80) headings.push(text);
+    }
+
+    // サービス・会社紹介ページのリンクを抽出
+    const subpageLinks = [];
+    for (const m of html.matchAll(/href=["'](https?:\/\/[^"'#?]+)/gi)) {
+      const href = m[1];
+      if (/service|サービス|事業|about|会社|solution|strength|feature/i.test(href)) {
+        subpageLinks.push(href);
+      }
+    }
+
+    return {
+      metaDescription: metaDesc.trim().slice(0, 200),
+      headings: [...new Set(headings)].slice(0, 10),
+      subpageLinks: [...new Set(subpageLinks)].slice(0, 3),
+    };
+  }
+
+  const topHtml = await fetchTextWithBackoff(url);
+  const structured = extractStructuredContent(topHtml);
+  const siteText = extractText(topHtml);
+
+  // サービスページを1枚追加取得（CVRに効く具体情報を増やす）
+  let subpageText = '';
+  for (const subUrl of structured.subpageLinks.slice(0, 2)) {
+    if (!isSafeUrl(subUrl)) continue;
+    try {
+      const subHtml = await fetchTextWithBackoff(subUrl);
+      const sub = extractText(subHtml).slice(0, 3000);
+      if (sub.length > 200) { subpageText = sub; break; }
+    } catch (_) {}
+  }
+
+  const combinedText = (siteText + '\n' + subpageText).slice(0, 10000);
+  const siteTextExcerpt = combinedText.slice(0, 2000);
   const settings = require('./settings-manager.cjs');
   const strengths = settings.getStrengths();
 
-  // 事業領域の抽出
-  const businessAreas = [];
-  const areaKeywords = ['AI', 'DX', 'クラウド', 'SaaS', 'セキュリティ', 'データ', 'IoT', 'Web', 'モバイル', 'EC', 'ERP', 'CRM', 'RPA', 'BI', 'インフラ'];
-  const siteTextLower = siteText.toLowerCase();
-  for (const kw of areaKeywords) {
-    if (siteTextLower.includes(kw.toLowerCase())) {
-      businessAreas.push({ label: kw, confidence: 0.7 });
-    }
-  }
+  // 事業領域の抽出（キーワード密度スコアで信頼度を付ける）
+  const areaChecks = [
+    { key: 'si', label: 'システム開発・SIer', words: ['システム開発', 'システムインテグレーション', 'si事業', '受託開発', 'SIer'] },
+    { key: 'infra', label: 'インフラ・クラウド', words: ['インフラ', 'ネットワーク', 'クラウド基盤', 'AWS', 'Azure', 'GCP'] },
+    { key: 'consulting', label: 'コンサルティング', words: ['コンサルティング', 'コンサル', '経営支援', '業務改善', '戦略'] },
+    { key: 'erp', label: 'ERP・基幹系', words: ['ERP', 'SAP', '基幹システム', '会計システム', '業務システム'] },
+    { key: 'security', label: 'セキュリティ', words: ['セキュリティ', 'サイバー', '脆弱性', 'SOC', 'CSIRT'] },
+    { key: 'data', label: 'データ分析・BI', words: ['データ分析', 'BI', 'データ活用', '可視化', 'ダッシュボード', 'データドリブン'] },
+    { key: 'dx', label: 'DX推進', words: ['DX', 'デジタルトランスフォーメーション', 'デジタル変革', 'DX推進'] },
+    { key: 'ai_ml', label: 'AI・機械学習', words: ['AI', '人工知能', '機械学習', 'ディープラーニング', '生成AI', 'LLM'] },
+    { key: 'web', label: 'Web制作・開発', words: ['Web制作', 'ホームページ制作', 'Webサイト', 'サイト構築', 'フロントエンド'] },
+    { key: 'saas', label: 'SaaS・プロダクト', words: ['SaaS', 'プロダクト', 'サブスクリプション', '自社サービス', 'クラウドサービス'] },
+    { key: 'bpo', label: 'BPO・アウトソーシング', words: ['BPO', 'アウトソーシング', '業務代行', '委託'] },
+    { key: 'hr', label: '人材・SES', words: ['人材', '派遣', 'エンジニア派遣', 'SES', '技術者派遣'] },
+    { key: 'marketing', label: 'マーケティング', words: ['マーケティング', '広告', 'SEO', 'SEM', 'CRM', 'MA'] },
+  ];
+  const combinedLower = combinedText.toLowerCase();
+  const businessAreas = areaChecks
+    .map((c) => {
+      const count = c.words.filter((w) => combinedLower.includes(w.toLowerCase())).length;
+      return count > 0 ? { ...c, matchCount: count, confidence: Math.min(count / 2, 1.0) } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.matchCount - a.matchCount);
 
-  // ギャップ分析
+  // ギャップ分析（自社強みのキーワードが相手サイトに少ない = 補完余地あり）
   const gaps = strengths.map((s) => {
     const keywords = (s.keywords || []).concat([s.label]);
-    const matched = keywords.some((k) => siteText.toLowerCase().includes(String(k).toLowerCase()));
-    return matched ? null : { strength: s, gap: 'not_mentioned' };
+    const matchCount = keywords.filter((k) => combinedLower.includes(String(k).toLowerCase())).length;
+    if (matchCount === 0) return { strength: s, gap: 'absent', relevance: 'high' };
+    if (matchCount < keywords.length * 0.3) return { strength: s, gap: 'weak', relevance: 'medium' };
+    return null;
   }).filter(Boolean);
 
   // 注力領域
   const focusAreas = [];
-  if (/パートナー|協業|提携/.test(siteText)) focusAreas.push('パートナーを募集中');
-  if (/採用|求人|キャリア/.test(siteText)) focusAreas.push('採用強化中');
-  if (/新サービス|リリース|ローンチ/.test(siteText)) focusAreas.push('新サービス展開中');
+  if (/パートナー|協業|提携|アライアンス/.test(combinedText)) focusAreas.push('パートナーを募集中');
+  if (/新サービス|リリース|ローンチ|プレスリリース/.test(combinedText)) focusAreas.push('新サービス展開中');
+  if (/DX|デジタル変革|デジタルトランスフォーメーション/.test(combinedText)) focusAreas.push('DX推進を強化中');
+  if (/採用強化|積極採用|エンジニア募集/.test(combinedText)) focusAreas.push('採用強化中');
 
   // 関連パターン
   const allPatterns = settings.getSuccessPatterns();
@@ -150,11 +218,15 @@ async function analyzeCompanyLite(url, companyName, companyType) {
   return {
     companyName,
     companyType: companyType || '',
-    businessAreas: businessAreas.slice(0, 5),
+    companyUrl: url || '',
+    businessAreas: businessAreas.slice(0, 6),
     gaps: gaps.slice(0, 5),
     focusAreas,
     relevantPatterns: relevantPatterns.slice(0, 3),
-    siteTextLength: siteText.length,
+    siteTextLength: combinedText.length,
+    siteTextExcerpt,
+    companyPhrases: structured.headings,
+    metaDescription: structured.metaDescription,
     analysisMode: 'lite',
   };
 }
@@ -192,8 +264,8 @@ async function main() {
     const analysis = await Promise.race([
       analyzeCompanyLite(url, companyName, companyType),
       new Promise((resolve) => setTimeout(() => resolve({
-        companyName, companyType: companyType || '', businessAreas: [], gaps: [],
-        focusAreas: [], relevantPatterns: [], siteTextLength: 0, analysisMode: 'timeout',
+        companyName, companyType: companyType || '', companyUrl: url || '', businessAreas: [], gaps: [],
+        focusAreas: [], relevantPatterns: [], siteTextLength: 0, siteTextExcerpt: '', analysisMode: 'timeout',
       }), 15000)),
     ]);
     actionLogger.logAction(no, companyName, 'site_analysis', JSON.stringify(analysis));
@@ -235,10 +307,11 @@ async function main() {
       step: 'メッセージ生成中',
     });
 
-    const message = messageBuilder.buildCustomMessage(analysis);
+    const templateDraft = messageBuilder.buildCustomMessage(analysis);
+    const { prompt: messagePrompt } = messageBuilder.buildMessagePrompt(analysis);
     const MIN_MESSAGE_LENGTH = 50;
-    if (message.trim().length < MIN_MESSAGE_LENGTH) {
-      const warnMsg = `メッセージが短すぎます (${message.trim().length}文字 < ${MIN_MESSAGE_LENGTH}文字)。設定の会社プロフィール・提供価値を確認してください`;
+    if (templateDraft.trim().length < MIN_MESSAGE_LENGTH) {
+      const warnMsg = `メッセージが短すぎます (${templateDraft.trim().length}文字 < ${MIN_MESSAGE_LENGTH}文字)。設定の会社プロフィール・提供価値を確認してください`;
       log(`[No.${no}] ${companyName}: ${warnMsg}`, 'warn');
       actionLogger.logAction(no, companyName, 'error', warnMsg);
       updateLiveMonitor(no, {
@@ -251,8 +324,8 @@ async function main() {
       process.stdout.write(JSON.stringify(result) + '\n');
       process.exit(0);
     }
-    actionLogger.logAction(no, companyName, 'message_draft', message);
-    log(`[No.${no}] ${companyName}: メッセージ生成完了 (${message.length}文字)`, 'step');
+    actionLogger.logAction(no, companyName, 'message_draft', templateDraft);
+    log(`[No.${no}] ${companyName}: プロンプト+テンプレート生成完了 (${templateDraft.length}文字)`, 'step');
 
     // Step 3: 分析完了
     updateLiveMonitor(no, {
@@ -267,7 +340,9 @@ async function main() {
       no,
       companyName,
       analysis,
-      message,
+      message: templateDraft,
+      messagePrompt,
+      templateDraft,
       formUrl: resolvedFormUrl || formUrl || '',
       formResolutionMethod,
     };

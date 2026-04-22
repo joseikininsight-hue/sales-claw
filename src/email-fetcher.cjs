@@ -6,6 +6,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const settings = require('./settings-manager.cjs');
 const { ensureDataDir, resolveDataPath } = require('./data-paths.cjs');
+const { log: cliLog } = (() => { try { return require('./cli-logger.cjs'); } catch { return { log: console.warn }; } })();
 
 function getSessionDir() {
   return resolveDataPath('outlook-session');
@@ -40,7 +41,15 @@ async function fetchEmails() {
   }
 
   const sessionDir = getSessionDir();
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+    // Restrict directory permissions to owner-only on POSIX systems
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(sessionDir, 0o700); } catch (_) {}
+    }
+    cliLog('[security] Outlook session stored in plaintext at: ' + sessionDir, 'warn');
+    cliLog('[security] Ensure this directory is not accessible by other users.', 'warn');
+  }
 
   console.log('=== Outlook Web メール取得 ===\n');
 

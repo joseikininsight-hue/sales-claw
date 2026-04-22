@@ -9,7 +9,7 @@ const path = require('path');
 const WebSocket = require('ws');
 const XLSX = require('xlsx');
 const { getAllLogs, logAction, removeCompanyLogs } = require('./action-logger.cjs');
-const { getAllHistorySummary, getHistory, removeHistory } = require('./contact-history.cjs');
+const { getAllHistorySummary, getHistory, recordContact, removeHistory } = require('./contact-history.cjs');
 const { readRuntime, toClientHost, writeRuntime, clearRuntime } = require('./dashboard-runtime.cjs');
 const settings = require('./settings-manager.cjs');
 const { getTranslations, t: i18nT } = require('./i18n.cjs');
@@ -22,7 +22,7 @@ const {
   getScreenshotSearchDirs,
 } = require('./approval-artifacts.cjs');
 const { findAvailablePort } = require('./port-utils.cjs');
-const { appendCompany, deleteCompany, findCompaniesByNos, getTargetPreview, importTargetList, readTargetList, updateCompany } = require('./target-list.cjs');
+const { appendCompany, deleteCompany, findCompaniesByNos, getTargetPreview, importTargetList, readTargetList, repairImportedTargetListIfNeeded, updateCompany } = require('./target-list.cjs');
 const { getTargetMap, setTargets } = require('./outreach-targets.cjs');
 const { finishLiveMonitor, getLiveMonitorFile, getLiveMonitorSummary, readMonitorState, removeCompanyMonitor, updateLiveMonitor } = require('./live-monitor.cjs');
 const { buildWorkbookBuffer: buildSettingsWorkbookBuffer, parseWorkbookBuffer: parseSettingsWorkbookBuffer } = require('./settings-excel.cjs');
@@ -30,6 +30,7 @@ const {
   buildLaunchArgs,
   buildHeadlessArgs,
   buildManagedSpawnSpec,
+  getAuthFiles,
   getExecutableFallbackCandidates,
   getInstallCommand,
   getInstallSpawnArgs,
@@ -70,6 +71,17 @@ let managedAiAutoSendSafe = !!(typeof settings.getAutoSendEligibleForms === 'fun
 const aiInstallState = Object.fromEntries(listProviders().map((provider) => [provider.id, 'idle']));
 const aiInstallError = Object.fromEntries(listProviders().map((provider) => [provider.id, null]));
 let managedAiSessionState = null;
+let managedAiBatchController = null;
+let managedAiRecoveryState = null;
+let managedAiRecoveryTimer = null;
+let managedAiSuppressAutoRecovery = false;
+
+const MANAGED_AI_FORM_BATCH_SIZE = 4;
+const MANAGED_AI_BATCH_POLL_MS = 5000;
+const MANAGED_AI_BATCH_STALL_MS = 5 * 60 * 1000;
+const MANAGED_AI_PTY_LOG_MAX_BYTES = 1024 * 1024;
+const MANAGED_AI_RECOVERY_RETRY_MS = 15000;
+const MANAGED_AI_RECOVERY_MAX_RETRIES = 20;
 
 const MANAGED_AI_READY_DELAY_MS = {
   claude: 1500,
@@ -450,6 +462,276 @@ function clearManagedAiSessionStateTimers(state = managedAiSessionState) {
   }
 }
 
+function clearManagedAiBatchControllerTimer(controller = managedAiBatchController) {
+  if (!controller || !controller.pollTimer) return;
+  clearInterval(controller.pollTimer);
+  controller.pollTimer = null;
+}
+
+function clearManagedAiRecoveryTimer() {
+  if (!managedAiRecoveryTimer) return;
+  clearTimeout(managedAiRecoveryTimer);
+  managedAiRecoveryTimer = null;
+}
+
+function resetManagedAiBatchController() {
+  clearManagedAiBatchControllerTimer();
+  managedAiBatchController = null;
+}
+
+function createManagedAiBatchController(providerId, autoSendSafe) {
+  return {
+    providerId: normalizeProviderId(providerId),
+    autoSendSafe: !!autoSendSafe,
+    pending: [],
+    activeBatch: null,
+    batchCounter: 0,
+    pollTimer: null,
+  };
+}
+
+function ensureManagedAiBatchController(providerId, autoSendSafe) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!managedAiBatchController) {
+    managedAiBatchController = createManagedAiBatchController(normalizedProviderId, autoSendSafe);
+    return managedAiBatchController;
+  }
+  if (managedAiBatchController.providerId !== normalizedProviderId) {
+    throw new Error(`現在の managed batch controller は ${getProviderDisplayName(managedAiBatchController.providerId)} 用です。${getProviderDisplayName(normalizedProviderId)} に切り替える前に現在のバッチを完了または停止してください。`);
+  }
+  managedAiBatchController.autoSendSafe = !!autoSendSafe;
+  return managedAiBatchController;
+}
+
+function snapshotManagedAiBatchesForRecovery() {
+  const controller = managedAiBatchController;
+  if (!controller) return null;
+  const snapshot = {
+    providerId: controller.providerId,
+    autoSendSafe: !!controller.autoSendSafe,
+    mode: claudeProcessMode || getProvider(controller.providerId).defaultMode || 'auto',
+    batches: [],
+  };
+  if (controller.activeBatch && Array.isArray(controller.activeBatch.companies) && controller.activeBatch.companies.length > 0) {
+    const progress = getManagedAiBatchProgressSnapshot(controller.activeBatch.companyNos || []);
+    const terminalNos = new Set((progress.statuses || [])
+      .filter((status) => status && status.terminal)
+      .map((status) => Number(status.companyNo)));
+    const remainingCompanies = controller.activeBatch.companies
+      .filter((company) => !terminalNos.has(Number(company.no)));
+    if (remainingCompanies.length > 0) {
+      snapshot.batches.push({
+        id: controller.activeBatch.id,
+        companies: remainingCompanies,
+        options: { ...(controller.activeBatch.options || {}) },
+      });
+    }
+  }
+  (controller.pending || []).forEach((batch) => {
+    if (!batch || !Array.isArray(batch.companies) || batch.companies.length === 0) return;
+    snapshot.batches.push({
+      id: batch.id,
+      companies: batch.companies.slice(),
+      options: { ...(batch.options || {}) },
+    });
+  });
+  return snapshot.batches.length > 0 ? snapshot : null;
+}
+
+function restoreManagedAiBatchesFromRecovery(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.batches) || snapshot.batches.length === 0) return null;
+  const controller = ensureManagedAiBatchController(snapshot.providerId, snapshot.autoSendSafe);
+  controller.pending = snapshot.batches.map((batch) => ({
+    id: batch.id || `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    companies: Array.isArray(batch.companies) ? batch.companies.slice() : [],
+    options: { ...(batch.options || {}) },
+  })).filter((batch) => batch.companies.length > 0);
+  controller.activeBatch = null;
+  controller.batchCounter = Math.max(controller.batchCounter || 0, controller.pending.length);
+  startManagedAiBatchPoller();
+  if (!controller.activeBatch && controller.pending.length > 0) {
+    setTimeout(() => {
+      dispatchNextManagedAiFormFillBatch();
+    }, 350);
+  }
+  return controller;
+}
+
+function chunkManagedAiCompanies(companies, chunkSize = MANAGED_AI_FORM_BATCH_SIZE) {
+  const normalizedChunkSize = Math.max(1, Number(chunkSize) || MANAGED_AI_FORM_BATCH_SIZE);
+  const chunks = [];
+  for (let i = 0; i < companies.length; i += normalizedChunkSize) {
+    chunks.push(companies.slice(i, i + normalizedChunkSize));
+  }
+  return chunks;
+}
+
+function buildManagedAiBatchOptionsSubset(baseOptions = {}, companies = []) {
+  const companyKeySet = new Set(companies.map((company) => String(company.no)));
+  const subsetMap = new Map();
+  const sourceMap = baseOptions.phaseAByCompany instanceof Map ? baseOptions.phaseAByCompany : null;
+  if (sourceMap) {
+    companies.forEach((company) => {
+      const key = String(company.no);
+      if (sourceMap.has(key)) subsetMap.set(key, sourceMap.get(key));
+    });
+  }
+  return {
+    ...baseOptions,
+    phaseAByCompany: subsetMap,
+    phaseASuccesses: Array.isArray(baseOptions.phaseASuccesses)
+      ? baseOptions.phaseASuccesses.filter((entry) => companyKeySet.has(String(entry.companyNo)))
+      : [],
+    phaseAFailures: Array.isArray(baseOptions.phaseAFailures)
+      ? baseOptions.phaseAFailures.filter((entry) => companyKeySet.has(String(entry.companyNo)))
+      : [],
+  };
+}
+
+function getManagedAiPtyLogFile(providerId = getManagedAiProvider()) {
+  return resolveDataPath(path.join('ai-runs', `managed-${normalizeProviderId(providerId)}-session.log`));
+}
+
+function appendManagedAiPtyLog(providerId, chunk, kind = 'output') {
+  const text = stripAnsiCodes(String(chunk || '')).replace(/\r/g, '');
+  if (!text.trim()) return;
+  const logFile = getManagedAiPtyLogFile(providerId);
+  ensureParentDir(logFile);
+  try {
+    if (fs.existsSync(logFile) && fs.statSync(logFile).size > MANAGED_AI_PTY_LOG_MAX_BYTES) {
+      const backupFile = `${logFile}.1`;
+      try {
+        if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
+      } catch (_) {}
+      fs.renameSync(logFile, backupFile);
+    }
+  } catch (_) {}
+
+  const lines = text.split('\n').filter((line) => line.trim());
+  if (lines.length === 0) return;
+  const stamp = new Date().toISOString();
+  const payload = lines.map((line) => `[${stamp}] [${kind}] ${line}`).join('\n') + '\n';
+  fs.appendFileSync(logFile, payload, 'utf8');
+}
+
+function parseEventTimestampMs(value) {
+  if (!value) return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getManagedAiBatchProgressSnapshot(companyNos = []) {
+  const keySet = new Set((companyNos || []).map((value) => String(value)));
+  const latestLogByCompany = new Map();
+  const latestMonitorByCompany = new Map();
+  const logs = getAllLogs();
+  logs.forEach((entry) => {
+    const key = String(entry.companyNo || entry.no || '');
+    if (!keySet.has(key)) return;
+    latestLogByCompany.set(key, entry);
+  });
+  const monitorState = readMonitorState();
+  const monitorEvents = monitorState && Array.isArray(monitorState.events) ? monitorState.events : [];
+  monitorEvents.forEach((entry) => {
+    const key = String(entry.companyNo || '');
+    if (!keySet.has(key)) return;
+    latestMonitorByCompany.set(key, entry);
+  });
+
+  const terminalStates = new Set(['awaiting_approval', 'submitted', 'completed', 'skipped', 'error']);
+  let terminalCount = 0;
+  let latestActivityAt = 0;
+  const statuses = [];
+
+  keySet.forEach((key) => {
+    const latestLog = latestLogByCompany.get(key) || null;
+    const latestMonitor = latestMonitorByCompany.get(key) || null;
+    const action = latestLog && latestLog.action ? String(latestLog.action) : '';
+    const monitorStatus = latestMonitor && latestMonitor.status ? String(latestMonitor.status) : '';
+    const terminal = terminalStates.has(action) || terminalStates.has(monitorStatus);
+    if (terminal) terminalCount += 1;
+    latestActivityAt = Math.max(
+      latestActivityAt,
+      parseEventTimestampMs(latestLog && (latestLog.timestamp || latestLog.date || latestLog.time)),
+      parseEventTimestampMs(latestMonitor && (latestMonitor.updatedAt || latestMonitor.timestamp || latestMonitor.time)),
+    );
+    statuses.push({
+      companyNo: Number(key),
+      action,
+      monitorStatus,
+      terminal,
+    });
+  });
+
+  return {
+    terminalCount,
+    totalCount: keySet.size,
+    latestActivityAt,
+    statuses,
+  };
+}
+
+function getManagedAiReservedCompanyNos() {
+  const reserved = new Set();
+  const controller = managedAiBatchController;
+  if (!controller) return reserved;
+  if (controller.activeBatch && Array.isArray(controller.activeBatch.companyNos)) {
+    controller.activeBatch.companyNos.forEach((companyNo) => {
+      if (companyNo !== undefined && companyNo !== null) reserved.add(Number(companyNo));
+    });
+  }
+  (controller.pending || []).forEach((batch) => {
+    (batch && batch.companies || []).forEach((company) => {
+      if (company && company.no !== undefined && company.no !== null) reserved.add(Number(company.no));
+    });
+  });
+  return reserved;
+}
+
+function isAiRuntimeActivelyProcessing() {
+  if (getActiveHeadlessRun()) return true;
+  if (claudePty) return true;
+  const controller = managedAiBatchController;
+  return !!(controller && (controller.activeBatch || (controller.pending && controller.pending.length > 0)));
+}
+
+function touchManagedAiBatchActivity(reason = 'unknown') {
+  const controller = managedAiBatchController;
+  if (!controller || !controller.activeBatch) return;
+  controller.activeBatch.lastProgressAt = Date.now();
+  controller.activeBatch.lastProgressReason = reason;
+}
+
+function cleanupStaleManagedAiMonitorEvents(maxAgeMs = MANAGED_AI_BATCH_STALL_MS) {
+  if (claudePty || getActiveHeadlessRun()) return 0;
+  const summary = getLiveMonitorSummary();
+  const terminalStates = new Set(['awaiting_approval', 'submitted', 'completed', 'skipped', 'error']);
+  const now = Date.now();
+  let cleaned = 0;
+  (summary.events || []).forEach((event) => {
+    if (!event || event.active === false) return;
+    if (terminalStates.has(String(event.status || ''))) return;
+    const updatedAtMs = parseEventTimestampMs(event.updatedAt || event.timestamp || event.time);
+    if (!updatedAtMs || (now - updatedAtMs) < maxAgeMs) return;
+    finishLiveMonitor(event.companyNo, {
+      companyNo: event.companyNo,
+      companyName: event.companyName || '',
+      status: 'error',
+      step: `前回セッションが停止したため自動終了 (${Math.round((now - updatedAtMs) / 60000)}分更新なし)`,
+      latestScreenshot: event.latestScreenshot || null,
+    });
+    cleaned += 1;
+  });
+  if (cleaned > 0) {
+    appendDiagnosticEvent('stale_managed_ai_sessions_cleaned', {
+      cleanedCount: cleaned,
+      maxAgeMs,
+    });
+  }
+  return cleaned;
+}
+
 function createManagedAiSessionState(providerId) {
   const normalizedProviderId = normalizeProviderId(providerId);
   return {
@@ -464,7 +746,31 @@ function createManagedAiSessionState(providerId) {
     readyTimer: null,
     enterTimer: null,
     contractVersionSent: 0,
+    authFingerprint: getProviderAuthFingerprint(normalizedProviderId),
   };
+}
+
+function getProviderAuthFingerprint(providerId) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  const authFiles = Array.from(new Set([
+    ...(getAuthFiles(normalizedProviderId) || []),
+    normalizedProviderId === 'claude' ? path.join(os.homedir(), '.claude.json') : null,
+  ].filter(Boolean)));
+  return authFiles.map((filePath) => {
+    try {
+      const stat = fs.statSync(filePath);
+      return `${String(filePath || '').toLowerCase()}:${stat.size}:${Math.floor(stat.mtimeMs)}`;
+    } catch (_) {
+      return `${String(filePath || '').toLowerCase()}:missing`;
+    }
+  }).join('|');
+}
+
+function isManagedAiAuthFingerprintStale(providerId = getManagedAiProvider()) {
+  const state = managedAiSessionState;
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!state || state.providerId !== normalizedProviderId) return false;
+  return String(state.authFingerprint || '') !== String(getProviderAuthFingerprint(normalizedProviderId) || '');
 }
 
 function hasManagedAiStartupBlocker(providerId, outputText) {
@@ -654,6 +960,8 @@ function flushManagedAiPromptQueue() {
     ? `\u001b[200~${next.promptText}\u001b[201~`
     : next.promptText;
   try {
+    appendManagedAiPtyLog(state.providerId, `[dispatch] prompt queued (${String(next.promptText || '').length} chars)`, 'system');
+    touchManagedAiBatchActivity('prompt-dispatch');
     claudePty.write(promptPayload);
   } catch (error) {
     state.dispatching = false;
@@ -670,7 +978,11 @@ function flushManagedAiPromptQueue() {
     }
     state.enterTimer = setTimeout(() => {
       try {
-        if (claudePty) claudePty.write(submitKey);
+        if (claudePty) {
+          claudePty.write(submitKey);
+          appendManagedAiPtyLog(state.providerId, `[dispatch] submit key sent (${JSON.stringify(submitKey)})`, 'system');
+          touchManagedAiBatchActivity('submit-key');
+        }
       } finally {
         sendSubmitKey(index + 1);
       }
@@ -705,6 +1017,227 @@ function queueManagedAiPrompt(promptText, providerId) {
     ready: state.ready,
     queueLength: state.queue.length,
   };
+}
+
+function startManagedAiBatchPoller() {
+  const controller = managedAiBatchController;
+  if (!controller || controller.pollTimer) return;
+  controller.pollTimer = setInterval(() => {
+    const activeController = managedAiBatchController;
+    if (!activeController) {
+      clearManagedAiBatchControllerTimer(controller);
+      return;
+    }
+
+    if (!activeController.activeBatch) {
+      if (activeController.pending.length === 0) {
+        clearManagedAiBatchControllerTimer(activeController);
+      }
+      return;
+    }
+
+    const snapshot = getManagedAiBatchProgressSnapshot(activeController.activeBatch.companyNos);
+    if (snapshot.latestActivityAt && snapshot.latestActivityAt > activeController.activeBatch.lastProgressAt) {
+      activeController.activeBatch.lastProgressAt = snapshot.latestActivityAt;
+      activeController.activeBatch.lastProgressReason = 'action-log';
+    }
+
+    if (snapshot.terminalCount >= snapshot.totalCount && snapshot.totalCount > 0) {
+      appendDiagnosticEvent('managed_ai_batch_completed', {
+        provider: activeController.providerId,
+        batchId: activeController.activeBatch.id,
+        companyCount: snapshot.totalCount,
+        durationMs: Date.now() - activeController.activeBatch.startedAt,
+        statuses: snapshot.statuses,
+      });
+      appendAiRunMetric('managed_ai_batch_completed', {
+        provider: activeController.providerId,
+        batchId: activeController.activeBatch.id,
+        companyCount: snapshot.totalCount,
+        durationMs: Date.now() - activeController.activeBatch.startedAt,
+        statuses: snapshot.statuses,
+      });
+      activeController.activeBatch = null;
+      if (activeController.pending.length === 0) {
+        clearManagedAiBatchControllerTimer(activeController);
+      } else {
+        setTimeout(() => {
+          dispatchNextManagedAiFormFillBatch();
+        }, 350);
+      }
+      return;
+    }
+
+    if (!activeController.activeBatch.stallNotified
+      && (Date.now() - activeController.activeBatch.lastProgressAt) > MANAGED_AI_BATCH_STALL_MS) {
+      activeController.activeBatch.stallNotified = true;
+      appendDiagnosticEvent('managed_ai_batch_stalled', {
+        provider: activeController.providerId,
+        batchId: activeController.activeBatch.id,
+        idleMs: Date.now() - activeController.activeBatch.lastProgressAt,
+        durationMs: Date.now() - activeController.activeBatch.startedAt,
+        companyNos: activeController.activeBatch.companyNos,
+        statuses: snapshot.statuses,
+      });
+      emitClaudeAutomationLog(
+        `[バッチ停滞検知] ${snapshot.totalCount}社の処理が ${Math.round((Date.now() - activeController.activeBatch.lastProgressAt) / 1000)} 秒更新されていません。CLIログとフォームタブを確認してください。\n`,
+        'warn',
+        activeController.providerId,
+      );
+    }
+  }, MANAGED_AI_BATCH_POLL_MS);
+  if (typeof controller.pollTimer.unref === 'function') {
+    controller.pollTimer.unref();
+  }
+}
+
+function dispatchNextManagedAiFormFillBatch() {
+  const controller = managedAiBatchController;
+  if (!controller || controller.activeBatch || controller.pending.length === 0) return null;
+  const next = controller.pending.shift();
+  controller.activeBatch = {
+    id: next.id,
+    companyNos: next.companies.map((company) => Number(company.no)),
+    companyNames: next.companies.map((company) => company.companyName || company.name || ''),
+    companies: next.companies.slice(),
+    options: { ...(next.options || {}) },
+    startedAt: Date.now(),
+    lastProgressAt: Date.now(),
+    lastProgressReason: 'queued',
+    stallNotified: false,
+  };
+  appendDiagnosticEvent('managed_ai_batch_dispatch', {
+    provider: controller.providerId,
+    batchId: next.id,
+    companyCount: next.companies.length,
+    remainingBatchCount: controller.pending.length,
+    companyNos: controller.activeBatch.companyNos,
+  });
+  appendAiRunMetric('managed_ai_batch_dispatch', {
+    provider: controller.providerId,
+    batchId: next.id,
+    companyCount: next.companies.length,
+    remainingBatchCount: controller.pending.length,
+    companyNos: controller.activeBatch.companyNos,
+  });
+  emitClaudeAutomationLog(
+    `[分割バッチ開始] ${next.companies.length}社を ${getProviderDisplayName(controller.providerId)} CLI に投入します（残り ${controller.pending.length} バッチ）。\n`,
+    'system',
+    controller.providerId,
+  );
+  const result = queueClaudeFormFillInManagedSession(next.companies, controller.providerId, next.options);
+  startManagedAiBatchPoller();
+  return result;
+}
+
+async function tryRecoverManagedAiSession(reason = 'unknown') {
+  const recovery = managedAiRecoveryState;
+  if (!recovery || recovery.inFlight) return false;
+  recovery.inFlight = true;
+  clearManagedAiRecoveryTimer();
+  try {
+    const auth = await probeClaudeAuthStatus(recovery.providerId);
+    if (!auth.installed || !auth.loggedIn) {
+      recovery.retries = (recovery.retries || 0) + 1;
+      appendDiagnosticEvent('managed_ai_recovery_waiting_auth', {
+        provider: recovery.providerId,
+        reason,
+        retries: recovery.retries,
+        installed: !!auth.installed,
+        loggedIn: !!auth.loggedIn,
+        error: auth.error || null,
+      });
+      if (recovery.retries >= MANAGED_AI_RECOVERY_MAX_RETRIES) {
+        emitClaudeAutomationLog(
+          `[AI自動復旧停止] ${getProviderDisplayName(recovery.providerId)} の再ログイン待ちが長引いたため、自動復旧を停止しました。再度「AIを起動」してください。\n`,
+          'warn',
+          recovery.providerId,
+        );
+        managedAiRecoveryState = null;
+        return false;
+      }
+      managedAiRecoveryTimer = setTimeout(() => {
+        tryRecoverManagedAiSession('retry-auth');
+      }, MANAGED_AI_RECOVERY_RETRY_MS);
+      if (typeof managedAiRecoveryTimer.unref === 'function') managedAiRecoveryTimer.unref();
+      return false;
+    }
+
+    appendDiagnosticEvent('managed_ai_recovery_restart', {
+      provider: recovery.providerId,
+      reason,
+      batchCount: recovery.batches.length,
+      mode: recovery.mode,
+      autoSendSafe: recovery.autoSendSafe,
+    });
+    await launchManagedAiPty(recovery.mode, recovery.providerId, {
+      allowReuse: false,
+      autoSendSafe: recovery.autoSendSafe,
+    });
+    restoreManagedAiBatchesFromRecovery(recovery);
+    emitClaudeAutomationLog(
+      `[AI自動復旧] ${getProviderDisplayName(recovery.providerId)} の再ログイン後に managed セッションを復旧し、残り ${recovery.batches.length} バッチを再開しました。\n`,
+      'system',
+      recovery.providerId,
+    );
+    managedAiRecoveryState = null;
+    return true;
+  } catch (error) {
+    recovery.retries = (recovery.retries || 0) + 1;
+    appendDiagnosticEvent('managed_ai_recovery_failed', {
+      provider: recovery.providerId,
+      reason,
+      retries: recovery.retries,
+      error: String(error && error.message || error),
+    });
+    if (recovery.retries < MANAGED_AI_RECOVERY_MAX_RETRIES) {
+      managedAiRecoveryTimer = setTimeout(() => {
+        tryRecoverManagedAiSession('retry-error');
+      }, MANAGED_AI_RECOVERY_RETRY_MS);
+      if (typeof managedAiRecoveryTimer.unref === 'function') managedAiRecoveryTimer.unref();
+    } else {
+      managedAiRecoveryState = null;
+    }
+    return false;
+  } finally {
+    if (managedAiRecoveryState) managedAiRecoveryState.inFlight = false;
+  }
+}
+
+async function restartManagedAiSessionForAuthRefresh(providerId = getManagedAiProvider()) {
+  const normalizedProviderId = normalizeProviderId(providerId);
+  if (!claudePty || getManagedAiProvider() !== normalizedProviderId || !isManagedAiAuthFingerprintStale(normalizedProviderId)) {
+    return { restarted: false };
+  }
+  const recovery = snapshotManagedAiBatchesForRecovery();
+  appendDiagnosticEvent('managed_ai_auth_refresh_detected', {
+    provider: normalizedProviderId,
+    mode: claudeProcessMode,
+    autoSendSafe: managedAiAutoSendSafe,
+    hasRecoveryBatches: !!(recovery && recovery.batches && recovery.batches.length),
+  });
+  emitClaudeAutomationLog(
+    `[認証状態更新検知] ${getProviderDisplayName(normalizedProviderId)} のログイン状態が変わったため、managed セッションを自動で張り直します。\n`,
+    'system',
+    normalizedProviderId,
+  );
+  managedAiRecoveryState = recovery
+    ? {
+      ...recovery,
+      retries: 0,
+      inFlight: false,
+    }
+    : null;
+  await stopManagedClaudePty({ suppressAutoRecovery: true });
+  if (managedAiRecoveryState) {
+    await tryRecoverManagedAiSession('auth-refresh');
+  } else {
+    await launchManagedAiPty(claudeProcessMode || getProvider(normalizedProviderId).defaultMode || 'auto', normalizedProviderId, {
+      allowReuse: false,
+      autoSendSafe: managedAiAutoSendSafe,
+    });
+  }
+  return { restarted: true };
 }
 
 function isHeadlessAutomationProvider(providerId) {
@@ -892,6 +1425,88 @@ function getManagedProviderHome(providerId) {
   return resolveDataPath(path.join('provider-homes', normalizeProviderId(providerId)));
 }
 
+function normalizeProjectConfigKey(projectRoot = PROJECT_ROOT) {
+  return path.resolve(projectRoot).replace(/\\/g, '/');
+}
+
+function buildManagedClaudeMcpServers(realState = {}) {
+  const globalMcpServers = (realState && typeof realState === 'object' && realState.mcpServers) || {};
+  if (globalMcpServers.playwright && typeof globalMcpServers.playwright === 'object') {
+    return { playwright: globalMcpServers.playwright };
+  }
+  return {
+    playwright: {
+      type: 'stdio',
+      command: 'cmd',
+      args: ['/c', 'npx', '-y', '@playwright/mcp', '--browser', 'chrome'],
+      env: {},
+    },
+  };
+}
+
+function buildManagedClaudeProjectState() {
+  return {
+    allowedTools: [],
+    mcpContextUris: [],
+    mcpServers: {},
+    enabledMcpjsonServers: [],
+    disabledMcpjsonServers: [],
+    hasTrustDialogAccepted: true,
+    projectOnboardingSeenCount: 1,
+    hasClaudeMdExternalIncludesApproved: false,
+    hasClaudeMdExternalIncludesWarningShown: false,
+  };
+}
+
+function extractManagedClaudeProjectState(realState = {}, projectKey) {
+  const projects = (realState && typeof realState === 'object' && realState.projects) || {};
+  const current = (projectKey && projects[projectKey]) || {};
+  return {
+    ...current,
+    ...buildManagedClaudeProjectState(),
+  };
+}
+
+function prepareClaudeManagedHome(projectRoot = PROJECT_ROOT) {
+  const realHome = os.homedir();
+  const managedHome = getManagedProviderHome('claude');
+  const managedClaudeDir = path.join(managedHome, '.claude');
+  const managedAppDataRoaming = path.join(managedHome, 'AppData', 'Roaming');
+  const managedAppDataLocal = path.join(managedHome, 'AppData', 'Local');
+  const managedTempDir = path.join(managedHome, 'tmp');
+  fs.mkdirSync(managedClaudeDir, { recursive: true });
+  fs.mkdirSync(managedAppDataRoaming, { recursive: true });
+  fs.mkdirSync(managedAppDataLocal, { recursive: true });
+  fs.mkdirSync(managedTempDir, { recursive: true });
+
+  copyFileIfExists(path.join(realHome, '.claude', '.credentials.json'), path.join(managedClaudeDir, '.credentials.json'));
+  copyFileIfExists(path.join(realHome, '.claude', '.omc-config.json'), path.join(managedClaudeDir, '.omc-config.json'));
+
+  const realSettings = readJsonFileSafe(path.join(realHome, '.claude', 'settings.json'), {}) || {};
+  const managedSettings = {
+    ...(realSettings || {}),
+    hooks: {},
+    mcpServers: {},
+  };
+  fs.writeFileSync(path.join(managedClaudeDir, 'settings.json'), JSON.stringify(managedSettings, null, 2), 'utf8');
+
+  const realState = readJsonFileSafe(path.join(realHome, '.claude.json'), {}) || {};
+  const projectKey = normalizeProjectConfigKey(projectRoot);
+  const managedState = {
+    ...(realState || {}),
+    autoUpdates: false,
+    mcpServers: buildManagedClaudeMcpServers(realState),
+    projects: {
+      [projectKey]: extractManagedClaudeProjectState(realState, projectKey),
+    },
+    plugins: [],
+  };
+  delete managedState.prompt;
+  fs.writeFileSync(path.join(managedHome, '.claude.json'), JSON.stringify(managedState, null, 2), 'utf8');
+
+  return managedHome;
+}
+
 function prepareGeminiManagedHome(projectRoot = PROJECT_ROOT) {
   const realHome = os.homedir();
   const managedHome = getManagedProviderHome('gemini');
@@ -944,6 +1559,28 @@ function prepareGeminiManagedHome(projectRoot = PROJECT_ROOT) {
 function buildManagedProviderEnv(providerId) {
   const normalizedProviderId = normalizeProviderId(providerId);
   const baseEnv = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+  if (normalizedProviderId === 'claude') {
+    const managedHome = prepareClaudeManagedHome(PROJECT_ROOT);
+    const parsed = path.parse(managedHome);
+    const appDataRoaming = path.join(managedHome, 'AppData', 'Roaming');
+    const appDataLocal = path.join(managedHome, 'AppData', 'Local');
+    const managedTempDir = path.join(managedHome, 'tmp');
+    return {
+      ...baseEnv,
+      HOME: managedHome,
+      USERPROFILE: managedHome,
+      HOMEDRIVE: parsed.root.replace(/\\$/, ''),
+      HOMEPATH: managedHome.slice(parsed.root.length - 1),
+      APPDATA: appDataRoaming,
+      LOCALAPPDATA: appDataLocal,
+      TEMP: managedTempDir,
+      TMP: managedTempDir,
+      XDG_CONFIG_HOME: managedHome,
+      XDG_CACHE_HOME: path.join(managedHome, '.cache'),
+      XDG_STATE_HOME: path.join(managedHome, '.state'),
+      CLAUDE_CONFIG_DIR: path.join(managedHome, '.claude'),
+    };
+  }
   if (normalizedProviderId !== 'gemini') {
     return baseEnv;
   }
@@ -1417,6 +2054,10 @@ function compactMessageForPrompt(message, sender = {}) {
   return trimMultilineText(core, 900);
 }
 
+function compactMessagePromptForPrompt(promptText) {
+  return trimMultilineText(promptText, 2600);
+}
+
 function buildCompactSenderPayload(sender = {}) {
   const payload = {};
   [
@@ -1467,8 +2108,10 @@ function buildManagedAiSessionContract(providerId = getManagedAiProvider(), opti
     '- form_fill / confirm_reached / awaiting_approval / submitted を正しく記録',
     '- 入力項目は設定にある値だけ使う。推測しない',
     autoSendSafe
-      ? '- 安全と判断できるフォームだけ submitted まで進める。少しでも手動判断が必要なら awaiting_approval'
+      ? '- CAPTCHA / ロボチェッカー / 手動必須項目 / 営業NG / 不確実ケースを除き、確認画面到達後はできるだけ submitted まで進める'
       : '- 送信は行わず awaiting_approval で止める',
+    '- submitted まで進めたら必ず ss-{No}-sent.png を残す。awaiting_approval / error / skipped は入力済みタブを残す',
+    '- submitted が明確に完了したタブは閉じる。送れなかったタブは残す',
     '- 同じセッションではこの契約を再説明しない。以後の batch payload だけ実行する',
   ].join('\n');
 }
@@ -1746,11 +2389,12 @@ async function forceKillManagedPty(targetPty) {
   }
 }
 
-async function stopManagedClaudePty() {
+async function stopManagedClaudePty(options = {}) {
   const targetPty = claudePty;
   if (!targetPty) {
     return { ok: true, stopped: false, method: 'noop' };
   }
+  managedAiSuppressAutoRecovery = !!options.suppressAutoRecovery;
 
   const providerId = getManagedAiProvider();
   const gracefulInput = providerId === 'claude' ? 'exit\r' : '\u0003';
@@ -2044,9 +2688,11 @@ function getScreenshotArtifacts(companyNo, options = {}) {
     dir: settings.getScreenshotDir(),
     input: status.exists.input ? (actual.input || status.screenshots.input) : null,
     confirm: status.exists.confirm ? (actual.confirm || status.screenshots.confirm) : null,
+    sent: status.exists.sent ? (actual.sent || status.screenshots.sent) : null,
     hasInput: status.exists.input,
     hasConfirm: status.exists.confirm,
-    hasAny: status.exists.input || status.exists.confirm,
+    hasSent: status.exists.sent,
+    hasAny: status.exists.input || status.exists.confirm || status.exists.sent,
     readyForApproval: status.readyForApproval,
     readyForManualApproval: !!status.readyForManualApproval,
     manualReviewReason: status.manualActionReason || '',
@@ -2171,16 +2817,81 @@ function getMonitorScreenshotFile(monitor) {
   return null;
 }
 
-function buildMonitorPayload() {
+function mapLogToMonitorStatus(action) {
+  switch (String(action || '').trim()) {
+    case 'site_analysis': return 'site_analysis';
+    case 'message_draft': return 'draft_ready';
+    case 'form_fill': return 'form_filling';
+    case 'confirm_reached': return 'confirm_reached';
+    case 'awaiting_approval': return 'awaiting_approval';
+    case 'submitted': return 'submitted';
+    case 'skipped': return 'skipped';
+    case 'error': return 'error';
+    default: return String(action || '').trim() || 'update';
+  }
+}
+
+function mapLogToMonitorStep(log) {
+  const action = String(log && log.action || '').trim();
+  switch (action) {
+    case 'site_analysis': return '企業サイト分析';
+    case 'message_draft': return '文面作成';
+    case 'form_fill': return 'フォーム入力中';
+    case 'confirm_reached': return '確認画面到達';
+    case 'awaiting_approval': return '確認待ち';
+    case 'submitted': return '送信済み';
+    case 'skipped': return '対象外/スキップ';
+    case 'error': return 'エラー';
+    default: return action || '';
+  }
+}
+
+function buildFallbackMonitorEventsFromLogs(sourceLogs = []) {
+  const relevantActions = new Set(['site_analysis', 'message_draft', 'form_fill', 'confirm_reached', 'awaiting_approval', 'submitted', 'skipped', 'error']);
+  const seen = new Set();
+  const events = [];
+  sourceLogs
+    .filter((log) => log && log.companyNo != null && relevantActions.has(String(log.action || '').trim()))
+    .slice()
+    .sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime())
+    .forEach((log) => {
+      const key = `${log.companyNo}:${log.action}:${log.timestamp}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      events.push({
+        companyNo: Number(log.companyNo),
+        companyName: log.companyName || '',
+        status: mapLogToMonitorStatus(log.action),
+        step: mapLogToMonitorStep(log),
+        currentUrl: extractFormUrlFromLog(log),
+        updatedAt: log.timestamp || null,
+        active: false,
+        source: 'action-log',
+      });
+    });
+  return events;
+}
+
+function buildMonitorPayload(sourceLogs = []) {
   const summary = getLiveMonitorSummary();
   const monitor = summary && summary.primary ? summary.primary : readMonitorState();
-  const events = summary && Array.isArray(summary.events)
+  const liveEvents = summary && Array.isArray(summary.events)
     ? summary.events.map((entry) => ({
         ...entry,
         currentUrl: entry && (entry.currentUrl || entry.formUrl) ? (entry.currentUrl || entry.formUrl) : '',
         latestScreenshotName: getMonitorScreenshotFile(entry),
       }))
     : [];
+  const fallbackEvents = buildFallbackMonitorEventsFromLogs(sourceLogs);
+  const eventMap = new Map();
+  [...liveEvents, ...fallbackEvents].forEach((entry) => {
+    if (!entry) return;
+    const key = `${entry.companyNo || ''}:${entry.status || ''}:${entry.updatedAt || ''}:${entry.step || ''}`;
+    if (!eventMap.has(key)) eventMap.set(key, entry);
+  });
+  const events = [...eventMap.values()]
+    .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+    .slice(0, 200);
   if (!monitor) {
     return {
       status: 'idle',
@@ -2217,12 +2928,67 @@ function getLatestMonitorUrl(companyNo) {
   return latest ? (latest.currentUrl || latest.formUrl || '') : '';
 }
 
-function getKnownFormUrl(companyNo, preferredUrl = '') {
+function extractUrlFromText(value = '') {
+  const match = String(value || '').match(/https?:\/\/[^\s"'<>]+/i);
+  if (!match) return '';
+  return match[0].replace(/[),.;]+$/g, '');
+}
+
+function extractFormUrlFromLog(log) {
+  if (!log) return '';
+  const details = log.details;
+  if (details && typeof details === 'object') {
+    const directCandidates = [details.formUrl, details.currentUrl, details.url, details.targetUrl];
+    for (const candidate of directCandidates) {
+      const normalized = String(candidate || '').trim();
+      if (/^https?:\/\//i.test(normalized)) return normalized;
+    }
+  }
+  return extractUrlFromText(stringifyLogDetails(details || ''));
+}
+
+function ensureSubmittedContactHistory(companyNo, companyName, submittedLog, formUrl, message, existingHistory = null, options = {}) {
+  if (!submittedLog) return existingHistory;
+  const normalizedMessage = String(message || '').trim();
+  const normalizedFormUrl = String(formUrl || '').trim();
+  const submittedAt = submittedLog && submittedLog.timestamp ? new Date(submittedLog.timestamp).toISOString() : '';
+  const history = existingHistory || getHistory(companyNo);
+  const contacts = history && Array.isArray(history.contacts) ? history.contacts : [];
+  const alreadyRecorded = contacts.some((contact) => {
+    const sameDate = submittedAt && (
+      String(contact && contact.date || '') === submittedAt
+      || String(contact && contact.sourceActionAt || '') === submittedAt
+    );
+    const sameMessage = normalizedMessage && String(contact && contact.message || '').trim() === normalizedMessage;
+    const sameUrl = normalizedFormUrl && String(contact && contact.formUrl || '').trim() === normalizedFormUrl;
+    return sameDate || (sameMessage && (!normalizedFormUrl || sameUrl));
+  });
+  if (alreadyRecorded || (!normalizedMessage && !normalizedFormUrl)) return history;
+  recordContact(companyNo, companyName, {
+    message: normalizedMessage,
+    formUrl: normalizedFormUrl,
+    method: 'web_form',
+    sentAt: submittedAt,
+    screenshot: options.screenshot || '',
+    sourceAction: options.sourceAction || 'submitted',
+    sourceActionAt: options.sourceActionAt || submittedAt,
+    status: options.status || 'submitted',
+    notes: options.notes || 'submitted log sync',
+  });
+  return getHistory(companyNo);
+}
+
+function getKnownFormUrl(companyNo, preferredUrl = '', logs = []) {
   const direct = String(preferredUrl || '').trim();
   if (direct) return direct;
 
   const monitorUrl = getLatestMonitorUrl(companyNo);
   if (monitorUrl) return monitorUrl;
+
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const logUrl = extractFormUrlFromLog(logs[i]);
+    if (logUrl) return logUrl;
+  }
 
   const history = getHistory(companyNo);
   if (history && Array.isArray(history.contacts)) {
@@ -2272,7 +3038,9 @@ function isAwaitingTransitionAllowed(lastAction, decision) {
     return ['awaiting_approval', 'confirm_reached'].includes(lastAction);
   }
   if (decision === 'skip') {
-    return ['site_analysis', 'message_draft', 'form_fill', 'confirm_reached', 'awaiting_approval', 'error'].includes(lastAction);
+    // 送信済み・スキップ済み以外はどの中間状態からでもスキップ可（バッチ中断時の救済含む）
+    const alreadyFinal = new Set(['submitted', 'skipped']);
+    return !alreadyFinal.has(lastAction);
   }
   return false;
 }
@@ -2600,6 +3368,9 @@ async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider())
   if (selectedProviderId === 'gemini') {
     ensureGeminiWorkspaceTrusted(PROJECT_ROOT);
   }
+  if (requiresManagedAiSessionForFormFill(selectedProviderId) && claudePty && managedProviderId === selectedProviderId) {
+    await restartManagedAiSessionForAuthRefresh(selectedProviderId);
+  }
   if (['codex', 'gemini'].includes(selectedProviderId)) {
     const playwrightSetup = await ensureProviderPlaywrightMcp(selectedProviderId, {
       env: selectedProviderId === 'gemini' ? buildManagedProviderEnv(selectedProviderId) : process.env,
@@ -2711,6 +3482,7 @@ async function runParallelAnalysisWorker(company, nodeExecutable) {
           elapsedMs: Date.now() - startedAtMs,
           analysis: parsed.analysis || null,
           message: typeof parsed.message === 'string' ? parsed.message : '',
+          messagePrompt: typeof parsed.messagePrompt === 'string' ? parsed.messagePrompt : '',
           formUrl: parsed.formUrl || company.formUrl || '',
           formResolutionMethod: parsed.formResolutionMethod || null,
           stdout,
@@ -2799,7 +3571,7 @@ async function executeBackendPhaseABatch(companies, providerId = getSelectedAiPr
 
 function buildClaudeFormFillPrompt(companies, sender, providerId = getManagedAiProvider(), options = {}) {
   const configuredScreenshotDir = settings.getScreenshotDir();
-  const promptScreenshotDir = path.join(PROJECT_ROOT, 'screenshots');
+  const promptScreenshotDir = configuredScreenshotDir;
   const autoSendSafe = typeof options.autoSendSafe === 'boolean'
     ? options.autoSendSafe
     : getManagedAiAutoSendSafe();
@@ -2826,11 +3598,14 @@ function buildClaudeFormFillPrompt(companies, sender, providerId = getManagedAiP
         confirm: path.join(promptScreenshotDir, `ss-${company.no}-confirm.png`),
         ...(autoSendSafe ? { sent: path.join(promptScreenshotDir, `ss-${company.no}-sent.png`) } : {}),
       },
+      messageDraft: trimMultilineText(phaseA && phaseA.message, 1500) || undefined,
       messageCore: compactMessageForPrompt(phaseA && phaseA.message, sender) || undefined,
+      messagePrompt: compactMessagePromptForPrompt(phaseA && phaseA.messagePrompt) || undefined,
       analysisHints: summarizePhaseAAnalysisForPrompt(phaseA && phaseA.analysis)
         .map((line) => trimOneLineText(String(line || '').replace(/^- /, ''), 160))
         .filter(Boolean)
         .slice(0, 4),
+      siteExcerpt: trimOneLineText(phaseA && phaseA.analysis && phaseA.analysis.siteTextExcerpt, 220) || undefined,
       automationHints: buildCompanyAutomationHints(company)
         .map((hint) => trimOneLineText(hint, 160))
         .filter(Boolean)
@@ -2864,14 +3639,18 @@ function buildClaudeFormFillPrompt(companies, sender, providerId = getManagedAiP
     approachPayload,
     '',
     'batch_rules:',
-    '- Phase A は backend 完了済み。再分析・再生成しない',
-    '- messageCore は本文コア。必要なら共有 sender_json を使って短い挨拶と署名を補う',
-    '- 本文コアは最小限の短縮以外で書き換えない',
+    '- Phase A は backend 完了済み。form 未解決時を除き、対象サイトを再分析しない',
+    '- messagePrompt がある場合は、それを使ってこの会社向けの本文を最終化してからフォーム入力する',
+    '- messageDraft は Phase A の草案、messageCore は要点、messagePrompt は本文生成コンテキスト。messagePrompt を優先し、messageDraft はフォールバックとして扱う',
+    '- 本文を書き換える場合でも、messagePrompt / analysisHints / siteExcerpt にない事実は足さない',
+    '- sender_json にない送信者情報は追加しない',
     '- unresolved form は site から Contact/お問い合わせ または common path を浅く確認する',
     '- 1社ずつ処理し、結果報告は簡潔にする',
     autoSendSafe
-      ? '- 安全と判断できたフォームだけ submitted。手動確認が必要なら awaiting_approval'
+      ? '- CAPTCHA / ロボチェッカー / 手動必須項目 / 営業NG / 不確実ケースを除き、確認画面が取れたら最終送信まで進めて submitted にする'
       : '- 送信は行わず awaiting_approval で止める',
+    '- 送信完了時は sent スクリーンショットを残し、送信済みタブは閉じる',
+    '- 送れない場合はタブを残して awaiting_approval / error にする',
     '',
     'companies_jsonl:',
     companyPayloadLines,
@@ -2915,7 +3694,7 @@ function writeClaudeFormFillPromptFile(companies, promptText, providerId = getMa
 }
 
 function writeWorkspaceClaudeFormFillPromptFile(companies, promptText, providerId = getManagedAiProvider()) {
-  const promptFile = path.join(PROJECT_ROOT, '.sales-claw-work', 'ai-prompts', `${providerId}-form-fill-${Date.now()}.md`);
+  const promptFile = resolveDataPath('.sales-claw-work', 'ai-prompts', `${providerId}-form-fill-${Date.now()}.md`);
   ensureParentDir(promptFile);
   const summary = (companies || []).map((company) => `- ${company.no}: ${company.companyName || company.name || '(unknown)'}`).join('\n');
   const content = [
@@ -2965,9 +3744,10 @@ function queueClaudeFormFillInManagedSession(companies, providerId = getManagedA
     `Sales Claw の batch payload を送ります。必ず ${provider.cliLabel} と MCP Playwright で実行してください。前回までの会話や未完了タスクは引き継がず、この batch だけを正として扱ってください。`,
     'Phase A は backend 完了済みです。再分析・再生成・settings 更新はしないでください。',
     autoSendSafe
-      ? '安全と判断できるフォームだけ自動送信してください。CAPTCHA / 手動確認 / 営業NGは awaiting_approval にしてください。'
+      ? 'CAPTCHA / ロボチェッカー / 手動必須項目 / 営業NG / 不確実ケース以外は、できるだけ自動送信してください。送信できたら sent スクショを残してタブを閉じ、送信できない場合だけタブを残して awaiting_approval にしてください。'
       : '送信は行わず、awaiting_approval で止めてください。',
     '本文は companies_jsonl の messageCore を基準に使い、必要なら sender_json の署名だけ補ってください。',
+    '送信完了時は ss-{No}-sent.png を残し、submitted が明確なタブは閉じてください。',
     '進行報告は簡潔にしてください。',
     '--- BEGIN SALES CLAW BATCH ---',
     promptText,
@@ -3043,7 +3823,58 @@ function queueClaudeFormFillInManagedSession(companies, providerId = getManagedA
 
 async function queueAiFormFill(companies, providerId = getSelectedAiProvider(), options = {}) {
   const normalizedProviderId = normalizeProviderId(providerId);
-  return queueClaudeFormFillInManagedSession(companies, normalizedProviderId, options);
+  const autoSendSafe = typeof options.autoSendSafe === 'boolean'
+    ? options.autoSendSafe
+    : getManagedAiAutoSendSafe();
+  const provider = getProvider(normalizedProviderId);
+  const controller = ensureManagedAiBatchController(normalizedProviderId, autoSendSafe);
+  const batches = chunkManagedAiCompanies(companies, MANAGED_AI_FORM_BATCH_SIZE);
+  const batchItems = batches.map((batchCompanies) => ({
+    id: `${Date.now()}-${++controller.batchCounter}`,
+    companies: batchCompanies,
+    options: buildManagedAiBatchOptionsSubset({
+      ...options,
+      autoSendSafe,
+    }, batchCompanies),
+  }));
+
+  controller.pending.push(...batchItems);
+  appendDiagnosticEvent('managed_ai_batches_enqueued', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+    batchCount: batchItems.length,
+    batchSize: MANAGED_AI_FORM_BATCH_SIZE,
+    activeBatchId: controller.activeBatch ? controller.activeBatch.id : null,
+    pendingBatchCount: controller.pending.length,
+  });
+  appendAiRunMetric('managed_ai_batches_enqueued', {
+    provider: normalizedProviderId,
+    companyCount: companies.length,
+    batchCount: batchItems.length,
+    batchSize: MANAGED_AI_FORM_BATCH_SIZE,
+    pendingBatchCount: controller.pending.length,
+  });
+
+  let dispatchResult = null;
+  if (!controller.activeBatch) {
+    dispatchResult = dispatchNextManagedAiFormFillBatch();
+  } else {
+    startManagedAiBatchPoller();
+  }
+
+  return {
+    ok: true,
+    count: companies.length,
+    provider: normalizedProviderId,
+    providerLabel: provider.displayName,
+    mode: `${provider.id}-cli-managed`,
+    autoSendSafe,
+    batchCount: batchItems.length,
+    batchSize: MANAGED_AI_FORM_BATCH_SIZE,
+    activeBatchId: controller.activeBatch ? controller.activeBatch.id : null,
+    pendingBatchCount: controller.pending.length + (controller.activeBatch ? 1 : 0),
+    ...(dispatchResult || {}),
+  };
 }
 
 async function startManagedAiSession(mode = 'default', providerId = getSelectedAiProvider(), options = {}) {
@@ -3072,7 +3903,7 @@ async function startManagedAiSession(mode = 'default', providerId = getSelectedA
   }
 
   if (claudePty) {
-    await stopManagedClaudePty();
+    await stopManagedClaudePty({ suppressAutoRecovery: true });
     claudePty = null;
   }
 
@@ -3107,41 +3938,74 @@ async function startManagedAiSession(mode = 'default', providerId = getSelectedA
   claudeProcessMode = mode;
   activeAiProvider = normalizedProviderId;
   managedAiAutoSendSafe = autoSendSafe;
+  clearManagedAiRecoveryTimer();
   resetManagedAiSessionState(normalizedProviderId);
+  resetManagedAiBatchController();
   invalidateAiStatusCache(normalizedProviderId);
 
   ptyProc.onData((data) => {
     updateManagedAiReadyFromOutput(normalizedProviderId, data);
+    appendManagedAiPtyLog(normalizedProviderId, data, 'output');
     broadcastPty({ type: 'output', data, provider: normalizedProviderId });
     detectCliIssuesFromOutput(data, normalizedProviderId);
   });
 
   ptyProc.onExit(({ exitCode }) => {
+    const recoverySnapshot = snapshotManagedAiBatchesForRecovery();
+    const suppressRecovery = managedAiSuppressAutoRecovery;
+    managedAiSuppressAutoRecovery = false;
     if (claudePty === ptyProc) {
       claudePty = null;
       clearManagedAiSessionStateTimers();
       managedAiSessionState = null;
       invalidateAiStatusCache(normalizedProviderId);
     }
-    try {
-      const { getLiveMonitorSummary, finishLiveMonitor: finishMon } = require('./live-monitor.cjs');
-      const summary = getLiveMonitorSummary();
-      const stuckSessions = (summary.events || []).filter(ev =>
-        ev && ev.active !== false && !['awaiting_approval', 'submitted', 'completed', 'skipped', 'error'].includes(ev.status)
-      );
-      stuckSessions.forEach(ev => {
-        try {
-          finishMon(ev.companyNo, {
-            status: 'error',
-            step: 'AIセッション終了 (exit code: ' + exitCode + ')',
-            companyName: ev.companyName || '',
-          });
-        } catch (_) {}
+    clearManagedAiRecoveryTimer();
+    if (!suppressRecovery && recoverySnapshot && recoverySnapshot.providerId === normalizedProviderId) {
+      managedAiRecoveryState = {
+        ...recoverySnapshot,
+        retries: 0,
+        inFlight: false,
+      };
+      appendDiagnosticEvent('managed_ai_recovery_queued', {
+        provider: normalizedProviderId,
+        exitCode,
+        batchCount: recoverySnapshot.batches.length,
       });
-      if (stuckSessions.length > 0) {
-        console.warn('[ai-exit] ' + stuckSessions.length + '社の未完了セッションをerrorに変更しました');
+      managedAiRecoveryTimer = setTimeout(() => {
+        tryRecoverManagedAiSession('pty-exit');
+      }, 2500);
+      if (typeof managedAiRecoveryTimer.unref === 'function') managedAiRecoveryTimer.unref();
+    } else {
+      resetManagedAiBatchController();
+      if (!managedAiRecoveryState || suppressRecovery) {
+        // suppressRecovery=true の場合は呼び出し元が再起動/復旧を制御する
+      } else {
+        managedAiRecoveryState = null;
       }
-    } catch (_) {}
+    }
+    if (!suppressRecovery && !recoverySnapshot) {
+      try {
+        const { getLiveMonitorSummary, finishLiveMonitor: finishMon } = require('./live-monitor.cjs');
+        const summary = getLiveMonitorSummary();
+        const stuckSessions = (summary.events || []).filter(ev =>
+          ev && ev.active !== false && !['awaiting_approval', 'submitted', 'completed', 'skipped', 'error'].includes(ev.status)
+        );
+        stuckSessions.forEach(ev => {
+          try {
+            finishMon(ev.companyNo, {
+              status: 'error',
+              step: 'AIセッション終了 (exit code: ' + exitCode + ')',
+              companyName: ev.companyName || '',
+            });
+          } catch (_) {}
+        });
+        if (stuckSessions.length > 0) {
+          console.warn('[ai-exit] ' + stuckSessions.length + '社の未完了セッションをerrorに変更しました');
+        }
+      } catch (_) {}
+    }
+    appendManagedAiPtyLog(normalizedProviderId, `process exited with code ${exitCode}`, 'system');
     broadcastPty({ type: 'exit', code: exitCode, provider: normalizedProviderId });
     notifyClients({ type: 'claude-exit', code: exitCode, provider: normalizedProviderId, time: Date.now() });
   });
@@ -3410,13 +4274,113 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
 }
 
 // データ読み込み → JSON API 用
+function syncSubmittedContactsToHistory({ orderedNos, rowMap, logsByCompany, historyMap, latestMonitorUrlByCompany }) {
+  let mutated = false;
+  (orderedNos || []).forEach((key) => {
+    const row = rowMap.get(key) || {};
+    const companyNo = row.no;
+    if (companyNo === undefined || companyNo === null || companyNo === '') return;
+
+    const logs = logsByCompany[key] || [];
+    const submittedLog = getLatestLog(logs, 'submitted');
+    if (!submittedLog) return;
+
+    const existingHistory = historyMap.get(String(companyNo)) || getHistory(companyNo) || null;
+    const contacts = existingHistory && Array.isArray(existingHistory.contacts) ? existingHistory.contacts : [];
+    const draftLog = getLatestLog(logs, 'message_draft');
+    const message = draftLog ? stringifyLogDetails(draftLog.details) : '';
+    const fallbackFormUrl = contacts.length > 0 ? String(contacts[contacts.length - 1].formUrl || '').trim() : '';
+    const formUrl = String(
+      getKnownFormUrl(companyNo, '', logs)
+      || latestMonitorUrlByCompany.get(String(companyNo))
+      || row.formUrl
+      || fallbackFormUrl
+      || ''
+    ).trim();
+    const submittedAt = String(submittedLog.timestamp || '').trim();
+
+    const alreadyRecorded = contacts.some((contact) => {
+      const recordedAt = String(contact.date || contact.timestamp || '').trim();
+      if (submittedAt && recordedAt === submittedAt) return true;
+      return !!message
+        && String(contact.message || '') === message
+        && String(contact.formUrl || '').trim() === formUrl;
+    });
+    if (alreadyRecorded) return;
+    const approvalArtifacts = getExpectedApprovalArtifacts(companyNo, {
+      logs,
+      formFillLog: getLatestLog(logs, 'form_fill'),
+      awaitingLog: getLatestLog(logs, 'awaiting_approval'),
+      confirmLog: getLatestLog(logs, 'confirm_reached'),
+      submittedLog,
+    });
+    const approvalScreenshot = approvalArtifacts
+      ? (approvalArtifacts.actual.sent || approvalArtifacts.screenshots.sent || approvalArtifacts.actual.confirm || approvalArtifacts.actual.input || approvalArtifacts.screenshots.confirm || approvalArtifacts.screenshots.input)
+      : null;
+    const nextHistory = ensureSubmittedContactHistory(
+      companyNo,
+      row.companyName || row.name || '',
+      submittedLog,
+      formUrl,
+      message,
+      existingHistory,
+      {
+        screenshot: approvalScreenshot || '',
+        sourceAction: 'submitted',
+        sourceActionAt: submittedAt || '',
+        status: 'submitted',
+        notes: 'submitted-sync',
+      },
+    );
+    if (nextHistory !== existingHistory) {
+      historyMap.set(String(companyNo), nextHistory);
+      mutated = true;
+    }
+  });
+  return mutated;
+}
+
+function getLatestContactEntry(contactHist) {
+  if (!contactHist || !Array.isArray(contactHist.contacts) || contactHist.contacts.length === 0) return null;
+  return contactHist.contacts[contactHist.contacts.length - 1] || null;
+}
+
+function getHistoryContactTimestamp(contact) {
+  return parseEventTimestampMs(contact && (contact.sourceActionAt || contact.date || contact.timestamp));
+}
+
+function doesHistoryContactRepresentSubmission(contact) {
+  if (!contact) return false;
+  const normalizedStatus = String(contact.status || contact.sourceAction || '').trim().toLowerCase();
+  if (!normalizedStatus) return true;
+  return ['submitted', 'sent', 'completed', 'dashboard-approve'].some((marker) => normalizedStatus.includes(marker));
+}
+
+function buildHistorySubmittedLog(companyNo, companyName, latestContact, fallbackLog = null) {
+  if (!doesHistoryContactRepresentSubmission(latestContact)) return fallbackLog;
+  const timestamp = String(latestContact.sourceActionAt || latestContact.date || latestContact.timestamp || '').trim();
+  return {
+    ...(fallbackLog || {}),
+    companyNo,
+    companyName,
+    action: 'submitted',
+    timestamp,
+    details: latestContact.notes || latestContact.response || 'contact-history',
+    source: 'contact-history',
+  };
+}
+
 function buildDashboardDataFromSources() {
+  const targetRepair = repairImportedTargetListIfNeeded();
+  if (targetRepair && targetRepair.repaired) {
+    appendDiagnosticEvent('target_list_repaired_from_import_source', targetRepair);
+  }
   const targetData = readTargetList();
   const targetRows = targetData.ok ? targetData.companies : [];
   const allLogs = getAllLogs();
-  const historySummary = getAllHistorySummary();
+  let historySummary = getAllHistorySummary();
   const _lang = settings.getSection('preferences').language || 'ja';
-  const historyMap = new Map(historySummary.map((entry) => [String(entry.companyNo), getHistory(entry.companyNo)]));
+  let historyMap = new Map(historySummary.map((entry) => [String(entry.companyNo), getHistory(entry.companyNo)]));
   const outreachTargets = getTargetMap();
   const monitorSummary = getLiveMonitorSummary();
   const liveEvents = monitorSummary && Array.isArray(monitorSummary.events) ? monitorSummary.events : [];
@@ -3512,6 +4476,11 @@ function buildDashboardDataFromSources() {
     }
   });
 
+  if (syncSubmittedContactsToHistory({ orderedNos, rowMap, logsByCompany, historyMap, latestMonitorUrlByCompany })) {
+    historySummary = getAllHistorySummary();
+    historyMap = new Map(historySummary.map((entry) => [String(entry.companyNo), getHistory(entry.companyNo)]));
+  }
+
   const companies = orderedNos.map((key) => {
     const row = rowMap.get(key) || {};
     const no = row.no;
@@ -3520,13 +4489,31 @@ function buildDashboardDataFromSources() {
     const isExcluded = !isDetachedFromTargetList && statusExclude.includes(status);
     const isApproachable = !isExcluded;
     const logs = logsByCompany[key] || [];
-    const lastLog = logs.length > 0 ? logs[logs.length - 1] : null;
+    const rawLastLog = logs.length > 0 ? logs[logs.length - 1] : null;
     const contactHist = historyMap.get(String(no)) || null;
-    const latestContact = contactHist && Array.isArray(contactHist.contacts) && contactHist.contacts.length > 0
-      ? contactHist.contacts[contactHist.contacts.length - 1]
-      : null;
+    const latestContact = getLatestContactEntry(contactHist);
     const effectiveName = row.companyName || (contactHist ? contactHist.companyName : '') || ((typeof no === 'number' || typeof no === 'string') ? String(no) : '');
-    const effectiveFormUrl = row.formUrl || latestMonitorUrlByCompany.get(String(no)) || (latestContact && latestContact.formUrl) || '';
+    const effectiveFormUrl = getKnownFormUrl(
+      no,
+      latestMonitorUrlByCompany.get(String(no)) || (latestContact && latestContact.formUrl) || row.formUrl || '',
+      logs,
+    );
+    const submittedLogFromLogs = getLatestLog(logs, 'submitted');
+    const latestContactImpliesSubmitted = doesHistoryContactRepresentSubmission(latestContact);
+    const latestContactSubmittedAtText = latestContactImpliesSubmitted
+      ? String(latestContact.sourceActionAt || latestContact.date || latestContact.timestamp || '').trim()
+      : '';
+    const latestContactSubmittedAtMs = getHistoryContactTimestamp(latestContact);
+    const rawLastLogAtMs = parseEventTimestampMs(rawLastLog && rawLastLog.timestamp);
+    const effectiveSubmittedLog = submittedLogFromLogs
+      || buildHistorySubmittedLog(no, effectiveName, latestContact);
+    const lastLog = latestContactSubmittedAtMs > rawLastLogAtMs
+      ? buildHistorySubmittedLog(no, effectiveName, latestContact, rawLastLog)
+      : rawLastLog;
+    const effectiveLastAction = lastLog ? lastLog.action : null;
+    const effectiveSubmittedAt = effectiveSubmittedLog
+      ? String(effectiveSubmittedLog.timestamp || '').trim()
+      : latestContactSubmittedAtText;
 
     stats.total++;
     if (!isDetachedFromTargetList && isExcluded) stats.excluded++;
@@ -3535,15 +4522,15 @@ function buildDashboardDataFromSources() {
       if (effectiveFormUrl) stats.hasFormUrl++; else stats.noFormUrl++;
     }
     if (lastLog) {
-      if (lastLog.action === 'form_fill') stats.formFill++;
-      if (lastLog.action === 'confirm_reached') stats.confirmReached++;
-      if (lastLog.action === 'awaiting_approval') stats.awaitingApproval++;
-      if (lastLog.action === 'submitted') stats.submitted++;
-      if (lastLog.action === 'error') stats.error++;
+      if (effectiveLastAction === 'form_fill') stats.formFill++;
+      if (effectiveLastAction === 'confirm_reached') stats.confirmReached++;
+      if (effectiveLastAction === 'awaiting_approval') stats.awaitingApproval++;
+      if (effectiveLastAction === 'submitted') stats.submitted++;
+      if (effectiveLastAction === 'error') stats.error++;
     }
 
     const formFillLog = getLatestLog(logs, 'form_fill');
-    const submittedLog = getLatestLog(logs, 'submitted');
+    const submittedLog = effectiveSubmittedLog;
     const siteAnalysis = getLatestLog(logs, 'site_analysis');
     const awaitingLog = getLatestLog(logs, 'awaiting_approval');
     const confirmLog = getLatestLog(logs, 'confirm_reached');
@@ -3562,7 +4549,7 @@ function buildDashboardDataFromSources() {
     const lastErrorDetail = stringifyLogDetails(errorLog ? errorLog.details : '');
     const requiresManualReview = !!screenshot.readyForManualApproval;
 
-    if (lastLog && ['form_fill', 'confirm_reached', 'awaiting_approval'].includes(lastLog.action)) {
+    if (effectiveLastAction && ['form_fill', 'confirm_reached', 'awaiting_approval'].includes(effectiveLastAction)) {
       stats.actionNeeded++;
     }
 
@@ -3578,7 +4565,7 @@ function buildDashboardDataFromSources() {
       outreachStatus: null,
       outreachDetail: null,
       outreachUpdatedAt: null,
-      lastAction: lastLog ? lastLog.action : null,
+      lastAction: effectiveLastAction,
       lastActionAt: lastLog ? lastLog.timestamp : null,
       lastLog,
       logs: logs.slice(-3).map(l => ({
@@ -3587,10 +4574,12 @@ function buildDashboardDataFromSources() {
       })),
       hasInputScreenshot: screenshot.hasInput,
       hasConfirmScreenshot: screenshot.hasConfirm,
+      hasSentScreenshot: screenshot.hasSent,
       hasAnyScreenshot: screenshot.hasAny,
       screenshotAuditState: screenshot.auditState,
       inputScreenshotName: screenshot.input ? path.basename(screenshot.input) : null,
       confirmScreenshotName: screenshot.confirm ? path.basename(screenshot.confirm) : null,
+      sentScreenshotName: screenshot.sent ? path.basename(screenshot.sent) : null,
       readyForApproval: screenshot.readyForApproval,
       readyForManualApproval: requiresManualReview,
       manualReviewReason: screenshot.manualReviewReason || '',
@@ -3599,7 +4588,7 @@ function buildDashboardDataFromSources() {
       directSubmitDetected: screenshot.directSubmitDetected,
       sentMessage: displayDraftMessage,
       hasDraftMessage: !!displayDraftMessage,
-      sentAt: submittedLog ? submittedLog.timestamp : null,
+      sentAt: effectiveSubmittedAt || null,
       analysis: siteAnalysis ? siteAnalysis.details : null,
       awaitingAt: awaitingLog ? awaitingLog.timestamp : (confirmLog ? confirmLog.timestamp : null),
       lastActionDetail,
@@ -3625,11 +4614,27 @@ function buildDashboardDataFromSources() {
   }
   allLogs.forEach((log) => {
     if (!log.timestamp || log.companyNo == null) return;
-    const idx = trendIndexByDay.get(log.timestamp.slice(0, 10));
+    const timestamp = log.timestamp instanceof Date ? log.timestamp.toISOString() : String(log.timestamp || '');
+    const idx = trendIndexByDay.get(timestamp.slice(0, 10));
     if (idx === undefined) return;
     if (log.action === 'form_fill' || log.action === 'confirm_reached' || log.action === 'awaiting_approval') trendActionNeededSets[idx].add(log.companyNo);
     if (log.action === 'submitted') trendSentSets[idx].add(log.companyNo);
     if (log.action === 'error') trendErrorSets[idx].add(log.companyNo);
+  });
+  historyMap.forEach((history, companyNo) => {
+    const contacts = history && Array.isArray(history.contacts) ? history.contacts : [];
+    contacts.forEach((contact) => {
+      if (String(contact && contact.status || '').trim() !== 'submitted') return;
+      const dateValue = contact.sourceActionAt || contact.date || contact.sentAt || '';
+      const isoDay = (() => {
+        const parsed = Date.parse(String(dateValue || ''));
+        return Number.isFinite(parsed) ? new Date(parsed).toISOString().slice(0, 10) : '';
+      })();
+      if (!isoDay) return;
+      const idx = trendIndexByDay.get(isoDay);
+      if (idx === undefined) return;
+      trendSentSets[idx].add(Number(companyNo));
+    });
   });
   const trendActionNeeded = trendActionNeededSets.map((set) => set.size);
   const trendSent = trendSentSets.map((set) => set.size);
@@ -3641,7 +4646,7 @@ function buildDashboardDataFromSources() {
     stats,
     recentLogs: allLogs.slice(-100).reverse(),
     issues: buildOperationalIssues(targetData, runtime),
-    liveMonitor: buildMonitorPayload(),
+    liveMonitor: buildMonitorPayload(allLogs),
     runtime,
     trendData: { labels: trendLabels, actionNeeded: trendActionNeeded, sent: trendSent, error: trendError },
   };
@@ -3687,6 +4692,7 @@ function jsonResponse(res, statusCode, data, extraHeaders = {}) {
 // HTML テンプレート
 function buildPage() {
   const _lang = settings.getSection('preferences').language || 'ja';
+  const _tz = settings.getSection('preferences').timezone || 'Asia/Tokyo';
   const _t = getTranslations(_lang);
   const buildMeta = getBuildSourceMeta(_lang);
   const settingsTag = (kind) => `<span class="settings-field-chip ${kind}">${_t['settings.tag.' + kind] || kind}</span>`;
@@ -4615,13 +5621,24 @@ contain-intrinsic-size:84px;
 
   <!-- Sent tab -->
   <div class="tab-content" id="tab-sent">
-    <div style="background:#fff;border:1px solid var(--outline-variant);border-bottom:2px solid #198038;padding:10px 16px;display:flex;align-items:center;flex-wrap:wrap;gap:8px">
-      <span class="material-symbols-outlined" style="font-size:16px;color:#198038">mark_email_read</span>
-      <input type="text" id="sentSearch" class="form-control-sm" style="width:200px" placeholder="${_t['sent.search']}">
-      <button class="fb-sent fb active" data-sf="all">${_t['sent.all']}</button>
-      <button class="fb-sent fb" data-sf="1">${_t['sent.firstOnly']}</button>
-      <button class="fb-sent fb" data-sf="2+">${_t['sent.multipleOnly']}</button>
-      <small style="margin-left:auto;font-family:var(--font-mono);font-size:.65rem;color:var(--outline)" id="sentCount">0 items</small>
+    <div style="background:#fff;border:1px solid var(--outline-variant);border-bottom:2px solid #198038;padding:12px 16px;display:flex;align-items:center;flex-wrap:wrap;gap:10px">
+      <div style="display:flex;align-items:center;gap:8px;min-width:0">
+        <span class="material-symbols-outlined" style="font-size:16px;color:#198038">mark_email_read</span>
+        <div style="display:flex;flex-direction:column;gap:2px">
+          <strong style="font-size:.76rem;color:var(--on-surface)">${_t['sent.panelTitle'] || (_lang === 'ja' ? '送信済みログ' : 'Sent log')}</strong>
+          <span style="font-size:.66rem;color:var(--outline)">${_t['sent.panelHint'] || (_lang === 'ja' ? '企業名・種別・本文・フォームURLで絞り込みできます' : 'Filter by company, type, message body, or form URL.')}</span>
+        </div>
+      </div>
+      <input type="text" id="sentSearch" class="form-control-sm" style="width:280px;max-width:100%" placeholder="${_t['sent.search'] || (_lang === 'ja' ? '企業名・種別・本文・フォームURLで検索...' : 'Search company, type, message, or URL...')}">
+      <select id="sentTypeFilter" class="form-control-sm" style="width:180px;max-width:100%">
+        <option value="">${_lang === 'ja' ? '種別: すべて' : 'Type: All'}</option>
+      </select>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <button class="fb-sent fb active" data-sf="all">${_t['sent.all']}</button>
+        <button class="fb-sent fb" data-sf="1">${_t['sent.firstOnly']}</button>
+        <button class="fb-sent fb" data-sf="2+">${_t['sent.multipleOnly']}</button>
+      </div>
+      <small style="margin-left:auto;font-family:var(--font-mono);font-size:.68rem;color:var(--outline)" id="sentCount">0 items</small>
     </div>
     <div id="sentList" style="padding:16px;background:var(--bg-base)"></div>
   </div>
@@ -5383,6 +6400,7 @@ contain-intrinsic-size:84px;
 
 <script>
 const LANG = ${serializeForInlineScript(_lang)};
+const PREF_TZ = ${serializeForInlineScript(_tz)};
 const I18N = ${serializeForInlineScript(_t)};
 const AVAILABLE_AI_PROVIDERS = ${serializeForInlineScript(providerOptions)};
 const DASHBOARD_SESSION_TOKEN = ${serializeForInlineScript(ensureDashboardSessionToken())};
@@ -6134,6 +7152,10 @@ const actionBadge=a=>{
 let currentFilter='all';
 let prevStats={};
 let _activeMainTab = 'companies';
+let _currentLiveMonitorState = null;
+let _monitorCliFeed = [];
+let _ptyProgressBuffer = '';
+let _lastPtyProgressNotice = { text: '', at: 0 };
 const _sectionRenderState = {
   liveMonitor: { signature: '', rendered: false },
   companies: { signature: '', rendered: false },
@@ -6216,14 +7238,59 @@ function buildAwaitingSectionSignature(companies) {
 function buildSentSectionSignature(companies) {
   return (companies || []).map((company) => [
     company.no,
+    compactSignatureValue(company.name),
+    compactSignatureValue(company.type),
     compactSignatureValue(company.sentAt),
     compactSignatureValue(company.sentMessage),
     compactSignatureValue(company.formUrl),
     compactSignatureValue(company.contactCount),
     compactSignatureValue(company.inputScreenshotName),
     compactSignatureValue(company.confirmScreenshotName),
+    compactSignatureValue(company.sentScreenshotName),
     compactSignatureValue(company.contactHistory ? JSON.stringify(company.contactHistory) : ''),
   ].join('|')).join('\\n');
+}
+
+function formatCompactDateTime(value) {
+  if (!value) return '';
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return '';
+  return new Date(ms).toLocaleString(LANG === 'ja' ? 'ja-JP' : undefined, {
+    timeZone: PREF_TZ,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function stripAnsiText(value) {
+  return String(value || '').replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+}
+
+function extractTerminalProgressText(line) {
+  const cleaned = stripAnsiText(line).replace(/\\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (/^(─+|❯|◼|◻|n______n|\\(.*\\)|sent \\d+ chars|5h\\[|7d\\[)/i.test(cleaned)) return '';
+  if (/^\\[[A-Z]+\\]/.test(cleaned)) return '';
+  if (/^Did \\d+ search/i.test(cleaned)) return '';
+  const normalized = cleaned.replace(/^●\\s+/, '');
+  if (!/(phase|フォーム|問い合わせ|メッセージ|送信|確認待ち|検索|探索|分析|スクショ|screenshot|search|navigate|fill|submit|captcha|thanks|queued|running|site|message|draft|approval)/i.test(normalized)) {
+    return '';
+  }
+  return truncateUiTextClient(normalized, 180);
+}
+
+function ingestPtyProgress(text) {
+  if (!text) return;
+  _ptyProgressBuffer += stripAnsiText(text).replace(/\\r/g, '\\n');
+  const parts = _ptyProgressBuffer.split('\\n');
+  _ptyProgressBuffer = parts.pop() || '';
+  parts.forEach((line) => {
+    const summary = extractTerminalProgressText(line);
+    if (!summary) return;
+    pushMonitorCliEvent(summary, 'step', new Date().toISOString());
+  });
 }
 
 function buildLiveMonitorSectionSignature(monitor) {
@@ -6431,6 +7498,19 @@ function populateCompanyFilterOptions(companies) {
   if (currentProgress && Array.from(progressSelect.options).some(function(option) { return option.value === currentProgress; })) progressSelect.value = currentProgress;
 }
 
+function populateSentTypeFilterOptions(companies) {
+  const typeSelect = document.getElementById('sentTypeFilter');
+  if (!typeSelect) return;
+  const currentType = String(typeSelect.value || '').trim().toLowerCase();
+  const typeOptions = Array.from(new Set((companies || []).map((company) => String(company.type || '').trim()).filter(Boolean)))
+    .sort((a, b) => a.localeCompare(b, LANG === 'ja' ? 'ja' : undefined));
+  typeSelect.innerHTML = '<option value="">' + (LANG === 'ja' ? '種別: すべて' : 'Type: All') + '</option>'
+    + typeOptions.map((value) => '<option value="' + esc(value.toLowerCase()) + '">' + esc(value) + '</option>').join('');
+  if (currentType && Array.from(typeSelect.options).some((option) => option.value === currentType)) {
+    typeSelect.value = currentType;
+  }
+}
+
 function applyCompanyFilters() {
   const q = (document.getElementById('q').value || '').toLowerCase();
   const typeFilter = (document.getElementById('companyTypeFilter')?.value || '').toLowerCase();
@@ -6549,6 +7629,18 @@ function openCompanyEditModal(companyNo) {
   const addTarget = document.getElementById('new-addTarget');
   if (addTarget) addTarget.checked = !!company.isOutreachTarget;
   document.getElementById('companyFormModal').classList.add('open');
+}
+
+function handleCompanyRowClick(companyNo, event) {
+  const target = event && event.target ? event.target : null;
+  if (target && target.closest('a,button,input,textarea,select,label')) return;
+  const company = _allCompanies.find((entry) => String(entry.no) === String(companyNo));
+  if (!company) return;
+  if (company.canManageInTargetList) {
+    openCompanyEditModal(companyNo);
+    return;
+  }
+  showCompanyDetail(companyNo, event);
 }
 
 document.getElementById('companyFormModal').addEventListener('click', function (event) {
@@ -7011,20 +8103,8 @@ function requestDashboardRefresh(options = {}) {
   }, delay);
 }
 
-function renderLiveMonitor(monitor) {
-  const statusEl = document.getElementById('monitorStatusChip');
-  const updatedAtEl = document.getElementById('monitorUpdatedAt');
-  const activeSummaryEl = document.getElementById('monitorActiveSummary');
-  const eventListEl = document.getElementById('monitorEventList');
-  const companyEl = document.getElementById('monitorCompany');
-  const stepEl = document.getElementById('monitorStep');
-  const urlEl = document.getElementById('monitorCurrentUrl');
-  const screenshotWrap = document.getElementById('monitorScreenshotWrap');
-  const screenshotLink = document.getElementById('monitorScreenshotLink');
-  if (!statusEl || !updatedAtEl || !activeSummaryEl || !eventListEl || !companyEl || !stepEl || !urlEl || !screenshotWrap || !screenshotLink) return;
-
-  const status = monitor && monitor.status ? monitor.status : 'idle';
-  const locale = LANG === 'ja' ? 'ja-JP' : undefined;
+function getMonitorStatusMeta(status) {
+  const normalizedStatus = status || 'idle';
   const labels = {
     idle: LANG === 'ja' ? '待機中' : 'Idle',
     queued: LANG === 'ja' ? 'キュー投入済み' : 'Queued',
@@ -7047,23 +8127,109 @@ function renderLiveMonitor(monitor) {
     user_required: { bg: 'var(--warning-container)', fg: 'var(--warning)' },
     error: { bg: 'var(--error-container)', fg: 'var(--error)' },
   };
-  const dotColors = { processing:'#3b82f6', awaiting_approval:'#f59e0b', user_required:'#f59e0b', error:'#ef4444', submitted:'#10b981', completed:'#10b981', queued:'#6366f1' };
-  const tone = styles[status] || styles.idle;
-  const events = monitor && Array.isArray(monitor.events) ? monitor.events : [];
+  const dotColors = {
+    processing: '#3b82f6',
+    awaiting_approval: '#f59e0b',
+    user_required: '#f59e0b',
+    error: '#ef4444',
+    submitted: '#10b981',
+    completed: '#10b981',
+    queued: '#6366f1',
+    skipped: '#94a3b8',
+    idle: '#94a3b8',
+  };
+  return {
+    status: normalizedStatus,
+    label: labels[normalizedStatus] || normalizedStatus,
+    tone: styles[normalizedStatus] || styles.idle,
+    dotColor: dotColors[normalizedStatus] || '#94a3b8',
+  };
+}
+
+function buildMonitorActivityFeed(monitor) {
+  const monitorEvents = monitor && Array.isArray(monitor.events)
+    ? monitor.events
+        .filter(Boolean)
+        .map((event) => ({ ...event, sourceType: 'monitor' }))
+    : [];
+  const cliEvents = Array.isArray(_monitorCliFeed)
+    ? _monitorCliFeed.map((event) => ({ ...event, sourceType: 'cli' }))
+    : [];
+  return [...cliEvents, ...monitorEvents]
+    .sort((a, b) => new Date(b.updatedAt || b.time || 0).getTime() - new Date(a.updatedAt || a.time || 0).getTime())
+    .slice(0, 30);
+}
+
+function pushMonitorCliEvent(message, type, time) {
+  const normalizedType = String(type || 'info').toLowerCase();
+  const status = normalizedType === 'error'
+    ? 'error'
+    : normalizedType === 'warn' || normalizedType === 'warning'
+      ? 'user_required'
+      : normalizedType === 'thinking' || normalizedType === 'step'
+        ? 'processing'
+        : normalizedType === 'action'
+          ? 'queued'
+          : 'idle';
+  const step = String(message || '').trim();
+  if (!step) return;
+  const now = Date.now();
+  if (_lastPtyProgressNotice.text === step && (now - _lastPtyProgressNotice.at) < 1200) return;
+  _lastPtyProgressNotice = { text: step, at: now };
+  const entry = {
+    companyName: LANG === 'ja' ? 'CLI通知' : 'CLI Activity',
+    companyNo: null,
+    step,
+    status,
+    updatedAt: time || new Date().toISOString(),
+  };
+  _monitorCliFeed = [entry, ..._monitorCliFeed]
+    .filter((event, index, list) => index === list.findIndex((candidate) =>
+      candidate.step === event.step && candidate.status === event.status && candidate.updatedAt === event.updatedAt))
+    .slice(0, 20);
+  if (!_liveMonitorOpen) {
+    _monitorUnreadCount += 1;
+    updateMonitorBadge();
+    showMonitorToast(entry.companyName, step, status);
+  }
+  if (_latestDashboardData && _latestDashboardData.liveMonitor) {
+    renderLiveMonitor(_latestDashboardData.liveMonitor);
+  }
+}
+
+function renderLiveMonitor(monitor) {
+  _currentLiveMonitorState = monitor || null;
+  const statusEl = document.getElementById('monitorStatusChip');
+  const updatedAtEl = document.getElementById('monitorUpdatedAt');
+  const activeSummaryEl = document.getElementById('monitorActiveSummary');
+  const eventListEl = document.getElementById('monitorEventList');
+  const companyEl = document.getElementById('monitorCompany');
+  const stepEl = document.getElementById('monitorStep');
+  const urlEl = document.getElementById('monitorCurrentUrl');
+  const screenshotWrap = document.getElementById('monitorScreenshotWrap');
+  const screenshotLink = document.getElementById('monitorScreenshotLink');
+  if (!statusEl || !updatedAtEl || !activeSummaryEl || !eventListEl || !companyEl || !stepEl || !urlEl || !screenshotWrap || !screenshotLink) return;
+
+  const status = monitor && monitor.status ? monitor.status : 'idle';
+  const locale = LANG === 'ja' ? 'ja-JP' : undefined;
+  const statusMeta = getMonitorStatusMeta(status);
+  const rawMonitorEvents = monitor && Array.isArray(monitor.events) ? monitor.events : [];
+  const events = buildMonitorActivityFeed(monitor);
   const activeCount = monitor && Number.isFinite(Number(monitor.activeCount)) ? Number(monitor.activeCount) : 0;
-  statusEl.textContent = labels[status] || status;
-  statusEl.style.background = tone.bg;
-  statusEl.style.color = tone.fg;
+  _monitorBaseStatus = statusMeta.status;
+  statusEl.textContent = statusMeta.label;
+  statusEl.style.background = statusMeta.tone.bg;
+  statusEl.style.color = statusMeta.tone.fg;
   const dot = document.getElementById('monitorDot');
   if (dot) {
-    dot.style.background = dotColors[status] || '#94a3b8';
+    dot.style.background = statusMeta.dotColor;
     dot.className = status === 'processing' ? 'monitor-dot-active' : '';
   }
   updatedAtEl.textContent = monitor && monitor.updatedAt ? new Date(monitor.updatedAt).toLocaleString(locale) : '-';
   activeSummaryEl.textContent = activeCount > 0
     ? (LANG === 'ja'
-        ? (activeCount + '件進行中 / 最新: ' + (labels[status] || status))
-        : (activeCount + ' active / latest: ' + (labels[status] || status)))
+        ? (activeCount + '件進行中 / 最新: ' + statusMeta.label)
+        : (activeCount + ' active / latest: ' + statusMeta.label))
     : (events.length > 0
         ? (LANG === 'ja' ? '直近の処理履歴を表示しています' : 'Showing recent activity')
         : (LANG === 'ja' ? '待機中' : 'Idle'));
@@ -7075,8 +8241,8 @@ function renderLiveMonitor(monitor) {
   } else {
     eventListEl.innerHTML = events.slice(0, 20).map((event, index) => {
       const eventStatus = event && event.status ? event.status : 'idle';
-      const eventTone = styles[eventStatus] || styles.idle;
-      const dotColor = dotColors[eventStatus] || '#94a3b8';
+      const eventMeta = getMonitorStatusMeta(eventStatus);
+      const dotColor = eventMeta.dotColor;
       const companyLabel = event && event.companyName
         ? ((event.companyNo ? '#' + event.companyNo + ' ' : '') + event.companyName)
         : (LANG === 'ja' ? '対象未設定' : 'Unknown target');
@@ -7092,7 +8258,7 @@ function renderLiveMonitor(monitor) {
         +     '</div>'
         +     (stepLabel ? '<div style="font-size:.66rem;color:var(--text-2);margin-top:1px;line-height:1.35">' + esc(stepLabel) + '</div>' : '')
         +   '</div>'
-        +   '<span style="font-size:.54rem;font-weight:700;padding:1px 6px;border-radius:999px;background:' + eventTone.bg + ';color:' + eventTone.fg + ';flex-shrink:0;white-space:nowrap;margin-top:2px">' + esc(labels[eventStatus] || eventStatus) + '</span>'
+        +   '<span style="font-size:.54rem;font-weight:700;padding:1px 6px;border-radius:999px;background:' + eventMeta.tone.bg + ';color:' + eventMeta.tone.fg + ';flex-shrink:0;white-space:nowrap;margin-top:2px">' + esc(eventMeta.label) + '</span>'
         + '</div>';
     }).join('');
   }
@@ -7126,19 +8292,19 @@ function renderLiveMonitor(monitor) {
   }
 
   // Chat-bot style notification when panel is closed
-  if (typeof _lastMonitorEventCount !== 'undefined' && events.length > _lastMonitorEventCount && _lastMonitorEventCount > 0) {
-    const newCount = events.length - _lastMonitorEventCount;
+  if (typeof _lastMonitorEventCount !== 'undefined' && rawMonitorEvents.length > _lastMonitorEventCount && _lastMonitorEventCount > 0) {
+    const newCount = rawMonitorEvents.length - _lastMonitorEventCount;
     if (!_liveMonitorOpen) {
       _monitorUnreadCount += newCount;
       updateMonitorBadge();
-      const latest = events[0];
+      const latest = rawMonitorEvents[0];
       if (latest) {
         const cLabel = latest.companyName ? ((latest.companyNo ? '#' + latest.companyNo + ' ' : '') + latest.companyName) : '-';
         showMonitorToast(cLabel, latest.step || '-', latest.status || 'idle');
       }
     }
   }
-  _lastMonitorEventCount = events.length;
+  _lastMonitorEventCount = rawMonitorEvents.length;
 }
 
 function renderStatusBanner(data) {
@@ -7282,6 +8448,10 @@ function render(data){
 
     const cnt=c.contactCount||0;
     const cntHtml=cnt===0?'<span class="text-muted">-</span>':cnt===1?'<span class="badge bg-success">1x</span>':'<span class="badge bg-info">'+cnt+'x</span>';
+    const sentDateLabel=c.sentAt?new Date(c.sentAt).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'';
+    const sentCellHtml=c.sentAt
+      ? '<div style="display:flex;flex-direction:column;gap:2px;align-items:center"><span style="font-size:.72rem;font-family:var(--font-mono);color:#198754;font-weight:700">'+esc(sentDateLabel)+'</span>'+(cnt>0?'<span style="font-size:.62rem;color:var(--outline)">'+cnt+'x</span>':'')+'</div>'
+      : cntHtml;
 
     let msgHtml='<span class="text-muted" style="font-size:.72rem">' + esc(t('message.notLogged') || '-') + '</span>';
     if(c.sentMessage){
@@ -7335,13 +8505,13 @@ function render(data){
       : (LANG==='ja'?'履歴のみの行も削除対象として選択できます':'History-only rows can also be selected for deletion');
     const selectCellHtml = '<input type="checkbox" class="form-check-input company-select" data-manageable="'+(c.canManageInTargetList?'1':'0')+'" data-no="'+c.no+'" title="'+selectTitle+'" onchange="toggleCompanySelection('+c.no+', this.checked)">';
 
-    html+='<tr class="'+excl+upd+'" data-f="'+f+'" data-targeted="'+(c.isOutreachTarget?'1':'0')+'" data-n="'+esc(c.name).toLowerCase()+'" data-no="'+c.no+'" data-la="'+(c.lastAction||'')+'" data-type="'+esc(c.type).toLowerCase()+'" data-type-exact="'+esc((c.type||'').trim().toLowerCase())+'" data-cnt="'+cnt+'" data-progress="'+(c.lastAction||'')+'" data-progress-exact="'+esc((c.lastAction||'').trim().toLowerCase())+'" data-search="'+esc(searchText)+'" style="display:'+display+'" onclick="showCompanyDetail('+c.no+',event)">'
+    html+='<tr class="'+excl+upd+'" data-f="'+f+'" data-targeted="'+(c.isOutreachTarget?'1':'0')+'" data-n="'+esc(c.name).toLowerCase()+'" data-no="'+c.no+'" data-la="'+(c.lastAction||'')+'" data-type="'+esc(c.type).toLowerCase()+'" data-type-exact="'+esc((c.type||'').trim().toLowerCase())+'" data-cnt="'+cnt+'" data-sent-at="'+(c.sentAt?new Date(c.sentAt).getTime():0)+'" data-progress="'+(c.lastAction||'')+'" data-progress-exact="'+esc((c.lastAction||'').trim().toLowerCase())+'" data-search="'+esc(searchText)+'" style="display:'+display+'" onclick="handleCompanyRowClick('+c.no+',event)">'
       +'<td class="checkbox-cell" onclick="event.stopPropagation()">'+selectCellHtml+'</td>'
       +'<td>'+c.no+'</td>'
       +'<td title="'+esc(c.name)+(c.isOutreachTarget?' [営業対象]':'')+(c.isDetachedFromTargetList?' [履歴のみ]':'')+'">'+companyUrlHtml+((targetBadge||detachedBadge)?'<div class="company-meta">'+targetBadge+detachedBadge+'</div>':'')+'</td>'
       +'<td title="'+esc(c.type)+'"><small>'+esc(c.type)+'</small></td>'
       +'<td title="'+esc(c.lastAction||'-')+(c.lastErrorDetail?' | '+esc(c.lastErrorDetail):'')+'">'+progressHtml+'</td>'
-      +'<td class="text-center">'+cntHtml+'</td>'
+      +'<td class="text-center">'+sentCellHtml+'</td>'
       +'<td title="'+esc(c.formUrl||'-')+'">'+(c.formUrl?'<a href="'+esc(c.formUrl)+'" target="_blank" onclick="event.stopPropagation()" title="'+esc(c.formUrl)+'">'+esc(c.formUrl).substring(0,30)+'…</a>':'-')+'</td>'
       +'<td title="'+(c.sentMessage?esc(c.sentMessage).substring(0,100):'')+'">'+msgHtml+'</td>'
       +'<td class="action-cell" onclick="event.stopPropagation()">'+actionHtml+'</td>'
@@ -7363,7 +8533,7 @@ function render(data){
   if (shouldRenderLogsNow) {
     const lbody=document.getElementById('logBody');
     lbody.innerHTML=recentLogs.map(l=>{
-      const t=new Date(l.timestamp).toLocaleString('ja-JP');
+      const t=new Date(l.timestamp).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
       const actionBg={error:'#da1e28',submitted:'#198038',confirm_reached:'#f59e0b',analyzing:'#0043ce',form_fill:'#6929c4',skip:'#6f6f6f'};
       const bg=actionBg[l.action]||'#393939';
       const fgDark=['confirm_reached'];
@@ -7391,22 +8561,26 @@ function render(data){
       awEl.innerHTML='<div class="text-center text-muted py-4">'+t('awaiting.empty')+'</div>';
     }else{
       awEl.innerHTML=awaitingCompanies.map(c=>{
-      const date=c.awaitingAt?new Date(c.awaitingAt).toLocaleString('ja-JP'):'-';
+      const date=c.awaitingAt?new Date(c.awaitingAt).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ}):'-';
       const msgBody=c.sentMessage
         ? esc(c.sentMessage).split(String.fromCharCode(10)).join('<br>')
         : '<span style="color:var(--error);font-weight:700">' + t('message.missingDraft') + '</span>';
       const screenshotState=c.screenshotAuditState||'missing';
       const inputScreenshotSrc=c.inputScreenshotName?screenshotUrl(c.inputScreenshotName):'';
       const confirmScreenshotSrc=c.confirmScreenshotName?screenshotUrl(c.confirmScreenshotName):'';
+      const primaryScreenshotSrc=confirmScreenshotSrc||inputScreenshotSrc;
       const manualReason=esc(c.manualReviewReason || (LANG==='ja' ? 'ブラウザで手動送信してください。' : 'Complete the final submission manually in the browser.'));
       const manualDetail=esc(c.manualReviewDetail || c.manualReviewReason || '');
       const manualBanner=(screenshotState==='manual-send-pending'||screenshotState==='direct-submit')
         ? '<div style="background:var(--warning-container);color:var(--warning);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+manualReason+(manualDetail?'<div style="margin-top:6px;font-weight:600;color:var(--on-surface-variant)">'+manualDetail+'</div>':'')+'</div>'
         : '';
+      const inputOnlyBanner=screenshotState==='input-only'
+        ? '<div style="background:var(--warning-container);color:var(--warning);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+t('awaiting.auditInputOnly')+'</div>'
+        : '';
       const ssConfirm=screenshotState==='confirm'
         ?'<img src="'+confirmScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Confirm screenshot">'
         : (screenshotState==='manual-send-pending'||screenshotState==='direct-submit')
-          ?'<div style="display:flex;flex-direction:column;gap:6px"><img src="'+inputScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Input screenshot"><div style="background:var(--warning-container);color:var(--warning);font-size:.68rem;font-weight:700;padding:8px 10px;line-height:1.6">'+manualReason+'</div></div>'
+          ?'<div style="display:flex;flex-direction:column;gap:6px">'+(primaryScreenshotSrc?'<img src="'+primaryScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Input screenshot">':'')+'<div style="background:var(--warning-container);color:var(--warning);font-size:.68rem;font-weight:700;padding:8px 10px;line-height:1.6">'+manualReason+'</div></div>'
         : screenshotState==='input-only'
           ?'<div style="display:flex;flex-direction:column;gap:6px"><img src="'+inputScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Input screenshot"><div style="background:var(--warning-container);color:var(--warning);font-size:.68rem;font-weight:700;padding:8px 10px;line-height:1.6">'+t('awaiting.auditPartial')+'</div></div>'
           :'<div style="background:var(--error-container);color:var(--error);font-size:.72rem;font-weight:700;padding:12px;line-height:1.7;border:1px solid var(--error);min-height:140px;display:flex;align-items:center;justify-content:center;text-align:center">'+t('awaiting.auditMissingScreenshot')+'</div>';
@@ -7436,7 +8610,7 @@ function render(data){
         +ssConfirm
         +'</div>'
         +'<div style="flex:1;padding:14px 16px;display:flex;flex-direction:column;gap:12px">'
-        +((screenshotState==='manual-send-pending'||screenshotState==='direct-submit')?manualBanner:(screenshotState!=='confirm'?'<div style="background:var(--error-container);color:var(--error);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+t('awaiting.auditBlocked')+'</div>':''))
+        +((screenshotState==='manual-send-pending'||screenshotState==='direct-submit')?manualBanner:(screenshotState==='input-only'?inputOnlyBanner:(screenshotState!=='confirm'?'<div style="background:var(--error-container);color:var(--error);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+t('awaiting.auditBlocked')+'</div>':'')))
         +'<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">'
         +'<div style="font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline)">'+t('awaiting.messageTitle')+'</div>'
         +(c.sentMessage?'<button class="btn btn-outline-secondary btn-sm py-0 px-1" style="font-size:.68rem" onclick="showMsg('+c.no+')">'+t('message.openFull')+'</button>':'')
@@ -7459,11 +8633,12 @@ function render(data){
 
   // Sent list
   const sentCompanies=companies.filter(c=>c.sentAt).sort((a,b)=>new Date(b.sentAt)-new Date(a.sentAt));
-  document.getElementById('sentCount').textContent=sentCompanies.length+' items';
+  document.getElementById('sentCount').textContent=sentCompanies.length+' '+(LANG==='ja'?'件':'items');
   const sentListKey = buildSentListRenderKey(companies);
   const shouldRenderSentNow = activeTab === 'sent' && shouldRenderSection('sent', sentListKey);
   if (shouldRenderSentNow) {
     const sentEl=document.getElementById('sentList');
+    populateSentTypeFilterOptions(sentCompanies);
     if(sentCompanies.length===0){
       sentEl.innerHTML='<div class="text-center text-muted py-4">'+t('sent.empty')+'</div>';
     }else{
@@ -7477,7 +8652,7 @@ function render(data){
           +'<div style="position:relative;padding-left:20px">'
           +'<div style="position:absolute;left:6px;top:4px;bottom:4px;width:1px;background:var(--outline-variant)"></div>';
         historyHtml+=c.contactHistory.map((h,i)=>{
-          const d=new Date(h.date).toLocaleString('ja-JP');
+          const d=new Date(h.date).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
           let respBg='#6f6f6f',respText=t('sent.replyWaiting');
           if(h.response==='replied'||h.response==='\u8fd4\u4fe1\u3042\u308a'){respBg='#198038';respText=h.response;}
           else if(h.response==='meeting'||h.response==='\u5546\u8ac7\u8a2d\u5b9a'){respBg='#0052dd';respText=h.response;}
@@ -7496,11 +8671,12 @@ function render(data){
         }).join('');
         historyHtml+='</div></div>';
       }
-      const date=new Date(c.sentAt).toLocaleString('ja-JP');
+      const date=new Date(c.sentAt).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
       const msg=esc(c.sentMessage||'').split(String.fromCharCode(10)).join('<br>');
+      const ssSent=c.sentScreenshotName?'<img src="'+screenshotUrl(c.sentScreenshotName)+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant);margin-bottom:6px" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Sent screenshot">':'';
       const ssInput=c.inputScreenshotName?'<img src="'+screenshotUrl(c.inputScreenshotName)+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant);margin-bottom:6px" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Input screenshot">':'';
       const ssConfirm=c.confirmScreenshotName?'<img src="'+screenshotUrl(c.confirmScreenshotName)+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Confirm screenshot">':'';
-      return'<div class="sent-card" data-sn="'+esc(c.name).toLowerCase()+' '+esc(c.type).toLowerCase()+'" data-sc="'+count+'" style="background:#fff;border:1px solid var(--outline-variant);border-left:3px solid #198038;margin-bottom:12px">'
+      return'<div class="sent-card" data-sn="'+esc((c.name+' '+c.type+' '+(c.sentMessage||'')+' '+(c.formUrl||'')).toLowerCase())+'" data-sc="'+count+'" data-type-exact="'+esc(String(c.type || '').trim().toLowerCase())+'" style="background:#fff;border:1px solid var(--outline-variant);border-left:3px solid #198038;margin-bottom:12px">'
         +'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant);background:var(--surface-low)">'
         +'<div style="display:flex;align-items:center;gap:6px">'
         +'<span style="background:#198038;color:#fff;font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('sent.badge')+'</span>'
@@ -7508,26 +8684,27 @@ function render(data){
         +'<strong style="font-size:.88rem;margin-left:4px">'+esc(c.name)+'</strong>'
         +'<span style="font-size:.72rem;color:var(--on-surface-variant);background:var(--surface-container);padding:2px 8px">'+esc(c.type)+'</span>'
         +'</div>'
-        +'<span style="font-size:.7rem;color:var(--on-surface-variant);font-family:var(--font-mono)">Last: '+date+'</span>'
+        +'<span style="font-size:.7rem;color:var(--on-surface-variant);font-family:var(--font-mono)">'+(LANG==='ja'?'送信日時: ':'Sent: ')+date+'</span>'
         +'</div>'
         +'<div style="display:flex">'
         +'<div style="flex:1;padding:14px 16px">'
         +'<div style="font-size:.82rem;background:var(--surface-low);padding:12px;white-space:pre-wrap;line-height:1.7;max-height:240px;overflow-y:auto;border:1px solid var(--outline-variant)">'+msg+'</div>'
         +historyHtml
-        +'<div style="margin-top:8px;font-size:.7rem;color:var(--outline)"><a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></div>'
+        +(c.formUrl?'<div style="margin-top:8px;font-size:.7rem;color:var(--outline)"><a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></div>':'<div style="margin-top:8px;font-size:.7rem;color:var(--outline)">'+(LANG==='ja'?'フォームURL未記録':'Form URL not recorded')+'</div>')
         +'</div>'
         +'<div style="width:160px;min-width:160px;border-left:1px solid var(--outline-variant);padding:10px;background:var(--surface-lowest);overflow-y:auto;max-height:400px">'
-        +ssInput+ssConfirm
+        +ssSent+ssInput+ssConfirm
         +'</div>'
         +'</div>'
         +'</div>';
     }).join('');
   }
+    applySentFilter();
     markSectionRendered('sent', sentListKey);
     _renderSectionKeys.sentList = sentListKey;
   }
 
-  const _ts = new Date().toLocaleString('ja-JP');
+  const _ts = new Date().toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
   document.getElementById('lastUpdate').textContent=t('app.lastUpdate')+': '+_ts;
   const _sl=document.getElementById('sidebarLastUpdate');if(_sl)_sl.textContent=_ts;
   const _hl=document.getElementById('headerLastUpdate');if(_hl)_hl.textContent=_ts;
@@ -7997,6 +9174,22 @@ let _trendChart = null;
 
 function initCharts() {
   if (typeof Chart === 'undefined') return;
+  const initialTrendData = (typeof _latestDashboardData !== 'undefined' && _latestDashboardData && _latestDashboardData.trendData)
+    ? _latestDashboardData.trendData
+    : null;
+  const initialTrendLabels = Array.isArray(initialTrendData && initialTrendData.labels) && initialTrendData.labels.length
+    ? initialTrendData.labels
+    : ['6日前','5日前','4日前','3日前','2日前','昨日','今日'];
+  const initialTrendSent = Array.isArray(initialTrendData && initialTrendData.sent) && initialTrendData.sent.length
+    ? initialTrendData.sent
+    : [0,0,0,0,0,0,0];
+  const initialTrendActionNeeded = Array.isArray(initialTrendData && initialTrendData.actionNeeded) && initialTrendData.actionNeeded.length
+    ? initialTrendData.actionNeeded
+    : [0,0,0,0,0,0,0];
+  const initialTrendError = Array.isArray(initialTrendData && (initialTrendData.error || initialTrendData.errors))
+    && (initialTrendData.error || initialTrendData.errors).length
+    ? (initialTrendData.error || initialTrendData.errors)
+    : [0,0,0,0,0,0,0];
 
   // Doughnut - ステータス内訳
   const ctxD = document.getElementById('statusDonutChart');
@@ -8033,11 +9226,11 @@ function initCharts() {
     _trendChart = new Chart(ctxA.getContext('2d'), {
       type: 'line',
       data: {
-        labels: ['6日前','5日前','4日前','3日前','2日前','昨日','今日'],
+        labels: initialTrendLabels,
         datasets: [
-          { label:'送信済', data:[0,0,0,0,0,0,0], borderColor:'#10b981', backgroundColor:grad2, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#10b981', pointBorderWidth:2 },
-          { label:'要対応', data:[0,0,0,0,0,0,0], borderColor:'#f59e0b', backgroundColor:grad1, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#f59e0b', pointBorderWidth:2 },
-          { label:'エラー', data:[0,0,0,0,0,0,0], borderColor:'#ef4444', backgroundColor:'transparent', borderWidth:1.5, borderDash:[4,4], tension:0.3, fill:false, pointRadius:0, pointHoverRadius:3, pointBackgroundColor:'#ef4444' }
+          { label:'送信済', data:initialTrendSent, borderColor:'#10b981', backgroundColor:grad2, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#10b981', pointBorderWidth:2 },
+          { label:'要対応', data:initialTrendActionNeeded, borderColor:'#f59e0b', backgroundColor:grad1, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#f59e0b', pointBorderWidth:2 },
+          { label:'エラー', data:initialTrendError, borderColor:'#ef4444', backgroundColor:'transparent', borderWidth:1.5, borderDash:[4,4], tension:0.3, fill:false, pointRadius:0, pointHoverRadius:3, pointBackgroundColor:'#ef4444' }
         ]
       },
       options: {
@@ -8071,11 +9264,15 @@ function updateCharts(data) {
 
   // Update trend chart with per-day data
   if (_trendChart && data.trendData) {
+    const trendErrorSeries = Array.isArray(data.trendData.error)
+      ? data.trendData.error
+      : (Array.isArray(data.trendData.errors) ? data.trendData.errors : null);
     _trendChart.data.labels = data.trendData.labels;
     _trendChart.data.datasets[0].data = data.trendData.sent;
     _trendChart.data.datasets[1].data = data.trendData.actionNeeded;
-    if (data.trendData.errors && _trendChart.data.datasets[2]) _trendChart.data.datasets[2].data = data.trendData.errors;
-    _trendChart.update('none');
+    if (trendErrorSeries && _trendChart.data.datasets[2]) _trendChart.data.datasets[2].data = trendErrorSeries;
+    _trendChart.resize();
+    _trendChart.update();
   }
 
   // Update analytics progress panel
@@ -8097,6 +9294,7 @@ let _liveMonitorOpen = false;
 let _monitorUnreadCount = 0;
 let _monitorToastTimer = null;
 let _lastMonitorEventCount = 0;
+let _monitorBaseStatus = 'idle';
 
 function toggleMonitorPanel() {
   _liveMonitorOpen = !_liveMonitorOpen;
@@ -8194,6 +9392,7 @@ document.addEventListener('keydown', function(e) {
 // Initial data fetch
 refreshData({toastOnError:true});
 connectEvents();
+connectPtyWs();
 
 // Claude CLI status — initial check + periodic polling
 pollClaudeStatus();
@@ -8265,8 +9464,9 @@ function updateMonitorThinking(msg) {
     if (dot) { dot.style.background='#818cf8'; }
   } else {
     row.style.display = 'none';
-    if (chip) { chip.innerHTML = LANG==='ja'?'待機中':'Idle'; chip.style.color='#94a3b8'; chip.style.background='rgba(255,255,255,.1)'; }
-    if (dot) { dot.style.background='#94a3b8'; }
+    const baseMeta = getMonitorStatusMeta(_monitorBaseStatus);
+    if (chip) { chip.textContent = baseMeta.label; chip.style.color = baseMeta.tone.fg; chip.style.background = baseMeta.tone.bg; }
+    if (dot) { dot.style.background = baseMeta.dotColor; }
   }
 }
 
@@ -8294,6 +9494,7 @@ function appendCliLog(msg,type,time){
   if(type==='thinking'){
     updateMonitorThinking(msg);
     updateCliThinking(msg);
+    pushMonitorCliEvent(msg, type, time);
     if (streamLastEventEl && ts) streamLastEventEl.textContent=ts;
     if(!el)return;
     const line=document.createElement('div');
@@ -8305,15 +9506,15 @@ function appendCliLog(msg,type,time){
     txt.textContent=msg;
     line.appendChild(spinner);
     line.appendChild(txt);
-    el.appendChild(line);
-    el.scrollTop=el.scrollHeight;
-    while(el.children.length>300){ el.removeChild(el.firstElementChild); }
+    el.prepend(line);
+    while(el.children.length>300){ el.removeChild(el.lastElementChild); }
     return;
   }
 
   // Non-thinking: clear thinking indicator and update timestamp
   updateMonitorThinking(null);
   updateCliThinking(null);
+  pushMonitorCliEvent(msg, type, time);
   if(lastEventEl) lastEventEl.textContent=ts;
   if(streamLastEventEl) streamLastEventEl.textContent=ts;
   if(!el)return;
@@ -8336,10 +9537,9 @@ function appendCliLog(msg,type,time){
   line.appendChild(labelSpan);
   line.appendChild(document.createTextNode(' '));
   line.appendChild(msgSpan);
-  el.appendChild(line);
-  el.scrollTop=el.scrollHeight;
+  el.prepend(line);
   while(el.children.length>300){
-    el.removeChild(el.firstElementChild);
+    el.removeChild(el.lastElementChild);
   }
 }
 
@@ -8408,6 +9608,9 @@ function _setWsStatus(status) {
 }
 
 function connectPtyWs() {
+  if (_ptyWs && (_ptyWs.readyState === WebSocket.OPEN || _ptyWs.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
   if (_ptyWsRetryTimer) { clearTimeout(_ptyWsRetryTimer); _ptyWsRetryTimer = null; }
   const ws = createSessionWebSocket('/terminal');
   _ptyWs = ws;
@@ -8422,6 +9625,7 @@ function connectPtyWs() {
         _tabTerm?.write(msg.data);
         _drawerTerm?.write(msg.data);
         document.getElementById('cliLastEvent').textContent = new Date().toLocaleTimeString('ja-JP');
+        ingestPtyProgress(msg.data);
       } else if (msg.type === 'exit') {
         const txt = '\\r\\n\\x1b[2m[AI 終了 code=' + msg.code + ']\\x1b[0m\\r\\n';
         _tabTerm?.write(txt);
@@ -8500,7 +9704,7 @@ function sortTable(col){
       const order={submitted:5,awaiting_approval:4,confirm_reached:3,form_fill:2,error:1,'':0};
       va=order[a.dataset.progress]||0;vb=order[b.dataset.progress]||0;
     }
-    else if(col==='sent'){va=parseInt(a.dataset.cnt)||0;vb=parseInt(b.dataset.cnt)||0;}
+    else if(col==='sent'){va=parseInt(a.dataset.sentAt||'0',10)||0;vb=parseInt(b.dataset.sentAt||'0',10)||0;}
     else{va=0;vb=0;}
     if(typeof va==='string'){return sortAsc?va.localeCompare(vb):vb.localeCompare(va);}
     return sortAsc?va-vb:vb-va;
@@ -8519,19 +9723,22 @@ document.querySelectorAll('.fb-sent').forEach(b=>{
     applySentFilter();
   });
 });
-document.getElementById('sentSearch').addEventListener('input',()=>applySentFilter());
+document.getElementById('sentSearch')?.addEventListener('input',()=>applySentFilter());
+document.getElementById('sentTypeFilter')?.addEventListener('change',()=>applySentFilter());
 function applySentFilter(){
   const q=(document.getElementById('sentSearch').value||'').toLowerCase();
+  const typeFilter=(document.getElementById('sentTypeFilter')?.value||'').toLowerCase();
   let visible=0;
   document.querySelectorAll('.sent-card').forEach(card=>{
     const matchQ=!q||(card.dataset.sn||'').includes(q);
     const cnt=parseInt(card.dataset.sc)||1;
+    const matchType=!typeFilter||(card.dataset.typeExact||'')===typeFilter;
     const matchF=sentFilter==='all'||(sentFilter==='1'&&cnt===1)||(sentFilter==='2+'&&cnt>=2);
-    const show=matchQ&&matchF;
+    const show=matchQ&&matchType&&matchF;
     card.style.display=show?'':'none';
     if(show)visible++;
   });
-  document.getElementById('sentCount').textContent=visible+' items';
+  document.getElementById('sentCount').textContent=visible+' '+(LANG==='ja'?'件':'items');
 }
 
 // Tab switching
@@ -8548,7 +9755,7 @@ document.querySelectorAll('.tab-btn').forEach(b=>{
     if (_latestDashboardData && b.dataset.tab !== 'settings') {
       render(_latestDashboardData);
     }
-    if (b.dataset.tab === 'cli') {
+    if (b.dataset.tab === 'logs') {
       ensureXtermAssets()
         .then(() => {
           initXtermTerminals();
@@ -9977,7 +11184,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (normalizedDecision === 'sent') {
           const approvalScreenshot = approvalArtifacts
-            ? (approvalArtifacts.actual.confirm || approvalArtifacts.actual.input || approvalArtifacts.screenshots.confirm || approvalArtifacts.screenshots.input)
+            ? (approvalArtifacts.actual.sent || approvalArtifacts.actual.confirm || approvalArtifacts.actual.input || approvalArtifacts.screenshots.sent || approvalArtifacts.screenshots.confirm || approvalArtifacts.screenshots.input)
             : null;
           logAction(companyNoNum, companyName, 'submitted', buildApprovalLogDetails({
             companyNo: companyNoNum,
@@ -9991,24 +11198,33 @@ const server = http.createServer(async (req, res) => {
             approvalRequired: true,
           }));
           const draft = auditContext.allLogs.filter(l => String(l.companyNo) === String(companyNoNum) && l.action === 'message_draft').pop();
-          const existingHistory = getHistory(companyNoNum);
           const knownFormUrl = getKnownFormUrl(companyNoNum, findRuntimeCompanyRecord(companyNoNum)?.formUrl || '');
-          const alreadyRecorded = existingHistory && existingHistory.contacts.length > 0 &&
-            existingHistory.contacts.some(c => draft && c.message === draft.details);
-          if (!alreadyRecorded) {
-            recordContact(companyNoNum, companyName, {
-              message: draft ? draft.details : '',
-              formUrl: knownFormUrl,
-              method: 'web_form',
-            });
-          }
+          ensureSubmittedContactHistory(
+            companyNoNum,
+            companyName,
+            auditContext.submittedLog || getLatestLog(auditContext.logs || [], 'submitted') || { timestamp: new Date().toISOString() },
+            knownFormUrl,
+            draft ? stringifyLogDetails(draft.details) : '',
+            getHistory(companyNoNum),
+            {
+              screenshot: approvalScreenshot || '',
+              sourceAction: 'dashboard-approve',
+              sourceActionAt: auditContext.submittedLog && auditContext.submittedLog.timestamp ? auditContext.submittedLog.timestamp : new Date().toISOString(),
+              status: 'submitted',
+              notes: allowInputOnlyApproval ? 'manual-approve-input-only' : 'manual-approve-confirmed',
+            },
+          );
           finishLiveMonitor(companyNoNum, {
             companyNo: companyNoNum,
             companyName,
             status: 'submitted',
             step: allowInputOnlyApproval ? 'ダッシュボードで手動送信完了を確認' : 'ダッシュボードで承認済み',
+            currentUrl: knownFormUrl,
+            formUrl: knownFormUrl,
             latestScreenshot: approvalScreenshot,
           });
+          // 元のCSV/Excelに送信済みを書き戻す（失敗してもメイン処理に影響させない）
+          try { updateCompany(companyNoNum, { progress: '送信済み' }); } catch (_) {}
         } else if (normalizedDecision === 'skip') {
           const reason = feedback ? 'Skip reason: ' + feedback : 'Skipped from dashboard';
           const approvalScreenshot = approvalArtifacts
@@ -10042,6 +11258,8 @@ const server = http.createServer(async (req, res) => {
             step: 'ダッシュボードでスキップ',
             latestScreenshot: approvalScreenshot,
           });
+          // 元のCSV/Excelにスキップを書き戻す
+          try { updateCompany(companyNoNum, { progress: 'スキップ' }); } catch (_) {}
         } else {
           appendDiagnosticEvent('approve_invalid_decision', {
             companyNo: companyNoNum,
@@ -10288,14 +11506,20 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // 重複キューイング防止: 既にアクティブな企業を除外
+      // 重複キューイング防止: 実際に稼働中のAI/batchだけを基準に判定する
       const { getLiveMonitorSummary } = require('./live-monitor.cjs');
+      if (!isAiRuntimeActivelyProcessing()) {
+        cleanupStaleManagedAiMonitorEvents(0);
+      }
       const monitorSummary = getLiveMonitorSummary();
-      const activeNos = new Set(
+      const activeNos = getManagedAiReservedCompanyNos();
+      if (isAiRuntimeActivelyProcessing()) {
         (monitorSummary.events || [])
           .filter(ev => ev && ev.active !== false && !['awaiting_approval','submitted','completed','skipped','error'].includes(ev.status))
-          .map(ev => Number(ev.companyNo))
-      );
+          .forEach((ev) => {
+            activeNos.add(Number(ev.companyNo));
+          });
+      }
       const alreadyQueued = found.companies.filter(c => activeNos.has(Number(c.no)));
       if (alreadyQueued.length > 0) {
         const names = alreadyQueued.map(c => c.companyName || c.name || '#' + c.no).join(', ');
@@ -10359,6 +11583,7 @@ const server = http.createServer(async (req, res) => {
           phaseA: phaseAResult ? {
             analysis: phaseAResult.analysis || null,
             message: phaseAResult.message || '',
+            messagePrompt: phaseAResult.messagePrompt || '',
             analysisElapsedMs: phaseAResult.elapsedMs,
             formUrl: phaseAResult.formUrl || company.formUrl || '',
             formResolutionMethod: phaseAResult.formResolutionMethod || null,
@@ -10371,6 +11596,7 @@ const server = http.createServer(async (req, res) => {
           {
             analysis: entry.analysis || null,
             message: entry.message || '',
+            messagePrompt: entry.messagePrompt || '',
             elapsedMs: entry.elapsedMs,
             formUrl: entry.formUrl || '',
             formResolutionMethod: entry.formResolutionMethod || null,
@@ -10410,7 +11636,7 @@ const server = http.createServer(async (req, res) => {
     const provider = getProvider(providerId);
     const stopped = getActiveHeadlessRun(providerId)
       ? await stopHeadlessAiRun(providerId)
-      : await stopManagedClaudePty();
+      : await stopManagedClaudePty({ suppressAutoRecovery: true });
     if (!stopped.ok) {
       jsonResponse(res, 500, stopped);
       return;
@@ -10518,7 +11744,7 @@ const server = http.createServer(async (req, res) => {
           c.lastAction || c.progress || 'Pending',
           c.formUrl, c.captcha,
           c.lastLog ? c.lastLog.action : '',
-          c.lastLog ? new Date(c.lastLog.timestamp).toLocaleString('ja-JP') : '',
+          c.lastLog ? new Date(c.lastLog.timestamp).toLocaleString('ja-JP', { timeZone: settings.getSection('preferences').timezone || 'Asia/Tokyo' }) : '',
           c.lastErrorDetail || (c.logs.length > 0 ? c.logs.map(l => `${l.action}: ${typeof l.details === 'object' ? JSON.stringify(l.details) : l.details}`).join(' | ') : ''),
         ]);
       });
@@ -10528,7 +11754,7 @@ const server = http.createServer(async (req, res) => {
 
       const logRows = [['Time', 'No.', 'Company', 'Action', 'Details']];
       data.recentLogs.forEach(l => {
-        logRows.push([new Date(l.timestamp).toLocaleString('ja-JP'), l.companyNo, l.companyName, l.action, typeof l.details === 'object' ? JSON.stringify(l.details) : l.details || '']);
+        logRows.push([new Date(l.timestamp).toLocaleString('ja-JP', { timeZone: settings.getSection('preferences').timezone || 'Asia/Tokyo' }), l.companyNo, l.companyName, l.action, typeof l.details === 'object' ? JSON.stringify(l.details) : l.details || '']);
       });
       const ws2 = XLSX.utils.aoa_to_sheet(logRows);
       ws2['!cols'] = [{ wch: 20 }, { wch: 5 }, { wch: 25 }, { wch: 15 }, { wch: 60 }];
@@ -10561,6 +11787,9 @@ const server = http.createServer(async (req, res) => {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
     'Set-Cookie': buildDashboardSessionCookieHeaders(),
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; object-src 'none';",
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
   });
   res.end(buildPage());
 });
@@ -10604,6 +11833,7 @@ async function startDashboardServer() {
 
     refreshWatchTargets();
     startHeartbeat();
+    cleanupStaleManagedAiMonitorEvents();
 
     const _sl = settings.getSection('preferences').language || 'ja';
     console.log(`\n===================================`);

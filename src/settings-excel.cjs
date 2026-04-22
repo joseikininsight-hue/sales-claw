@@ -301,7 +301,12 @@ function parseListRows(rows, columns, mapper) {
   return parsed.length ? parsed : null;
 }
 
+const XLSX_MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB
+
 function parseWorkbookBuffer(buffer) {
+  if (Buffer.isBuffer(buffer) && buffer.length > XLSX_MAX_BUFFER_SIZE) {
+    throw new Error(`アップロードファイルが上限(50MB)を超えています`);
+  }
   const workbook = XLSX.read(buffer, { type: 'buffer' });
   const parsedSections = {};
   const applied = [];

@@ -99,8 +99,11 @@ Step 1: 企業サイト分析
   → company-analyzer.cjs or MCP Playwrightでサイト巡回
   → logAction(no, name, 'site_analysis', 分析結果)
 
-Step 2: メッセージ生成
-  → message-builder.cjs の buildCustomMessage(analysis)
+Step 2: メッセージ生成（CLI言語能力を活用）
+  → message-builder.cjs の buildMessagePrompt(analysis) でプロンプト+コンテキスト生成
+  → CLIエージェントが messagePrompt に基づき、企業ごとにパーソナライズした文面を実際に作成
+  → approachObjective / approachGuardrails が自動反映される
+  → フォールバック: buildCustomMessage(analysis) のテンプレート文面
   → logAction(no, name, 'message_draft', メッセージ全文)
 
 Step 3: フォームにアクセス ★ 2社目以降は browser_navigate 禁止
@@ -116,11 +119,11 @@ Step 4: フォームに入力 ★ 絶対省略するな
   → logAction(no, name, 'form_fill', '入力完了')
 
 Step 5: スクリーンショット ★ 絶対省略するな（ファイル名を厳守すること）
-  → フォーム入力後の画面を screenshots/ss-{No}-input.png に保存（入力確認用）
-  → 送信ボタンを押した後の確認/完了画面を screenshots/ss-{No}-confirm.png に保存（承認用）
-  → ★ input と confirm は別のスクショ。同じファイル名にしてはいけない
-  → ★ 承認システムは ss-{No}-confirm.png が存在しないと送信済みにできない
-  → logAction(no, name, 'confirm_reached', 'スクショ撮影完了: screenshots/ss-{No}-confirm.png')
+  → フォーム入力後の画面を screenshots/ss-{No}-input.png に保存（必須）
+  → 確認画面や次画面が存在する場合は screenshots/ss-{No}-confirm.png に保存（任意の追加確認用）
+  → ★ input は確認待ち登録の必須スクショ。confirm は取得できる場合のみ追加で残す
+  → ★ input と confirm を両方保存する場合は別ファイルにする
+  → logAction(no, name, 'confirm_reached', 'スクショ撮影完了')
 
 Step 6: 確認待ちに登録
   → logAction(no, name, 'awaiting_approval', 'ダッシュボードで確認待ち')
@@ -133,17 +136,25 @@ Step 6: 確認待ちに登録
 → 一気に最後まで進める。途中でメッセージ承認を求めて止まらない。
 
 フェーズA（並列実行 — MCP不使用）:
-→ 各社の「サイト分析 + メッセージ生成」を並列サブエージェントで同時処理
+→ 各社の「サイト分析 + メッセージ生成プロンプト構築」を並列サブエージェントで同時処理
 → 方法: Agent ツールで haiku サブエージェントを並列起動:
     node src/parallel-analysis.cjs '{"no":1,"companyName":"会社名","url":"URL","type":"種別","formUrl":"フォームURL"}'
 → サブエージェント内で company-analyzer + message-builder を使用
+→ 出力: analysis + messagePrompt（CLI用プロンプト）+ templateDraft（フォールバック）
 → MCP Playwright は使わない（直接 HTTP フェッチのみ）
 → thinking() + updateLiveMonitor() で進行状況をダッシュボードに通知
-→ 全社のフェーズAが完了するまでフェーズBに進まない
+→ 全社のフェーズAが完了するまでフェーズA.5に進まない
+
+フェーズA.5（メッセージ生成 — CLI言語能力を活用）:
+→ フェーズAの分析結果 + messagePrompt をフォーム入力用 batch payload に載せる
+→ CLIは messagePrompt を使って企業ごとに本文を最終化し、templateDraft はフォールバックとして扱う
+→ messagePrompt には approachObjective / approachGuardrails / サイト抜粋 / ギャップ分析が含まれる
+→ CLIが自然な日本語で、テンプレート感のない「この会社だけに書いた」文面を生成する
+→ templateDraft はCLI生成に失敗した場合のフォールバック
 
 フェーズB（順次実行 — MCP Playwright 使用）:
-→ フェーズA完了後、メインがMCP Playwrightで1社ずつフォーム入力
-→ フェーズAで生成済みのメッセージを使ってフォームに入力
+→ フェーズA.5完了後、メインがMCP Playwrightで1社ずつフォーム入力
+→ CLI生成済みのメッセージを使ってフォームに入力
 → 各社: navigate → snapshot → fill_form → screenshot → awaiting_approval
 → thinking() + updateLiveMonitor() で進行状況をダッシュボードに通知
 → タブは閉じずに残す
@@ -163,7 +174,9 @@ const { thinking, log } = require('./src/cli-logger.cjs');
 
 フェーズA開始: thinking('フェーズA開始: N社の並列分析')
 各社分析開始: thinking('[No.X] 会社名: サイト分析開始')
-各社メッセージ: thinking('[No.X] 会社名: メッセージ生成中')
+各社プロンプト: thinking('[No.X] 会社名: メッセージプロンプト生成中')
+フェーズA.5開始: thinking('フェーズA.5開始: CLIメッセージ生成')
+各社CLI生成: thinking('[No.X] 会社名: CLIでパーソナライズ文面生成中')
 フェーズB開始: thinking('フェーズB開始: フォーム入力（順次処理）')
 各社フォーム入力: thinking('[No.X] 会社名: フォーム入力中')
 各社完了: log('[No.X] 会社名: 確認待ち登録完了', 'action')
@@ -171,18 +184,33 @@ const { thinking, log } = require('./src/cli-logger.cjs');
 
 ## Message Generation
 
-メッセージは `data/settings.json` の以下を参照して生成:
+メッセージはCLIの言語能力を活用して企業ごとにパーソナライズ生成する。
+
+### 生成フロー
+1. `parallel-analysis.cjs` が企業サイトを分析 → analysis（事業領域・ギャップ・注力分野・サイト抜粋）
+2. `message-builder.cjs` の `buildMessagePrompt(analysis)` がCLI用プロンプトを構築
+3. CLIエージェントがプロンプトに基づき、相手企業に刺さる文面を生成
+4. フォールバック: `buildCustomMessage(analysis)` のテンプレート文面
+
+### 設定参照先
 - `companyProfile` — 送信者情報
 - `valuePropositions.strengths` — 自社の強み（ギャップ分析に使用）
 - `valuePropositions.successPatterns` — 協業実績
-- `valuePropositions.industryProfiles` — 業種別テンプレート
+- `valuePropositions.industryProfiles` — 業種別テンプレート（フォールバック用）
 - `messageTemplates` — 文面のトーン・署名・CTA
+- `messageTemplates.approachObjective` — 営業方針（CLIプロンプトに自動反映）
+- `messageTemplates.approachGuardrails` — 禁止事項（CLIプロンプトに自動反映）
 
-### メッセージ作成方針
+### メッセージ作成方針（CLIプロンプトに組み込み済み）
+- 相手がやりたいことから入る（自社紹介から始めない）
+- この会社だけに書いた感を出す（テンプレート感を排除）
+- 全部伝えようとしない（尖った強み1-2個に集中）
+- Win-Winは匂わせ程度（押し売り感を排除）
 - 実績は控えめに（企業名を全面に出さない。数字は使ってOK）
-- **相手に何を提供できるかを前面に**（箇条書きで明確に）
+- **相手に何を提供できるかを前面に**
 - 相手の事業に触れる（「貴社の〇〇事業を拝見」）
 - 相手の強み × 自社の強みの組み合わせ提案
+- 相手の課題を決めつけない
 
 ## OMC（oh-my-claudecode）モデルルーティング — トークン節約
 

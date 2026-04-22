@@ -22,6 +22,17 @@ const MANUAL_REVIEW_RULES = [
     auditState: 'direct-submit',
   },
   {
+    code: 'browser_pending',
+    pattern: /確認ボタン未押下|入力内容を確認するボタン未押下|送信ボタン未押下|フォーム入力済み状態で残っています|ブラウザタブにフォーム入力済み状態で残っています|ブラウザタブ.*残しています|ユーザーによる送信判断を待機中/i,
+    label: 'ブラウザタブで最終確認して送信してください。',
+    confirmRequired: false,
+    allowInputOnly: true,
+    readyForManualSubmission: true,
+    alreadySubmitted: false,
+    requiresManualAction: true,
+    auditState: 'manual-send-pending',
+  },
+  {
     code: 'captcha',
     pattern: /recaptcha|hcaptcha|turnstile|captcha/i,
     label: 'CAPTCHA の手動対応が必要です。',
@@ -47,11 +58,12 @@ const MANUAL_REVIEW_RULES = [
 
 function getExpectedScreenshotPaths(companyNo) {
   const dir = settings.getScreenshotDir();
+  const safeNo = String(companyNo).replace(/[^a-zA-Z0-9_-]/g, '_');
   return {
-    input: path.join(dir, `ss-${companyNo}-input.png`),
-    confirm: path.join(dir, `ss-${companyNo}-confirm.png`),
-    sent: path.join(dir, `ss-${companyNo}-sent.png`),
-    error: path.join(dir, `ss-${companyNo}-error.png`),
+    input: path.join(dir, `ss-${safeNo}-input.png`),
+    confirm: path.join(dir, `ss-${safeNo}-confirm.png`),
+    sent: path.join(dir, `ss-${safeNo}-sent.png`),
+    error: path.join(dir, `ss-${safeNo}-error.png`),
   };
 }
 
@@ -120,8 +132,17 @@ function getScreenshotSearchDirs() {
     dirs.push(
       path.join(process.resourcesPath, 'app', 'screenshots'),
       path.join(process.resourcesPath, 'screenshots'),
+      path.join(process.resourcesPath, 'app'),
     );
   }
+
+  // Extra dirs from env (semicolon-separated) for legacy/dev migration
+  const extra = process.env.SALES_CLAW_EXTRA_SCREENSHOT_DIRS || '';
+  extra.split(';')
+    .filter(Boolean)
+    .map((p) => path.resolve(p.trim()))
+    .filter((p) => !p.includes('\0'))
+    .forEach((p) => dirs.push(p));
 
   return Array.from(new Set(
     dirs
@@ -172,8 +193,8 @@ function getScreenshotStatus(companyNo) {
     errorExists,
     expected,
     confirmUsedFallback: confirmExists && path.resolve(paths.confirm) !== path.resolve(expected.confirm),
-    readyForApproval: inputExists && confirmExists,
-    readyForSubmission: inputExists && confirmExists,
+    readyForApproval: inputExists,
+    readyForSubmission: inputExists,
   };
 }
 
@@ -260,7 +281,7 @@ function getManualApprovalMeta(input) {
     reasons: unique,
     captchaDetected: unique.some((entry) => entry.code === 'captcha'),
     directSubmitDetected: unique.some((entry) => entry.code === 'direct_submit'),
-    confirmRequired: primary ? !!primary.confirmRequired : true,
+    confirmRequired: primary ? !!primary.confirmRequired : false,
     allowInputOnly: primary ? !!primary.allowInputOnly : false,
     readyForManualSubmission: primary ? !!primary.readyForManualSubmission : false,
     alreadySubmitted: primary ? !!primary.alreadySubmitted : false,
@@ -401,10 +422,10 @@ function getExpectedApprovalArtifacts(companyNo, options = {}) {
 
   const expected = getExpectedScreenshotPaths(companyNo);
   const actual = {
-    input: resolveLogBoundArtifact(companyNo, 'input', logs, referenceTimes),
-    confirm: resolveLogBoundArtifact(companyNo, 'confirm', logs, referenceTimes),
-    sent: resolveLogBoundArtifact(companyNo, 'sent', logs, referenceTimes),
-    error: resolveLogBoundArtifact(companyNo, 'error', logs, referenceTimes),
+    input: resolveLogBoundArtifact(companyNo, 'input', logs, referenceTimes) ?? findScreenshotPath(expected.input),
+    confirm: resolveLogBoundArtifact(companyNo, 'confirm', logs, referenceTimes) ?? findScreenshotPath(expected.confirm),
+    sent: resolveLogBoundArtifact(companyNo, 'sent', logs, referenceTimes) ?? findScreenshotPath(expected.sent),
+    error: resolveLogBoundArtifact(companyNo, 'error', logs, referenceTimes) ?? findScreenshotPath(expected.error),
   };
 
   return buildArtifactStatus(companyNo, expected, actual, manual);
@@ -436,7 +457,10 @@ function buildApprovalLogDetails(input = {}) {
     source: input.source || 'runner',
     action: input.action || null,
     mode: input.mode || null,
-    screenshot: input.screenshot || (status ? status.screenshots.confirm : null),
+    screenshot: input.screenshot || (status
+      ? (status.actual.sent || status.actual.confirm || status.actual.input
+        || status.screenshots.sent || status.screenshots.confirm || status.screenshots.input)
+      : null),
     screenshots: status
       ? {
           input: status.screenshots.input,

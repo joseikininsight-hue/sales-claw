@@ -59,7 +59,9 @@ async function analyzeCompany(companyUrl, companyName, companyType) {
 
   await browser.close();
 
-  const allText = texts.map(t => t.text).join('\n').toLowerCase();
+  const rawJoinedText = texts.map(t => t.text).join('\n');
+  const allText = rawJoinedText.toLowerCase();
+  const siteTextExcerpt = rawJoinedText.slice(0, 1200);
   const strengths = settings.getStrengths();
 
   return {
@@ -71,6 +73,7 @@ async function analyzeCompany(companyUrl, companyName, companyType) {
     focusAreas: detectFocusAreas(allText),
     relevantPatterns: findRelevantPatterns(companyType),
     rawTextLength: allText.length,
+    siteTextExcerpt,
   };
 }
 

@@ -3,7 +3,7 @@
 ## About This Project
 
 企業の問い合わせフォーム経由で営業アプローチを自動化するツール。
-ユーザーが設定した自社情報・ターゲットリスト・提供価値に基づいて、Codex CLIが企業分析→メッセージ生成→フォーム入力を実行する。
+ユーザーが設定した自社情報・ターゲットリスト・提供価値に基づいて、Claude Code CLIが企業分析→メッセージ生成→フォーム入力を実行する。
 
 ## 絶対ルール: フォーム入力+スクショなしで「確認待ち」にするな
 
@@ -15,6 +15,8 @@
 2. **フォーム構造を解析** — `browser_snapshot` でフィールドを特定
 3. **全フィールドに実際に入力** — `browser_fill_form` で会社名・氏名・メール・電話・本文を入力
 4. **入力済みフォームのスクリーンショット撮影** — `browser_take_screenshot` で `screenshots/ss-{No}-input.png` に保存
+   - 確認画面や次画面が存在する場合は `screenshots/ss-{No}-confirm.png` も追加で保存してよい
+   - ただし `awaiting_approval` の必須条件は **input スクショ**。`confirm` は任意の追加アーティファクト
 5. **ログ記録** — `form_fill` → `confirm_reached` → `awaiting_approval` の順でログ
 
 ### やってはいけないこと（厳禁）:
@@ -45,10 +47,10 @@
 
 ## Architecture — CLI主体
 
-**重要: このプロジェクトはCodex CLIが主体で動く。**
+**重要: このプロジェクトはClaude Code CLIが主体で動く。**
 
-- Codexがその場で企業を分析し、メッセージを作成し、Playwrightでフォームに入力する
-- フォームごとにCodexが構造を見て専用ロジックを書く
+- Claude Codeがその場で企業を分析し、メッセージを作成し、Playwrightでフォームに入力する
+- フォームごとにClaude Codeが構造を見て専用ロジックを書く
 - ダッシュボード（localhost:設定ポート）はUI表示・操作・設定管理
 - **MCP Playwrightで1社ずつタブ切替・確実入力**
   - MCP Playwrightは1ブラウザ共有。並列エージェントから同時にMCPを呼んではいけない
@@ -98,7 +100,9 @@ Step 1: 企業サイト分析
   → logAction(no, name, 'site_analysis', 分析結果)
 
 Step 2: メッセージ生成
-  → message-builder.cjs の buildCustomMessage(analysis)
+  → message-builder.cjs の buildCustomMessage(analysis) で草案生成
+  → buildMessagePrompt(analysis) で CLI 用パーソナライズ prompt も構築
+  → Phase B の CLI は messagePrompt を使って本文を最終化し、templateDraft はフォールバックとして扱う
   → logAction(no, name, 'message_draft', メッセージ全文)
 
 Step 3: フォームにアクセス
@@ -111,7 +115,9 @@ Step 4: フォームに入力 ★ 絶対省略するな
   → logAction(no, name, 'form_fill', '入力完了')
 
 Step 5: スクリーンショット ★ 絶対省略するな
-  → browser_take_screenshot で screenshots/ss-{No}-input.png に保存
+  → browser_take_screenshot で screenshots/ss-{No}-input.png に保存（必須）
+  → 確認画面や次画面がある場合は screenshots/ss-{No}-confirm.png も追加で保存（任意）
+  → ダッシュボード監査の必須条件は ss-{No}-input.png。confirm は追加の確認用として扱う
   → logAction(no, name, 'confirm_reached', 'スクショ撮影完了')
 
 Step 6: 確認待ちに登録
@@ -151,14 +157,14 @@ Step 6: 確認待ちに登録
 - 相手の事業に触れる（「貴社の〇〇事業を拝見」）
 - 相手の強み × 自社の強みの組み合わせ提案
 
-## OMC（oh-my-Codex）モデルルーティング — トークン節約
+## OMC（oh-my-claudecode）モデルルーティング — トークン節約
 
 このプロジェクトはOMCのモデルルーティングに対応。
 各ステップで最適なモデルを使い分けることで、**トークンコストを60-70%削減**できる。
 
 ### インストール（初回のみ）
 ```bash
-Codex /install oh-my-Codex
+claude /install oh-my-claudecode
 ```
 
 ### ステップ別モデル割り当て
@@ -250,21 +256,21 @@ sales-claw/
 
 ## Agent Orchestration
 
-このプロジェクトは **Codex（オーケストラ）+ CODEX（バックエンド実装）** の2エージェント体制で開発する。
+このプロジェクトは **Claude Code（オーケストラ）+ Codex（バックエンド実装補助）** の2エージェント体制で開発できる。
 
 | 担当 | エージェント | 対象 |
 |------|------------|------|
-| フロントエンド・UI設計・統合 | **Codex** | HTML/CSS/i18n/ダッシュボードUI |
-| バックエンド実装 | **CODEX** | .cjs サーバーロジック・データ処理・ファイル操作 |
+| フロントエンド・UI設計・統合・メイン制御 | **Claude Code** | HTML/CSS/i18n/ダッシュボードUI/フォーム入力 |
+| バックエンド実装補助 | **Codex** | .cjs サーバーロジック・データ処理・ファイル操作 |
 
-### CODEX 呼び出し
+### Codex 呼び出し（オプション）
 
 ```bash
-codex exec -m gpt-5.4 -s workspace-write "タスク内容"
+codex exec -m o3 -s workspace-write "タスク内容"
 ```
 
-- モデル: `gpt-5.4`（最高モデル。`o3`はChatGPTアカウントで未対応）
-- 作業ディレクトリ: `C:\bp-outreach`
+- モデル: `o3`（推奨）または `o4-mini`（コスト重視）
+- 作業ディレクトリ: リポジトリルート
 
 ## Session Quick Start
 

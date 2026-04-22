@@ -210,8 +210,9 @@ function readLegacyClaudeModel() {
 
 function resolveConfiguredDataDir(configured) {
   const value = typeof configured === 'string' ? configured.trim() : '';
-  if (!value) return DEFAULT_SETTINGS_DIR;
-  return path.isAbsolute(value) ? value : path.join(getRuntimeRoot(), value);
+  if (!value || value.includes('\0')) return DEFAULT_SETTINGS_DIR;
+  const resolved = path.isAbsolute(value) ? value : path.join(getRuntimeRoot(), value);
+  return path.resolve(resolved);
 }
 
 function getBootstrapSettings() {
@@ -365,10 +366,19 @@ function getExcludeStatuses() {
   return getSection('exclusionRules').excludeStatuses || [];
 }
 
+function getAutoSubmitPolicy() {
+  const prefs = getSection('preferences');
+  return {
+    enabled: prefs.autoSendEligibleForms === true,
+    requireApproval: prefs.requireApprovalBeforeSend !== false,
+    skipIfCaptcha: true,
+  };
+}
+
 function getTargetListPath() {
   const tl = getSection('targetList');
   if (!tl.filePath) return null;
-  return path.isAbsolute(tl.filePath) ? tl.filePath : path.join(__dirname, '..', tl.filePath);
+  return path.isAbsolute(tl.filePath) ? tl.filePath : path.join(getRuntimeRoot(), tl.filePath);
 }
 
 function getPort() {
@@ -384,8 +394,10 @@ function getHost() {
 }
 
 function getScreenshotDir() {
-  const dir = getSection('preferences').screenshotDir || 'screenshots';
-  return path.isAbsolute(dir) ? dir : path.join(getRuntimeRoot(), dir);
+  const raw = getSection('preferences').screenshotDir || 'screenshots';
+  const dir = typeof raw === 'string' && !raw.includes('\0') ? raw.trim() : 'screenshots';
+  const resolved = path.isAbsolute(dir) ? dir : path.join(getRuntimeRoot(), dir);
+  return path.resolve(resolved);
 }
 
 function normalizeSettings(input) {
@@ -507,7 +519,7 @@ module.exports = {
   getExcludeStatuses, getTargetListPath, getPort, getScreenshotDir,
   getHost, getRuntimeRoot,
   isConfigured, getSignature, getMessageStyle, getLetterTemplate,
-  getApprovalBeforeSend, getAutoSendEligibleForms, getFormFillTimeout, getActiveSettingsFile,
+  getApprovalBeforeSend, getAutoSendEligibleForms, getAutoSubmitPolicy, getFormFillTimeout, getActiveSettingsFile,
   getAiProvider, getAiModels, getAiModel,
   // Constants
   DEFAULT_SETTINGS, PROJECT_ROOT, SETTINGS_FILE, LEGACY_SETTINGS_FILE, SAMPLE_SETTINGS_FILE, STATIC_DATA_DIR,

@@ -25,7 +25,9 @@ const FINAL_STATUSES = new Set([
   'error',
   'user_required',
 ]);
-const STALE_SESSION_TTL_MS = 45 * 60 * 1000;
+const STALE_SESSION_TTL_MS = 5 * 60 * 1000;
+const MAX_MONITOR_EVENTS_STORED = 1000;
+const MAX_MONITOR_EVENTS_SUMMARY = 200;
 const monitorCache = {
   filePath: null,
   signature: null,
@@ -192,7 +194,7 @@ function appendEvent(state, previous, next, kind) {
     kind: kind || 'update',
     currentUrl: next.currentUrl || next.formUrl || '',
   };
-  state.events = [event, ...(Array.isArray(state.events) ? state.events : [])].slice(0, 40);
+  state.events = [event, ...(Array.isArray(state.events) ? state.events : [])].slice(0, MAX_MONITOR_EVENTS_STORED);
 }
 
 function updateLiveMonitor(companyNo, patch = {}) {
@@ -325,7 +327,10 @@ function getLiveMonitorSummary() {
   return {
     activeCount: activeSessions.length,
     primary: serializeEntry(primary),
-    events: history.map(serializeEntry).slice(0, 40),
+    events: history
+      .map(serializeEntry)
+      .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+      .slice(0, MAX_MONITOR_EVENTS_SUMMARY),
     updatedAt: state.updatedAt,
   };
 }

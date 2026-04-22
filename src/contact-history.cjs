@@ -138,15 +138,20 @@ function recordContact(companyNo, companyName, record) {
     }
 
     const contactNo = history[key].contacts.length + 1;
+    const recordedAt = record.timestamp || record.sentAt || new Date().toISOString();
 
     history[key].contacts.push({
       contactNo,
-      date: new Date().toISOString(),
+      date: recordedAt,
       message: record.message,
       formUrl: record.formUrl || '',
       method: record.method || 'web_form',
       response: record.response || null,
       notes: record.notes || '',
+      screenshot: record.screenshot || '',
+      sourceAction: record.sourceAction || '',
+      sourceActionAt: record.sourceActionAt || '',
+      status: record.status || '',
     });
 
     saveHistory(history);
