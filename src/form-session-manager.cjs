@@ -6,6 +6,20 @@ const crypto = require('crypto');
 // WebContentsView bounds for the form review pane (right 55% of content area)
 const HEADER_HEIGHT = 56;
 const PANEL_LEFT_RATIO = 0.45; // dashboard left panel takes 45%
+const MAX_SESSIONS = 30;
+const ALLOWED_SCREENSHOT_SUFFIXES = new Set(['input', 'confirm', 'sent', 'error']);
+
+function isSafeFormUrl(rawUrl) {
+  let parsed;
+  try { parsed = new URL(rawUrl); } catch { return false; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const hostname = parsed.hostname.toLowerCase();
+  const bareHost = hostname.replace(/^\[|\]$/g, '');
+  if (/^(localhost|127\.|0\.|::1|169\.254\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe80:|::ffff:)/.test(bareHost)) return false;
+  if (/^\d+$/.test(hostname) || /^0x[0-9a-f]+$/i.test(hostname)) return false;
+  if (!hostname.includes('.') && !hostname.includes(':')) return false;
+  return true;
+}
 
 class FormSessionManager {
   constructor(getMainWindow) {
@@ -18,11 +32,21 @@ class FormSessionManager {
   // ── Session lifecycle ────────────────────────────────────────────────
 
   async createSession(formUrl, companyNo) {
+    if (!isSafeFormUrl(formUrl)) {
+      throw new Error(`SSRF guard: 許可されていないURLです: ${formUrl}`);
+    }
+
     let WebContentsView;
     try {
       ({ WebContentsView } = require('electron'));
     } catch {
       throw new Error('WebContentsView はElectronモードでのみ利用できます');
+    }
+
+    // セッション上限: 古いものから自動破棄
+    if (this._sessions.size >= MAX_SESSIONS) {
+      const oldest = this._sessions.keys().next().value;
+      this.destroySession(oldest);
     }
 
     const id = crypto.randomUUID();
@@ -54,17 +78,19 @@ class FormSessionManager {
     const session = this._sessions.get(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        session.status = 'load_timeout';
-        resolve(); // timeout はエラーにせず続行（部分ロードでも構造取得を試みる）
-      }, timeout);
-
+    return new Promise((resolve) => {
       const onReady = () => {
         clearTimeout(timer);
+        session.view.webContents.removeListener('dom-ready', onReady);
         session.status = 'loaded';
         resolve();
       };
+
+      const timer = setTimeout(() => {
+        session.view.webContents.removeListener('dom-ready', onReady);
+        session.status = 'load_timeout';
+        resolve(); // timeout はエラーにせず続行（部分ロードでも構造取得を試みる）
+      }, timeout);
 
       if (!session.view.webContents.isLoading()) {
         onReady();
@@ -199,14 +225,27 @@ class FormSessionManager {
     const session = this._sessions.get(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-    const dir = require('path').dirname(savePath);
+    const path = require('path');
+    const basename = path.basename(savePath);
+    // suffix 検証: ss-{No}-{suffix}.png のsuffixが許可リスト内か確認
+    const suffixMatch = basename.match(/^ss-[^-]+-([^.]+)\.png$/);
+    if (suffixMatch && !ALLOWED_SCREENSHOT_SUFFIXES.has(suffixMatch[1])) {
+      throw new Error(`許可されていないsuffix: ${suffixMatch[1]}`);
+    }
+    const normalizedPath = path.resolve(savePath);
+    const screenshotDir = path.resolve(require('./settings-manager.cjs').getScreenshotDir());
+    if (!normalizedPath.startsWith(screenshotDir)) {
+      throw new Error(`パストラバーサル検出: screenshotDir 外への書き込みは禁止です`);
+    }
+
+    const dir = path.dirname(normalizedPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
     const image = await session.view.webContents.capturePage();
-    fs.writeFileSync(savePath, image.toPNG());
-    session.screenshotPath = savePath;
+    fs.writeFileSync(normalizedPath, image.toPNG());
+    session.screenshotPath = normalizedPath;
 
-    return savePath;
+    return normalizedPath;
   }
 
   // ── View display ─────────────────────────────────────────────────────

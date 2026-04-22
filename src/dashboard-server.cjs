@@ -11926,7 +11926,8 @@ const server = http.createServer(async (req, res) => {
           const session = _formSessionManager.getSession(sessionId);
           if (!session) { jsonResponse(res, 404, { ok: false, error: 'Session not found' }); return; }
 
-          const suffix = body.suffix || 'input';
+          const ALLOWED_SUFFIXES = ['input', 'confirm', 'sent', 'error'];
+          const suffix = ALLOWED_SUFFIXES.includes(body.suffix) ? body.suffix : 'input';
           const safeNo = String(session.companyNo).replace(/[^a-zA-Z0-9_-]/g, '_');
           const screenshotDir = settings.getScreenshotDir();
           const savePath = path.join(screenshotDir, `ss-${safeNo}-${suffix}.png`);
