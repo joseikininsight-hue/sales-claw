@@ -3132,8 +3132,11 @@ async function resolveClaudeExecutable(providerId = getSelectedAiProvider()) {
       const normalized = String(entry || '').toLowerCase();
       let value = 0;
       if (normalized.includes('\\appdata\\roaming\\npm\\')) value += 40;
-      if (normalized.includes('\\.local\\bin\\')) value += 35;
+      // .local/bin は claude self-update がインストールする場所 — npm .cmd ラッパーより優先
+      if (normalized.includes('\\.local\\bin\\')) value += 50;
       if (normalized.includes('\\windowsapps\\')) value -= 40;
+      // node_modules 内の直接バイナリは npm ラッパーが壊れたとき不安定なため低く評価
+      if (normalized.includes('\\node_modules\\')) value -= 10;
       if (normalized.endsWith('.cmd')) value += 20;
       else if (normalized.endsWith('.exe')) value += 15;
       else if (normalized.endsWith('.ps1')) value += 5;
