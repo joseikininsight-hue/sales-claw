@@ -2,23 +2,130 @@
 
 const fs = require('fs');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
+const path = require('path');
+const settings = require('./settings-manager.cjs');
 
 // WebContentsView bounds for the form review pane (right 55% of content area)
 const HEADER_HEIGHT = 56;
 const PANEL_LEFT_RATIO = 0.45; // dashboard left panel takes 45%
 const MAX_SESSIONS = 30;
 const ALLOWED_SCREENSHOT_SUFFIXES = new Set(['input', 'confirm', 'sent', 'error']);
+const DNS_LOOKUP_TIMEOUT_MS = 5000;
 
-function isSafeFormUrl(rawUrl) {
+function isBlockedIpv4(address) {
+  const parts = String(address).split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+  const [a, b, c] = parts;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && (b === 0 || b === 168)) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
+}
+
+function isBlockedIpv6(address) {
+  const normalized = String(address).toLowerCase();
+  const mapped = normalized.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (mapped) return isBlockedIpv4(mapped[1]);
+  const mappedHex = normalized.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mappedHex) {
+    const high = Number.parseInt(mappedHex[1], 16);
+    const low = Number.parseInt(mappedHex[2], 16);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) return true;
+    return isBlockedIpv4([
+      (high >> 8) & 0xff,
+      high & 0xff,
+      (low >> 8) & 0xff,
+      low & 0xff,
+    ].join('.'));
+  }
+  const firstHextet = Number.parseInt(normalized.split(':')[0] || '0', 16);
+  return (
+    normalized === '::' ||
+    normalized === '::1' ||
+    normalized.startsWith('fc') ||
+    normalized.startsWith('fd') ||
+    (Number.isFinite(firstHextet) && (firstHextet & 0xffc0) === 0xfe80) ||
+    normalized.startsWith('ff') ||
+    normalized.startsWith('2001:db8:')
+  );
+}
+
+function isBlockedIpAddress(address) {
+  const bareAddress = String(address || '').replace(/^\[|\]$/g, '');
+  const version = net.isIP(bareAddress);
+  if (version === 4) return isBlockedIpv4(bareAddress);
+  if (version === 6) return isBlockedIpv6(bareAddress);
+  return true;
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function resolvePublicAddresses(hostname) {
+  const bareHost = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (net.isIP(bareHost)) return [{ address: bareHost }];
+  const results = await withTimeout(
+    dns.lookup(bareHost, { all: true, verbatim: true }),
+    DNS_LOOKUP_TIMEOUT_MS,
+    'DNS lookup timed out',
+  );
+  return Array.isArray(results) ? results : [];
+}
+
+async function validateFormUrlSafety(rawUrl) {
   let parsed;
-  try { parsed = new URL(rawUrl); } catch { return false; }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  try { parsed = new URL(rawUrl); } catch { return { ok: false, reason: 'invalid_url' }; }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { ok: false, reason: 'unsupported_protocol' };
+  if (parsed.username || parsed.password) return { ok: false, reason: 'url_credentials_not_allowed' };
   const hostname = parsed.hostname.toLowerCase();
   const bareHost = hostname.replace(/^\[|\]$/g, '');
-  if (/^(localhost|127\.|0\.|::1|169\.254\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fc[0-9a-f]{2}:|fd[0-9a-f]{2}:|fe80:|::ffff:)/.test(bareHost)) return false;
-  if (/^\d+$/.test(hostname) || /^0x[0-9a-f]+$/i.test(hostname)) return false;
-  if (!hostname.includes('.') && !hostname.includes(':')) return false;
-  return true;
+  if (bareHost === 'localhost' || bareHost.endsWith('.localhost')) return { ok: false, reason: 'localhost_not_allowed' };
+  if (/^\d+$/.test(bareHost) || /^0x[0-9a-f]+$/i.test(bareHost)) return { ok: false, reason: 'ambiguous_ip_literal' };
+  if (!bareHost.includes('.') && !bareHost.includes(':')) return { ok: false, reason: 'dotless_host_not_allowed' };
+
+  let addresses;
+  try {
+    addresses = await resolvePublicAddresses(bareHost);
+  } catch (error) {
+    return { ok: false, reason: `dns_lookup_failed: ${error.message}` };
+  }
+  if (addresses.length === 0) return { ok: false, reason: 'dns_lookup_empty' };
+  const blocked = addresses.find((entry) => isBlockedIpAddress(entry.address));
+  if (blocked) return { ok: false, reason: `blocked_ip: ${blocked.address}` };
+
+  return { ok: true, url: parsed.toString(), addresses: addresses.map((entry) => entry.address) };
+}
+
+async function assertSafeFormUrl(rawUrl) {
+  const result = await validateFormUrlSafety(rawUrl);
+  if (!result.ok) {
+    throw new Error(`SSRF guard: 許可されていないURLです: ${rawUrl} (${result.reason})`);
+  }
+  return result.url;
+}
+
+function isPathInsideDirectory(baseDir, targetPath) {
+  const relative = path.relative(baseDir, targetPath);
+  return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
 class FormSessionManager {
@@ -32,9 +139,7 @@ class FormSessionManager {
   // ── Session lifecycle ────────────────────────────────────────────────
 
   async createSession(formUrl, companyNo) {
-    if (!isSafeFormUrl(formUrl)) {
-      throw new Error(`SSRF guard: 許可されていないURLです: ${formUrl}`);
-    }
+    const safeFormUrl = await assertSafeFormUrl(formUrl);
 
     let WebContentsView;
     try {
@@ -55,19 +160,29 @@ class FormSessionManager {
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
+        partition: `form-session-${id}`,
       },
     });
+    this._installRequestGuards(view, id);
 
     this._sessions.set(id, {
       id,
       view,
-      formUrl,
+      formUrl: safeFormUrl,
       companyNo: String(companyNo),
       status: 'loading',
       screenshotPath: null,
+      blockedUrl: null,
+      blockedReason: null,
     });
 
-    view.webContents.loadURL(formUrl);
+    view.webContents.loadURL(safeFormUrl).catch((error) => {
+      const session = this._sessions.get(id);
+      if (session && session.status === 'loading') {
+        session.status = 'load_failed';
+        session.blockedReason = error.message;
+      }
+    });
 
     // Wait for DOM ready (with timeout)
     await this._waitForLoad(id, 20000);
@@ -82,13 +197,13 @@ class FormSessionManager {
       const onReady = () => {
         clearTimeout(timer);
         session.view.webContents.removeListener('dom-ready', onReady);
-        session.status = 'loaded';
+        if (session.status === 'loading') session.status = 'loaded';
         resolve();
       };
 
       const timer = setTimeout(() => {
         session.view.webContents.removeListener('dom-ready', onReady);
-        session.status = 'load_timeout';
+        if (session.status === 'loading') session.status = 'load_timeout';
         resolve(); // timeout はエラーにせず続行（部分ロードでも構造取得を試みる）
       }, timeout);
 
@@ -110,6 +225,40 @@ class FormSessionManager {
 
     this._sessions.delete(sessionId);
     if (this._activeSessionId === sessionId) this._activeSessionId = null;
+  }
+
+  _installRequestGuards(view, sessionId) {
+    const markBlocked = (url, reason) => {
+      const session = this._sessions.get(sessionId);
+      if (!session) return;
+      session.status = 'blocked_url';
+      session.blockedUrl = url;
+      session.blockedReason = reason;
+    };
+
+    view.webContents.setWindowOpenHandler(({ url }) => {
+      markBlocked(url, 'popup_blocked');
+      return { action: 'deny' };
+    });
+
+    view.webContents.session.webRequest.onBeforeRequest(
+      { urls: ['http://*/*', 'https://*/*'] },
+      (details, callback) => {
+        validateFormUrlSafety(details.url)
+          .then((result) => {
+            if (!result.ok) {
+              markBlocked(details.url, result.reason);
+              callback({ cancel: true });
+              return;
+            }
+            callback({ cancel: false });
+          })
+          .catch((error) => {
+            markBlocked(details.url, error.message);
+            callback({ cancel: true });
+          });
+      },
+    );
   }
 
   // ── Form inspection ─────────────────────────────────────────────────
@@ -225,16 +374,14 @@ class FormSessionManager {
     const session = this._sessions.get(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-    const path = require('path');
     const basename = path.basename(savePath);
-    // suffix 検証: ss-{No}-{suffix}.png のsuffixが許可リスト内か確認
-    const suffixMatch = basename.match(/^ss-[^-]+-([^.]+)\.png$/);
-    if (suffixMatch && !ALLOWED_SCREENSHOT_SUFFIXES.has(suffixMatch[1])) {
-      throw new Error(`許可されていないsuffix: ${suffixMatch[1]}`);
+    const suffixMatch = basename.match(/^ss-[a-zA-Z0-9_-]+-([a-zA-Z]+)\.png$/);
+    if (!suffixMatch || !ALLOWED_SCREENSHOT_SUFFIXES.has(suffixMatch[1])) {
+      throw new Error(`許可されていないスクリーンショット名: ${basename}`);
     }
     const normalizedPath = path.resolve(savePath);
-    const screenshotDir = path.resolve(require('./settings-manager.cjs').getScreenshotDir());
-    if (!normalizedPath.startsWith(screenshotDir)) {
+    const screenshotDir = path.resolve(settings.getScreenshotDir());
+    if (!isPathInsideDirectory(screenshotDir, normalizedPath)) {
       throw new Error(`パストラバーサル検出: screenshotDir 外への書き込みは禁止です`);
     }
 
@@ -306,6 +453,8 @@ class FormSessionManager {
       formUrl: s.formUrl,
       status: s.status,
       screenshotPath: s.screenshotPath,
+      blockedUrl: s.blockedUrl,
+      blockedReason: s.blockedReason,
       isActive: this._activeSessionId === s.id,
     };
   }
@@ -316,6 +465,8 @@ class FormSessionManager {
       companyNo: s.companyNo,
       formUrl: s.formUrl,
       status: s.status,
+      blockedUrl: s.blockedUrl,
+      blockedReason: s.blockedReason,
       isActive: this._activeSessionId === s.id,
     }));
   }

@@ -11888,8 +11888,12 @@ const server = http.createServer(async (req, res) => {
           const sender = settings.getSender();
           const allowedValues = {
             companyName: sender.companyName || '',
-            contactName: sender.contactName || '',
-            contactTitle: sender.contactTitle || '',
+            contactName: sender.name || '',
+            name: sender.name || '',
+            contactNameKana: sender.nameKana || '',
+            nameKana: sender.nameKana || '',
+            contactTitle: sender.title || '',
+            title: sender.title || '',
             department: sender.department || '',
             email: sender.email || '',
             phone: sender.phone || '',
