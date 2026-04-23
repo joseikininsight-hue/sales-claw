@@ -11555,7 +11555,12 @@ const server = http.createServer(async (req, res) => {
 
       // 重複キューイング防止: 実際に稼働中のAI/batchだけを基準に判定する
       const { getLiveMonitorSummary } = require('./live-monitor.cjs');
-      if (!isAiRuntimeActivelyProcessing()) {
+      const ptyActuallyRunning = !!(claudePty || getActiveHeadlessRun());
+      if (!ptyActuallyRunning) {
+        // PTYが停止中かつリカバリタイマーもない → activeBatch は確実に古い
+        if (!managedAiRecoveryTimer && managedAiBatchController) {
+          managedAiBatchController.activeBatch = null;
+        }
         cleanupStaleManagedAiMonitorEvents(0);
       }
       const monitorSummary = getLiveMonitorSummary();
