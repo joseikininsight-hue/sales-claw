@@ -8,6 +8,11 @@ const fs = require('fs');
 const http = require('http');
 const { exec } = require('child_process');
 
+// 開発モードでは専用ディレクトリを使う（%APPDATA%\Electron を他アプリと共有しない）
+if (!app.isPackaged) {
+  app.setPath('userData', path.join(__dirname, '.electron-userdata'));
+}
+
 const runtimeUserDataDir = path.join(app.getPath('userData'), 'runtime');
 if (!process.env.SALES_CLAW_USER_DATA_DIR) {
   process.env.SALES_CLAW_USER_DATA_DIR = runtimeUserDataDir;

@@ -82,6 +82,7 @@ dist/
 
 # Electron dev
 .webpack/
+.electron-userdata/
 .aidesigner/*
 !.aidesigner/.gitkeep
 
