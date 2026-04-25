@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.18 - 2026-04-25
+
+- 自動アップデート後の "Cannot find module" 系起動失敗を根治
+  - `nsis.runAfterFinish: false` を追加し、NSIS インストール直後の auto-launch を停止
+  - 旧アプリの uninstall → 新ファイル書き込みが完了する前にアプリが起動して、まだコピーされていない依存モジュール (universalify / node-pty / ws / xlsx 等) を `require` しに行って失敗する競合状態を解消
+  - インストール後はトレイ / スタートメニューから手動で起動する運用に変更
+
 ## v1.2.17 - 2026-04-25
 
 - 設定タブ刷新の不具合修正 (v1.2.16 のフィードバック対応)

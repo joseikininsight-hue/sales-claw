@@ -85,6 +85,12 @@ nsis:
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Sales Claw
+  # Disable auto-launch right after install — there is a race where NSIS
+  # finishes the silent install (uninstall old → write new files) but the
+  # auto-launch fires before all files are flushed, producing
+  # "Cannot find module 'electron-updater'" / 'universalify' / etc errors.
+  # User opens the app from the tray / Start menu after install completes.
+  runAfterFinish: false
   # 差分インストールを無効化し、毎回フルインストーラを転送する。
   # NSIS の blockmap-based 差分は「既存インストールが CI ビルドと完全一致」
   # 前提で動くため、ローカルbuild経由で入った v1.2.5 などからの差分更新で
