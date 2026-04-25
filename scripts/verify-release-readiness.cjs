@@ -16,8 +16,10 @@ const EXPECTED = {
 };
 
 const REQUIRED_RUNTIME_DEPENDENCIES = [
+  '@playwright/mcp',
   'electron-updater',
   'fs-extra',
+  'npm',
   'universalify',
 ];
 
@@ -146,7 +148,7 @@ function checkSourceConfig() {
     }
   }
 
-  for (const exclude of ['!dist/**', '!.claude/**', '!.electron-userdata/**', '!.aidesigner/**', '!.code-review-graph/**']) {
+  for (const exclude of ['!dist/**', '!dist-released/**', '!.claude/**', '!.electron-userdata/**', '!.aidesigner/**', '!.code-review-graph/**']) {
     requireContains('electron-builder.yml', builder, exclude, `excludes ${exclude} from packaged app`);
   }
 
@@ -241,7 +243,7 @@ function checkDist() {
       fail(`${rel(packagedPackagePath)}: missing packaged package.json`);
     }
 
-    for (const forbiddenDir of ['.claude', '.electron-userdata', '.aidesigner', '.code-review-graph', 'dist']) {
+    for (const forbiddenDir of ['.claude', '.electron-userdata', '.aidesigner', '.code-review-graph', 'dist', 'dist-released']) {
       const forbiddenPath = path.join(winResources, 'app', forbiddenDir);
       if (fs.existsSync(forbiddenPath)) {
         fail(`${rel(forbiddenPath)}: dev-only directory must not be packaged`);

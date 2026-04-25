@@ -41,6 +41,7 @@ const {
   listProviders,
   normalizeProviderId,
 } = require('./ai-providers.cjs');
+const localToolchain = require('./local-toolchain.cjs');
 const { detectStalledCompanies, formatStallReason } = require('./batch-watchdog.cjs');
 const { saveRecoverySnapshot, loadRecoverySnapshot, clearRecoverySnapshot } = require('./recovery-store.cjs');
 // AI runtime 分離モジュール (Phase 3 の分割先)
@@ -53,6 +54,7 @@ const renderAnalyticsScript = require('./ui/client-scripts/dashboard-analytics.c
 const renderColumnResizerScript = require('./ui/client-scripts/column-resizer.cjs');
 const renderAwaitingCardRedesignScript = require('./ui/client-scripts/awaiting-card-redesign.cjs');
 const renderSentCardRedesignScript = require('./ui/client-scripts/sent-card-redesign.cjs');
+const renderCliTerminalScript = require('./ui/client-scripts/cli-terminal.cjs');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const AI_STATUS_CACHE_TTL_MS = 15000;
@@ -1442,15 +1444,24 @@ function normalizeProjectConfigKey(projectRoot = PROJECT_ROOT) {
 
 function buildManagedClaudeMcpServers(realState = {}) {
   const globalMcpServers = (realState && typeof realState === 'object' && realState.mcpServers) || {};
-  if (globalMcpServers.playwright && typeof globalMcpServers.playwright === 'object') {
+  const existingPlaywright = globalMcpServers.playwright;
+  const existingCommand = String((existingPlaywright && existingPlaywright.command) || '').toLowerCase();
+  const existingArgs = Array.isArray(existingPlaywright && existingPlaywright.args)
+    ? existingPlaywright.args.join(' ').toLowerCase()
+    : '';
+  const existingUsesSystemPackageManager = /(^|[\\/])(npm|npx)(\.cmd|\.exe)?$/.test(existingCommand)
+    || ['npm', 'npx', 'cmd', 'cmd.exe'].includes(existingCommand)
+    || /\b(npm|npx)\b/.test(existingArgs);
+  if (existingPlaywright && typeof existingPlaywright === 'object' && !existingUsesSystemPackageManager) {
     return { playwright: globalMcpServers.playwright };
   }
+  const playwrightMcp = localToolchain.getPlaywrightMcpCommandSpec();
   return {
     playwright: {
       type: 'stdio',
-      command: 'cmd',
-      args: ['/c', 'npx', '-y', '@playwright/mcp', '--browser', 'chrome'],
-      env: {},
+      command: playwrightMcp.command,
+      args: playwrightMcp.args,
+      env: playwrightMcp.env,
     },
   };
 }
@@ -1569,7 +1580,7 @@ function prepareGeminiManagedHome(projectRoot = PROJECT_ROOT) {
 
 function buildManagedProviderEnv(providerId) {
   const normalizedProviderId = normalizeProviderId(providerId);
-  const baseEnv = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+  const baseEnv = localToolchain.buildToolEnv({ ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' });
   if (normalizedProviderId === 'claude') {
     const managedHome = prepareClaudeManagedHome(PROJECT_ROOT);
     const parsed = path.parse(managedHome);
@@ -1650,7 +1661,7 @@ async function runProviderCliCommand(providerId, args = [], options = {}) {
   const spec = buildCliCommandSpec(executable, args);
   const result = spawnSync(spec.command, spec.args, {
     cwd: PROJECT_ROOT,
-    env: options.env || process.env,
+    env: options.env || buildManagedProviderEnv(provider.id),
     encoding: 'utf8',
     windowsHide: true,
     timeout: options.timeout || 15000,
@@ -1671,16 +1682,17 @@ async function ensureProviderPlaywrightMcp(providerId, options = {}) {
     return { ok: true, required: false };
   }
 
-  const cliOptions = { timeout: 20000, env: options.env || process.env };
+  const cliOptions = { timeout: 20000, env: options.env || buildManagedProviderEnv(normalized) };
   const check = await runProviderCliCommand(normalized, ['mcp', 'list'], cliOptions);
   const combined = `${check.stdout}\n${check.stderr}`;
   if (check.ok && /playwright/i.test(combined)) {
     return { ok: true, required: true, configured: true };
   }
 
+  const playwrightMcp = localToolchain.getPlaywrightMcpCommandSpec();
   const addArgs = normalized === 'codex'
-    ? ['mcp', 'add', 'playwright', '--', 'npm', 'exec', '@playwright/mcp', '--browser', 'chrome']
-    : ['mcp', 'add', 'playwright', 'npm', 'exec', '@playwright/mcp', '--browser', 'chrome'];
+    ? ['mcp', 'add', 'playwright', '--', playwrightMcp.command, ...playwrightMcp.args]
+    : ['mcp', 'add', 'playwright', playwrightMcp.command, ...playwrightMcp.args];
   const add = await runProviderCliCommand(normalized, addArgs, { timeout: 30000, env: cliOptions.env });
   if (!add.ok) {
     const message = `${getProviderDisplayName(normalized)} で MCP Playwright の設定に失敗しました。${String(add.stderr || add.stdout || '').trim()}`;
@@ -2621,12 +2633,15 @@ async function startHeadlessAiAutomationRun(companies, providerId = getSelectedA
     prompt: invocationPrompt,
   });
   const executable = await resolveClaudeExecutable(normalizedProviderId);
+  if (process.platform === 'win32' && executable === provider.id) {
+    throw new Error(`${provider.cliLabel} が未インストールです。ダッシュボードの「AI CLI を準備」ボタンでセットアップしてください。`);
+  }
   const spawnSpec = buildCliCommandSpec(executable, headlessSpec.args);
   const logFile = createHeadlessAiLogFile(normalizedProviderId);
   const { spawn } = require('child_process');
   const child = spawn(spawnSpec.command, spawnSpec.args, {
     cwd: PROJECT_ROOT,
-    env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    env: buildManagedProviderEnv(normalizedProviderId),
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -3163,13 +3178,18 @@ async function resolveClaudeExecutable(providerId = getSelectedAiProvider()) {
       .filter((line) => line && fs.existsSync(line)));
   }
 
+  const localNpmBin = `${localToolchain.getNpmBinDir()}${path.sep}`.toLowerCase();
   const candidates = Array.from(new Set([
+    ...localToolchain.getProviderExecutableCandidates(provider.id).filter((entry) => fs.existsSync(entry)),
     ...discoveredCandidates,
     ...getExecutableFallbackCandidates(provider.id).filter((entry) => fs.existsSync(entry)),
   ])).sort((left, right) => {
     function score(entry) {
       const normalized = String(entry || '').toLowerCase();
       let value = 0;
+      if (normalized.startsWith(localNpmBin)) value += 100;
+      if (normalized.includes('\\.sales-claw\\tools\\npm-project\\node_modules\\.bin\\')) value += 90;
+      if (normalized.includes('/.sales-claw/tools/npm-project/node_modules/.bin/')) value += 90;
       if (normalized.includes('\\appdata\\roaming\\npm\\')) value += 40;
       // .local/bin は claude self-update がインストールする場所 — npm .cmd ラッパーより優先
       if (normalized.includes('\\.local\\bin\\')) value += 50;
@@ -3195,6 +3215,10 @@ async function resolveClaudeExecutable(providerId = getSelectedAiProvider()) {
 async function resolveNodeExecutable() {
   if (/node(?:\.exe)?$/i.test(path.basename(process.execPath || ''))) {
     return process.execPath;
+  }
+  const toolchain = localToolchain.ensureToolchainFiles();
+  if (toolchain.nodeShim && fs.existsSync(toolchain.nodeShim)) {
+    return toolchain.nodeShim;
   }
   if (process.platform === 'win32') {
     const result = await execCommand('where node', { timeout: 3000 });
@@ -3223,16 +3247,16 @@ async function probeClaudeAuthStatus(providerId = getSelectedAiProvider()) {
   }
 
   if (provider.id === 'claude') {
-    const command = process.platform === 'win32'
-      ? `"${executable}" auth status --json`
-      : 'claude auth status --json';
-    const result = await execCommand(command, { timeout: 8000 });
-    if (result.error) {
+    const result = await runProviderCliCommand(provider.id, ['auth', 'status', '--json'], {
+      timeout: 8000,
+      env: buildManagedProviderEnv(provider.id),
+    });
+    if (!result.ok) {
       return {
         provider: provider.id,
         installed: true,
         loggedIn: false,
-        error: String(result.stderr || result.stdout || result.error.message || 'Claude auth status failed.').trim(),
+        error: String(result.stderr || result.stdout || result.error?.message || 'Claude auth status failed.').trim(),
       };
     }
 
@@ -3259,10 +3283,10 @@ async function probeClaudeAuthStatus(providerId = getSelectedAiProvider()) {
   }
 
   if (provider.id === 'codex') {
-    const command = process.platform === 'win32'
-      ? `"${executable}" login status`
-      : 'codex login status';
-    const result = await execCommand(command, { timeout: 8000 });
+    const result = await runProviderCliCommand(provider.id, ['login', 'status'], {
+      timeout: 8000,
+      env: buildManagedProviderEnv(provider.id),
+    });
     const output = String(result.stdout || result.stderr || '').trim();
     const loggedIn = /logged in/i.test(output) || /chatgpt/i.test(output);
     return {
@@ -3289,39 +3313,12 @@ async function probeClaudeAuthStatus(providerId = getSelectedAiProvider()) {
 }
 
 async function probeNpmStatus() {
-  const result = await execCommand('npm --version', { timeout: 5000 });
-  if (result.error) {
-    return {
-      available: false,
-      version: null,
-      error: String(result.stderr || result.stdout || result.error.message || 'npm is not available.').trim(),
-    };
-  }
-  const version = String(result.stdout || result.stderr || '').trim().split(/\r?\n/)[0].trim();
-  return {
-    available: !!version,
-    version: version || null,
-    error: version ? null : 'npm version could not be determined.',
-  };
+  return localToolchain.probeEmbeddedNpmStatus();
 }
 
 async function probePlaywrightPackageStatus(npmStatus = null) {
-  const npm = npmStatus || await probeNpmStatus();
-  if (!npm.available) {
-    return {
-      available: false,
-      error: 'npm is required to bootstrap Playwright MCP.',
-      command: 'npm exec @playwright/mcp -- --help',
-    };
-  }
-  const result = await execCommand('npm exec @playwright/mcp -- --help', { timeout: 12000, maxBuffer: 1024 * 1024 });
-  const output = String(result.stdout || result.stderr || '').trim();
-  const available = !result.error && /Usage: Playwright MCP/i.test(output);
-  return {
-    available,
-    error: available ? null : (output || String(result.error && result.error.message || 'Playwright MCP bootstrap check failed.').trim()),
-    command: 'npm exec @playwright/mcp -- --help',
-  };
+  void npmStatus;
+  return localToolchain.probePlaywrightMcpStatus();
 }
 
 async function probeProviderPlaywrightSetup(providerId = getSelectedAiProvider()) {
@@ -3374,8 +3371,13 @@ async function probeAiSetupDiagnostics(providerId = getSelectedAiProvider()) {
     playwrightPackage,
     providerPlaywright,
     workspaceTrusted,
-    installCommand: getInstallCommand(normalizedProviderId),
-    autoInstallSupported: !!npm.available,
+    installCommand: localToolchain.getProviderInstallCommand(normalizedProviderId),
+    autoInstallSupported: !!(npm.available && playwrightPackage.available),
+    embeddedToolchain: {
+      root: localToolchain.getToolchainRoot(),
+      npmProjectDir: localToolchain.getNpmProjectDir(),
+      browsersDir: localToolchain.getPlaywrightBrowsersDir(),
+    },
     managedSessionRequired: requiresManagedAiSessionForFormFill(normalizedProviderId),
     tabRetentionNote: `${provider.displayName} の確認待ちでフォームタブを残すには、ダッシュボードの「AI を起動」で ${provider.displayName} を managed セッションとして起動してから実行する必要があります。`,
     launchExamples: getProviderLaunchExamples(normalizedProviderId),
@@ -3406,6 +3408,14 @@ async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider())
       error: `${provider.cliLabel} が未ログインです。先に ${provider.displayName} を起動してログインを完了してください。`,
     };
   }
+  const playwrightPackage = await probePlaywrightPackageStatus();
+  if (!playwrightPackage.available || !playwrightPackage.browserInstalled) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: `Playwright MCP / Chromium が未準備です。ダッシュボードの「AI CLI を準備」ボタンで ${provider.displayName} と Playwright をセットアップしてください。`,
+    };
+  }
   if (selectedProviderId === 'codex') {
     ensureCodexWorkspaceTrusted(PROJECT_ROOT);
   }
@@ -3417,7 +3427,7 @@ async function ensureClaudeAutomationReady(providerId = getSelectedAiProvider())
   }
   if (['codex', 'gemini'].includes(selectedProviderId)) {
     const playwrightSetup = await ensureProviderPlaywrightMcp(selectedProviderId, {
-      env: selectedProviderId === 'gemini' ? buildManagedProviderEnv(selectedProviderId) : process.env,
+      env: buildManagedProviderEnv(selectedProviderId),
     });
     if (!playwrightSetup.ok) {
       return {
@@ -3958,13 +3968,16 @@ async function startManagedAiSession(mode = 'default', providerId = getSelectedA
     ensureGeminiWorkspaceTrusted(PROJECT_ROOT);
   }
   const launchEnv = buildManagedProviderEnv(normalizedProviderId);
+  const executable = await resolveClaudeExecutable(normalizedProviderId);
+  if (process.platform === 'win32' && executable === provider.id) {
+    throw new Error(`${provider.cliLabel} が未インストールです。ダッシュボードの「AI CLI を準備」ボタンでセットアップしてください。`);
+  }
   const playwrightSetup = await ensureProviderPlaywrightMcp(normalizedProviderId, { env: launchEnv });
   if (!playwrightSetup.ok) {
     throw new Error(playwrightSetup.error);
   }
 
   const nodePty = require('node-pty');
-  const executable = await resolveClaudeExecutable(normalizedProviderId);
   const flags = buildLaunchArgs(normalizedProviderId, mode, {
     model: getConfiguredAiModel(normalizedProviderId),
     sessionId: normalizedProviderId === 'claude' ? crypto.randomUUID() : null,
@@ -4117,7 +4130,7 @@ async function openManagedAiViewerInExternalTerminal(providerId = getManagedAiPr
     const encoded = toPowerShellEncodedCommand(command);
     const child = spawn('cmd.exe', ['/c', 'start', '""', 'powershell.exe', '-NoExit', '-EncodedCommand', encoded], {
       cwd: PROJECT_ROOT,
-      env: process.env,
+      env: localToolchain.buildToolEnv(process.env),
       detached: true,
       stdio: 'ignore',
       windowsHide: false,
@@ -4135,7 +4148,7 @@ async function openManagedAiViewerInExternalTerminal(providerId = getManagedAiPr
       'tell application "Terminal" to activate',
     ], {
       cwd: PROJECT_ROOT,
-      env: process.env,
+      env: localToolchain.buildToolEnv(process.env),
       detached: true,
       stdio: 'ignore',
     });
@@ -4153,7 +4166,7 @@ async function openManagedAiViewerInExternalTerminal(providerId = getManagedAiPr
     try {
       const child = spawn(program, args, {
         cwd: PROJECT_ROOT,
-        env: process.env,
+        env: localToolchain.buildToolEnv(process.env),
         detached: true,
         stdio: 'ignore',
       });
@@ -4221,12 +4234,12 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
       version: null,
       installState: getProviderInstallState(activeHeadlessStatus.provider),
       installError: getProviderInstallError(activeHeadlessStatus.provider),
-      installCommand: getInstallCommand(activeHeadlessStatus.provider),
+      installCommand: localToolchain.getProviderInstallCommand(activeHeadlessStatus.provider),
     };
   }
   const runtimeProviderId = claudePty ? getManagedAiProvider() : selectedProviderId;
   const provider = getProvider(runtimeProviderId);
-  const installCommand = getInstallCommand(runtimeProviderId);
+  const installCommand = localToolchain.getProviderInstallCommand(runtimeProviderId);
 
   if (claudePty) {
     return {
@@ -4283,11 +4296,11 @@ async function probeClaudeStatus(providerId = getSelectedAiProvider()) {
     };
   }
 
-  const versionCommand = process.platform === 'win32'
-    ? `"${executable}" --version`
-    : `${provider.id} --version`;
-  const versionResult = await execCommand(versionCommand, { timeout: 5000 });
-  const version = versionResult.error ? null : (String(versionResult.stdout || versionResult.stderr || '').trim().split('\n')[0].trim() || null);
+  const versionResult = await runProviderCliCommand(runtimeProviderId, ['--version'], {
+    timeout: 5000,
+    env: buildManagedProviderEnv(runtimeProviderId),
+  });
+  const version = !versionResult.ok ? null : (String(versionResult.stdout || versionResult.stderr || '').trim().split('\n')[0].trim() || null);
   const runningResult = await execCommand(getProviderRunningCheckCommand(runtimeProviderId), { timeout: 3000 });
   const running = !runningResult.error && (runningResult.stdout || '').trim().length > 0;
   const auth = await probeClaudeAuthStatus(runtimeProviderId);
@@ -4774,6 +4787,9 @@ function buildPage() {
 <link rel="stylesheet" href="/assets/vendor/material-symbols.css">
 <link rel="stylesheet" href="/assets/vendor/phosphor.css">
 <link rel="stylesheet" href="/assets/vendor/tailwind.css">
+<link rel="stylesheet" href="/assets/vendor/js/xterm.css">
+<script src="/assets/vendor/js/xterm.js" defer></script>
+<script src="/assets/vendor/js/xterm-addon-fit.js" defer></script>
 <style>
 ${renderStyles()}
 </style>
@@ -5425,6 +5441,76 @@ ${renderStyles()}
 
   <!-- CLI Activity tab -->
   <div class="tab-content" id="tab-logs">
+    <!-- Embedded interactive terminal -->
+    <div id="cliTerminalCard" class="cli-term-card">
+      <div class="cli-term-head">
+        <div class="cli-term-title">
+          <span class="material-symbols-outlined" style="font-size:18px;color:var(--primary)">terminal</span>
+          <span>${_lang==='ja' ? 'ターミナル' : 'Terminal'}</span>
+          <span id="cliTermProviderBadge" class="cli-term-badge" style="display:none"></span>
+          <span id="cliTermStatusDot" class="cli-term-status-dot off" title=""></span>
+        </div>
+        <div class="cli-term-launchers">
+          <button type="button" class="cli-term-launch claude" data-cli-launch="claude">
+            <img src="/assets/vendor/ai-icons/claude-code.svg" alt="" class="cli-term-launch-icon" onerror="this.style.display='none'">
+            <span>Claude を起動</span>
+          </button>
+          <button type="button" class="cli-term-launch codex" data-cli-launch="codex">
+            <img src="/assets/vendor/ai-icons/codex-openai.svg" alt="" class="cli-term-launch-icon" onerror="this.style.display='none'">
+            <span>Codex を起動</span>
+          </button>
+          <button type="button" class="cli-term-launch gemini" data-cli-launch="gemini">
+            <img src="/assets/vendor/ai-icons/gemini-cli.svg" alt="" class="cli-term-launch-icon" onerror="this.style.display='none'">
+            <span>Gemini を起動</span>
+          </button>
+          <button type="button" class="cli-term-stop" data-cli-stop="1" disabled>
+            <span class="material-symbols-outlined" style="font-size:14px">stop_circle</span>
+            <span>停止</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Auth-error helper banner (auto-shown when /login or 401 detected) -->
+      <div id="cliTermAuthHelp" class="cli-term-auth-help" style="display:none">
+        <div class="cli-term-auth-help-icon">
+          <span class="material-symbols-outlined" style="font-size:22px">lock_open</span>
+        </div>
+        <div class="cli-term-auth-help-body">
+          <h4 id="cliTermAuthHelpTitle">認証が必要です</h4>
+          <p id="cliTermAuthHelpDesc">${_lang==='ja' ? 'Claude のログイン期限が切れています。下のボタンを押すとターミナルに「/login」が自動入力され、ブラウザでログイン画面が開きます。' : 'Authentication required. Press the button below to type "/login" automatically.'}</p>
+          <ol class="cli-term-auth-help-steps">
+            <li>下の「<b>/login を実行</b>」ボタンをクリック</li>
+            <li>ターミナルに <code>/login</code> が自動で入力されます</li>
+            <li>ブラウザが開く → Anthropic にログイン → 完了したらこの画面に戻る</li>
+            <li>もう一度「Claude を起動」を押すか、ダッシュボードで「AI を起動」</li>
+          </ol>
+          <div class="cli-term-auth-help-actions">
+            <button type="button" class="cli-term-auth-help-btn primary" data-cli-action="type-login">
+              <span class="material-symbols-outlined" style="font-size:14px">keyboard</span>
+              /login を実行
+            </button>
+            <button type="button" class="cli-term-auth-help-btn" data-cli-action="dismiss-help">閉じる</button>
+            <a href="https://docs.anthropic.com/en/docs/claude-code/quickstart" target="_blank" rel="noopener" class="cli-term-auth-help-btn link">
+              <span class="material-symbols-outlined" style="font-size:14px">help</span>公式ヘルプ
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- Empty state shown before first launch -->
+      <div id="cliTermEmpty" class="cli-term-empty">
+        <div class="cli-term-empty-illust">
+          <span class="material-symbols-outlined" style="font-size:36px;color:var(--text-3)">smart_toy</span>
+        </div>
+        <p class="cli-term-empty-title">AI CLI を起動してください</p>
+        <p class="cli-term-empty-sub">上の「Claude を起動」「Codex を起動」「Gemini を起動」のいずれかをクリックすると、ここに対話型ターミナルが立ち上がります。</p>
+        <p class="cli-term-empty-hint">初回はインストールが必要な場合があります。エラーが出たら自動で案内が表示されます。</p>
+      </div>
+
+      <!-- xterm container (shown after launch) -->
+      <div id="cliTermHost" class="cli-term-host" style="display:none"></div>
+    </div>
+
     <div style="background:#fff;border:1px solid var(--outline-variant);margin-bottom:10px">
       <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant)">
         <div style="display:flex;align-items:center;gap:10px">
@@ -6192,6 +6278,7 @@ ${renderSentCardRedesignScript()}
 ${renderDashboardScript()}
 ${renderAnalyticsScript()}
 ${renderColumnResizerScript()}
+${renderCliTerminalScript()}
 </script>
 
 </body>
@@ -6257,6 +6344,8 @@ function getAiRuntimeApiDispatch() {
       getProviderDisplayName,
       probeNpmStatus,
       probeClaudeStatus,
+      installAiRuntime: localToolchain.installAiRuntime,
+      getProviderInstallCommand: localToolchain.getProviderInstallCommand,
       setProviderInstallState,
       invalidateAiStatusCache,
       clearAiExecutablePath: (providerId) => { _aiExecutablePath[providerId] = null; },

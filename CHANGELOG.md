@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.11 - 2026-04-25
+
+- CLI Activity タブに「**Claude を起動 / Codex を起動 / Gemini を起動**」ボタンと内蔵対話ターミナル (xterm.js) を追加
+  - 既存 WebSocket (`/terminal`) + `/api/launch-ai` / `/api/stop-ai` / `/api/ai-input` と接続
+  - PTY 出力をブラウザ内で表示、キーストロークも双方向
+- 認証エラー(`Please run /login` / `API Error: 401` / `authentication_error` / `Invalid API key` / `token expired`) をリアルタイム検出すると、**手順入りの黄色アシストバナー** を自動表示
+  - 「**/login を実行**」ボタンでターミナルに自動入力
+  - 公式ドキュメントへのリンク併記
+- 非エンジニアでもログイン作業ができるよう、空状態のヘルプ文言・ステータス LED・閉じるボタンを整備
+
 ## v1.2.10 - 2026-04-25
 
 - `verify-release-readiness.cjs` を `nsis.differentialPackage: false` 時に blockmap 不存在を許容するよう修正 (v1.2.9 の Windows ビルド失敗対応)

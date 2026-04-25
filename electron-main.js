@@ -6,7 +6,6 @@ const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
-const { exec } = require('child_process');
 
 // 開発モードでは専用ディレクトリを使う（%APPDATA%\Electron を他アプリと共有しない）
 if (!app.isPackaged) {
@@ -27,6 +26,7 @@ const { resolveDataPath } = require('./src/data-paths.cjs');
 const { readRuntime } = require('./src/dashboard-runtime.cjs');
 const { FormSessionManager } = require('./src/form-session-manager.cjs');
 const { cleanupStaleFiles } = require('./src/startup-cleanup.cjs');
+const localToolchain = require('./src/local-toolchain.cjs');
 
 let mainWindow = null;
 let tray = null;
@@ -225,9 +225,9 @@ async function firstRunSetup() {
       message: '初回起動を検出しました',
       detail:
         '設定ファイルを作成しました。\n\n' +
-        'Playwright (ブラウザ自動化) と Claude Code CLI のインストールを試行できます。\n' +
-        '「インストール」を押すとバックグラウンドで順番に実行します。\n\n' +
-        '失敗した場合は、表示される手動手順に従ってください。',
+        'Sales Claw 内蔵セットアップで Playwright (Chromium) と Claude Code CLI の準備を試行できます。\n' +
+        'PC 側に Node.js / npm / Playwright が入っていなくても、アプリ管理下に順番に配置します。\n\n' +
+        '後からダッシュボードの「AI CLI を準備」ボタンでも実行できます。',
       buttons: ['インストール', 'スキップ（後で）'],
       defaultId: 0,
     });
@@ -239,7 +239,7 @@ async function firstRunSetup() {
   }
 }
 
-function runInstaller(command, title, message, failureTitle, failureDetail) {
+function runInstaller(task, title, message, failureTitle, failureDetail) {
   return new Promise((resolve) => {
     const win = new BrowserWindow({
       width: 560,
@@ -255,42 +255,45 @@ function runInstaller(command, title, message, failureTitle, failureDetail) {
       document.body.innerHTML = '<h3 style="margin:0 0 12px">${message}</h3><p style="color:#a6adc8;margin:0">しばらくお待ちください。</p>';
     `);
 
-    exec(command, {
-      cwd: __dirname,
-      shell: process.platform === 'win32',
-      windowsHide: process.platform === 'win32',
-    }, (err) => {
-      win.close();
-      if (err) {
+    Promise.resolve()
+      .then(task)
+      .then((result) => {
+        if (result && result.ok === false) {
+          throw new Error(result.error || result.cli?.error || result.playwright?.error || 'セットアップに失敗しました。');
+        }
+        win.close();
+        resolve(true);
+      })
+      .catch((err) => {
+        win.close();
         dialog.showMessageBox({
           type: 'warning',
           title: failureTitle,
           message: `${title} に失敗しました`,
-          detail: failureDetail,
+          detail: `${failureDetail}\n\n${err && err.message ? err.message : String(err || '')}`.trim(),
         });
-      }
-      resolve(!err);
-    });
+        resolve(false);
+      });
   });
 }
 
 function installPlaywright() {
   return runInstaller(
-    'npx playwright install chromium',
+    () => localToolchain.installPlaywrightChromium(),
     'Playwright インストール中...',
     'Playwright (Chromium) をインストール中...',
     'インストール警告',
-    '後で手動でインストールしてください:\nnpx playwright install chromium'
+    '後でダッシュボードの「AI CLI を準備」ボタンから再試行してください。'
   );
 }
 
 function installClaudeCli() {
   return runInstaller(
-    'npm install -g @anthropic-ai/claude-code',
+    () => localToolchain.installProviderCli('claude'),
     'Claude CLI インストール中...',
     'Claude Code CLI をインストール中...',
     'インストール警告',
-    '後で手動でインストールしてください:\nnpm install -g @anthropic-ai/claude-code'
+    '後でダッシュボードの「AI CLI を準備」ボタンから再試行してください。'
   );
 }
 

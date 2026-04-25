@@ -22,7 +22,6 @@
 
 const {
   getInstallCommand,
-  getInstallSpawnArgs,
 } = require('../ai-providers.cjs');
 
 /**
@@ -41,6 +40,8 @@ const {
  *
  * @param {function} ctx.probeNpmStatus - () → Promise<{ available, error? }>
  * @param {function} ctx.probeClaudeStatus - (providerId) → Promise<{ installed, version }>
+ * @param {function} ctx.installAiRuntime - (providerId) → Promise<Result>
+ * @param {function} ctx.getProviderInstallCommand - (providerId) → string
  * @param {function} ctx.setProviderInstallState - (providerId, state, error) → void
  * @param {function} ctx.invalidateAiStatusCache - (providerId?) → void
  * @param {function} ctx.clearAiExecutablePath - (providerId) → void (既存の `_aiExecutablePath[providerId] = null;` と同等)
@@ -71,6 +72,8 @@ module.exports = function createAiRuntimeRoutes(ctx) {
     getProviderDisplayName,
     probeNpmStatus,
     probeClaudeStatus,
+    installAiRuntime,
+    getProviderInstallCommand = getInstallCommand,
     setProviderInstallState,
     invalidateAiStatusCache,
     clearAiExecutablePath,
@@ -88,7 +91,7 @@ module.exports = function createAiRuntimeRoutes(ctx) {
 
   // ---------- 各ハンドラ関数 ----------
 
-  // POST /api/install-ai-cli (legacy: /api/install-claude-cli) — attempt automatic global install
+  // POST /api/install-ai-cli (legacy: /api/install-claude-cli) — install into Sales Claw's embedded toolchain
   async function handleInstallAi(req, res) {
     try {
       const body = await parseJsonBody(req).catch(() => ({}));
@@ -96,50 +99,36 @@ module.exports = function createAiRuntimeRoutes(ctx) {
       const provider = getProvider(providerId);
       const npmStatus = await probeNpmStatus();
       if (!npmStatus.available) {
-        const installError = `${provider.cliLabel} の自動インストールには npm が必要です。${npmStatus.error || ''}`.trim();
+        const installError = `${provider.cliLabel} の自動インストールに必要な内蔵 npm を起動できません。${npmStatus.error || ''}`.trim();
         setProviderInstallState(providerId, 'failed', installError);
         jsonResponse(res, 409, {
           ok: false,
           provider: providerId,
           providerLabel: provider.displayName,
           error: installError,
-          command: getInstallCommand(providerId),
+          command: getProviderInstallCommand(providerId),
         });
         return;
       }
-      const installSpec = getInstallSpawnArgs(providerId);
       setProviderInstallState(providerId, 'installing', null);
       invalidateAiStatusCache(providerId);
       clearAiExecutablePath(providerId);
 
-      const { spawn } = require('child_process');
-      const child = spawn(installSpec.command, installSpec.args, {
-        cwd: PROJECT_ROOT,
-        env: process.env,
-        shell: process.platform === 'win32',
-        windowsHide: process.platform === 'win32',
-      });
-
-      let stdout = '';
-      let stderr = '';
-      child.stdout && child.stdout.on('data', (data) => { stdout += data.toString(); });
-      child.stderr && child.stderr.on('data', (data) => { stderr += data.toString(); });
-
-      const result = await new Promise((resolve, reject) => {
-        child.on('error', reject);
-        child.on('close', (code) => resolve({ code }));
-      });
-
-      if (result.code !== 0) {
-        const installError = (stderr || stdout || `npm exited with code ${result.code}`).trim();
+      const result = await installAiRuntime(providerId);
+      if (!result.ok) {
+        const installError = String(
+          result.cli?.error
+          || result.playwright?.error
+          || `${provider.cliLabel} / Playwright setup failed.`
+        ).trim();
         setProviderInstallState(providerId, 'failed', installError);
         jsonResponse(res, 500, {
           ok: false,
           provider: providerId,
           providerLabel: provider.displayName,
           error: installError,
-          code: result.code,
-          command: getInstallCommand(providerId),
+          details: result,
+          command: getProviderInstallCommand(providerId),
         });
         return;
       }
@@ -154,7 +143,7 @@ module.exports = function createAiRuntimeRoutes(ctx) {
           provider: providerId,
           providerLabel: provider.displayName,
           error: installError,
-          command: getInstallCommand(providerId),
+          command: getProviderInstallCommand(providerId),
         });
         return;
       }
@@ -166,12 +155,13 @@ module.exports = function createAiRuntimeRoutes(ctx) {
         providerLabel: provider.displayName,
         installed: status.installed,
         version: status.version,
-        command: getInstallCommand(providerId),
+        playwright: result.playwright || null,
+        command: getProviderInstallCommand(providerId),
       });
     } catch (e) {
       const providerId = getSelectedAiProvider();
       setProviderInstallState(providerId, 'failed', e.message);
-      jsonResponse(res, 500, { ok: false, provider: providerId, error: e.message, command: getInstallCommand(providerId) });
+      jsonResponse(res, 500, { ok: false, provider: providerId, error: e.message, command: getProviderInstallCommand(providerId) });
     }
   }
 

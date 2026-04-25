@@ -33,6 +33,7 @@ extraResources:
 files:
   - "**/*"
   - "!dist/**"
+  - "!dist-released/**"
   - "!.git/**"
   - "!.github/**"
   - "!.electron-userdata/**"
