@@ -204,8 +204,14 @@ function checkDist() {
 
       if (/\.exe$/i.test(artifactName)) {
         const blockMapPath = `${artifactPath}.blockmap`;
+        // electron-builder.yml で nsis.differentialPackage: false の場合 blockmap は生成されない。
+        // その場合は blockmap 不存在を許容する。
+        const builderYml = fs.readFileSync(path.join(ROOT, 'electron-builder.yml'), 'utf8');
+        const differentialDisabled = /differentialPackage\s*:\s*false/i.test(builderYml);
         if (fs.existsSync(blockMapPath)) {
           pass(`${label}: Windows blockmap exists (${path.basename(blockMapPath)})`);
+        } else if (differentialDisabled) {
+          pass(`${label}: Windows blockmap intentionally absent (nsis.differentialPackage:false)`);
         } else {
           fail(`${label}: Windows blockmap is missing for ${artifactName}`);
         }

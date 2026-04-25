@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.10 - 2026-04-25
+
+- `verify-release-readiness.cjs` を `nsis.differentialPackage: false` 時に blockmap 不存在を許容するよう修正 (v1.2.9 の Windows ビルド失敗対応)
+- v1.2.9 は Windows 配布なし(Mac / Linux のみ)。実質的な内容は v1.2.10 と同じ
+
 ## v1.2.9 - 2026-04-25
 
 - 自動更新の差分配信 (`differentialPackage`) を無効化し、毎回フルインストーラ転送に切り替え
