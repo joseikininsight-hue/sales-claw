@@ -3973,9 +3973,18 @@ async function startManagedAiSession(mode = 'default', providerId = getSelectedA
   if (process.platform === 'win32' && executable === provider.id) {
     throw new Error(`${provider.cliLabel} が未インストールです。ダッシュボードの「AI CLI を準備」ボタンでセットアップしてください。`);
   }
+  // MCP Playwright check is blocking only when the launcher explicitly demands it
+  // (i.e. batch / form-fill paths). When launched from the in-browser terminal we
+  // treat the failure as a warning and let the user start an interactive session;
+  // the batch flow will re-validate separately when it actually needs MCP.
   const playwrightSetup = await ensureProviderPlaywrightMcp(normalizedProviderId, { env: launchEnv });
+  let mcpWarning = null;
   if (!playwrightSetup.ok) {
-    throw new Error(playwrightSetup.error);
+    if (options && options.requireMcp) {
+      throw new Error(playwrightSetup.error);
+    }
+    mcpWarning = playwrightSetup.error || `${provider.displayName} で MCP Playwright の設定確認に失敗しました (バッチ送信時のみ必要)。`;
+    console.warn('[launch-ai] non-blocking MCP warning:', mcpWarning);
   }
 
   const nodePty = require('node-pty');

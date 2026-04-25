@@ -36,12 +36,18 @@ const STYLE = [
   '.cli-term-empty-title{font-size:.86rem;font-weight:700;margin:0 0 6px;color:var(--text-1)}',
   '.cli-term-empty-sub{font-size:.74rem;color:var(--text-2);margin:0 0 4px;line-height:1.6}',
   '.cli-term-empty-hint{font-size:.68rem;color:var(--text-3);margin:0;font-style:italic}',
-  '.cli-term-host{height:460px;background:#0b0e14;padding:8px;position:relative;cursor:text}',
+  '.cli-term-host{height:460px;min-height:200px;max-height:80vh;background:#0b0e14;padding:8px;position:relative;cursor:text}',
   '.cli-term-host .xterm{height:100%;padding:0 4px}',
   '.cli-term-host .xterm-viewport{background-color:transparent!important}',
   '.cli-term-host .xterm-helper-textarea{z-index:5!important}',
   '.cli-term-host .xterm-screen{cursor:text}',
   '.cli-term-host:focus-within{outline:1px solid var(--primary);outline-offset:-1px}',
+  /* drag handle to resize the terminal vertically */
+  '.cli-term-resize{position:absolute;left:0;right:0;bottom:-1px;height:8px;cursor:ns-resize;z-index:20;display:flex;align-items:center;justify-content:center;transition:background .12s}',
+  '.cli-term-resize::before{content:"";width:48px;height:3px;border-radius:2px;background:rgba(255,255,255,.18);transition:background .12s}',
+  '.cli-term-resize:hover::before,.cli-term-resize.dragging::before{background:var(--primary)}',
+  '.cli-term-resize:hover,.cli-term-resize.dragging{background:rgba(37,99,235,.08)}',
+  'body.cli-term-resizing{cursor:ns-resize!important;user-select:none!important}',
   '.cli-term-auth-help{display:flex;gap:14px;padding:14px 18px;background:linear-gradient(135deg,rgba(217,119,6,.08) 0%,rgba(217,119,6,.02) 70%);border-bottom:1px solid rgba(217,119,6,.25);animation:cliFade .18s ease}',
   '@keyframes cliFade{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}',
   '.cli-term-auth-help-icon{width:36px;height:36px;border-radius:10px;background:var(--warning-dim);color:var(--warning);display:flex;align-items:center;justify-content:center;flex-shrink:0}',
@@ -139,6 +145,54 @@ const SCRIPT = `(function(){
     }
 
     term.open(refs.host);
+
+    // Restore saved height
+    try {
+      var savedH = parseInt(localStorage.getItem('cli-term:height') || '', 10);
+      if (Number.isFinite(savedH) && savedH >= 200 && savedH <= window.innerHeight * 0.85) {
+        refs.host.style.height = savedH + 'px';
+      }
+    } catch(_){}
+
+    // Insert drag-resize handle (south edge)
+    if (!refs.host.querySelector('.cli-term-resize')) {
+      var grip = document.createElement('div');
+      grip.className = 'cli-term-resize';
+      grip.title = 'ドラッグで高さを変更';
+      refs.host.appendChild(grip);
+      grip.addEventListener('mousedown', function(ev){
+        if (ev.button !== 0) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var startY = ev.clientY;
+        var startH = refs.host.getBoundingClientRect().height;
+        grip.classList.add('dragging');
+        document.body.classList.add('cli-term-resizing');
+        function onMove(e){
+          var dy = e.clientY - startY;
+          var next = Math.max(200, Math.min(window.innerHeight * 0.85, startH + dy));
+          refs.host.style.height = next + 'px';
+          try { fitAddon && fitAddon.fit(); } catch(_){}
+        }
+        function onUp(){
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          grip.classList.remove('dragging');
+          document.body.classList.remove('cli-term-resizing');
+          try {
+            var h = Math.round(refs.host.getBoundingClientRect().height);
+            localStorage.setItem('cli-term:height', String(h));
+          } catch(_){}
+          try { fitAddon && fitAddon.fit(); } catch(_){}
+          if (ws && ws.readyState === 1) {
+            try { ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows })); } catch(_){}
+          }
+        }
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    }
+
     // Re-fit several times to handle delayed layout (vendor fonts, panel toggle, etc.)
     [40, 120, 360, 800].forEach(function(ms){
       setTimeout(function(){

@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.2.15 - 2026-04-25
+
+- **MCP Playwright チェックを launch 時の必須から外す**
+  - `/api/launch-ai` の前段で MCP 設定確認に失敗してもエラーにせず警告ログだけにする
+  - Gemini / Codex の `mcp` サブコマンド未対応や偽陰性で起動できなかった問題を解消
+  - バッチ送信パスでは引き続き MCP 必須 (`requireMcp: true` 経路は据え置き)
+- **ターミナル高さをドラッグでリサイズ可能に**
+  - `cli-term-host` 下端にドラッグハンドル(8px / `cursor: ns-resize`)
+  - 200px〜画面の85% の範囲で自由調整、`localStorage('cli-term:height')` に永続化
+  - リサイズ中は `fitAddon.fit()` を毎フレーム呼んで PTY サイズも追従
+
 ## v1.2.14 - 2026-04-25
 
 - 内蔵ターミナルで「文字入力できない」「プロンプトが見切れる」問題を修正
