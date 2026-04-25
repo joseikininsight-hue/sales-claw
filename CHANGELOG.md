@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.19 - 2026-04-25
+
+- **インストーラサイズを 159MB → ~80MB に半減 (約50%減)**
+  - `next` (145MB) / `react-dom` (7MB) / `lucide-react` (6.5MB) / `react` を `dependencies` から `devDependencies` に移動
+  - これらは `lp:dev` (ランディングページ用 Next.js) でのみ使用され、デスクトップアプリは一切 import していなかった
+  - 結果: `resources/app/node_modules/` から ~160MB のデッドウェイトを削除
+  - 自動アップデートで毎回ダウンロードする量も同じく半減
+
 ## v1.2.18 - 2026-04-25
 
 - 自動アップデート後の "Cannot find module" 系起動失敗を根治
