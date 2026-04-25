@@ -36,9 +36,12 @@ const STYLE = [
   '.cli-term-empty-title{font-size:.86rem;font-weight:700;margin:0 0 6px;color:var(--text-1)}',
   '.cli-term-empty-sub{font-size:.74rem;color:var(--text-2);margin:0 0 4px;line-height:1.6}',
   '.cli-term-empty-hint{font-size:.68rem;color:var(--text-3);margin:0;font-style:italic}',
-  '.cli-term-host{height:380px;background:#0b0e14;padding:8px;position:relative}',
+  '.cli-term-host{height:460px;background:#0b0e14;padding:8px;position:relative;cursor:text}',
   '.cli-term-host .xterm{height:100%;padding:0 4px}',
   '.cli-term-host .xterm-viewport{background-color:transparent!important}',
+  '.cli-term-host .xterm-helper-textarea{z-index:5!important}',
+  '.cli-term-host .xterm-screen{cursor:text}',
+  '.cli-term-host:focus-within{outline:1px solid var(--primary);outline-offset:-1px}',
   '.cli-term-auth-help{display:flex;gap:14px;padding:14px 18px;background:linear-gradient(135deg,rgba(217,119,6,.08) 0%,rgba(217,119,6,.02) 70%);border-bottom:1px solid rgba(217,119,6,.25);animation:cliFade .18s ease}',
   '@keyframes cliFade{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}',
   '.cli-term-auth-help-icon{width:36px;height:36px;border-radius:10px;background:var(--warning-dim);color:var(--warning);display:flex;align-items:center;justify-content:center;flex-shrink:0}',
@@ -136,7 +139,26 @@ const SCRIPT = `(function(){
     }
 
     term.open(refs.host);
-    setTimeout(function(){ try { fitAddon && fitAddon.fit(); } catch(_){} }, 60);
+    // Re-fit several times to handle delayed layout (vendor fonts, panel toggle, etc.)
+    [40, 120, 360, 800].forEach(function(ms){
+      setTimeout(function(){
+        try {
+          fitAddon && fitAddon.fit();
+          if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          }
+        } catch(_){}
+      }, ms);
+    });
+
+    // Click-anywhere to focus the terminal — fixes "can't type" for new users
+    refs.host.addEventListener('mousedown', function(){
+      setTimeout(function(){ try { term.focus(); } catch(_){} }, 0);
+    });
+    // Window-level resize re-fit
+    window.addEventListener('resize', function(){
+      try { fitAddon && fitAddon.fit(); } catch(_){}
+    });
 
     term.onData(function(data) {
       if (ws && ws.readyState === 1) {
@@ -255,6 +277,7 @@ const SCRIPT = `(function(){
         if (payload.type === 'data' || payload.type === 'pty' || (typeof data === 'string' && data)) {
           if (term && data) {
             term.write(data);
+            term.scrollToBottom();
             detectAuthError(data);
           }
         } else if (payload.type === 'connected') {
@@ -274,6 +297,7 @@ const SCRIPT = `(function(){
         // raw text fallback
         if (term && typeof ev.data === 'string') {
           term.write(ev.data);
+          term.scrollToBottom();
           detectAuthError(ev.data);
         }
       }

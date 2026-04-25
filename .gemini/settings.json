@@ -1,13 +1,8 @@
 {
   "mcpServers": {
     "playwright": {
-      "command": "npm",
-      "args": [
-        "exec",
-        "@playwright/mcp",
-        "--browser",
-        "chrome"
-      ]
+      "command": "C:\\Users\\中澤圭志\\AppData\\Roaming\\sales-claw\\runtime\\tools\\bin\\playwright-mcp.cmd",
+      "args": []
     }
   }
 }
