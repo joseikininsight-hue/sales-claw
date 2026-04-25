@@ -16,7 +16,7 @@ const STYLE = [
   /* ---------- Sidebar ---------- */
   '.settings-sidebar.set2-styled{width:248px!important;padding:14px 10px!important;background:var(--bg-card)!important;border:1px solid var(--border-subtle)!important;border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient);align-self:flex-start;display:flex;flex-direction:column;gap:0;flex-shrink:0;position:sticky;top:64px}',
   '.set2-side-title{font-size:.6rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);padding:6px 12px;margin-bottom:4px}',
-  '.settings-sidebar-btn{display:flex!important;align-items:flex-start!important;gap:11px;padding:10px 12px!important;border:1px solid transparent;border-radius:var(--radius-md)!important;background:transparent;color:var(--text-1);text-align:left;cursor:pointer;transition:all .15s var(--ease-out-expo);width:100%;margin-bottom:4px;font-weight:600!important;text-transform:none!important;letter-spacing:0!important}',
+  '.settings-sidebar-btn{display:flex!important;align-items:center!important;gap:12px;padding:14px 14px!important;border:1px solid transparent;border-radius:var(--radius-md)!important;background:transparent;color:var(--text-1);text-align:left;cursor:pointer;transition:all .15s var(--ease-out-expo);width:100%;margin-bottom:8px;font-weight:600!important;text-transform:none!important;letter-spacing:0!important}',
   '.settings-sidebar-btn:hover{background:var(--bg-hover);border-color:transparent}',
   '.settings-sidebar-btn.active{background:var(--primary-glow);border-color:rgba(37,99,235,.18);color:var(--primary)}',
   '.settings-sidebar-btn.active .set2-side-icon{background:var(--primary);color:#fff}',
@@ -32,15 +32,17 @@ const STYLE = [
   /* ---------- Hide legacy setup guide once redesign loads ---------- */
   '.set2-active .settings-setup-guide{display:none!important}',
 
-  /* ---------- Sidebar footer hint ---------- */
-  '.set2-side-spacer{flex:1 1 auto;min-height:8px}',
-  '.set2-side-hint{margin:8px 6px 0;padding:10px 12px;background:var(--info-dim);border:1px solid rgba(124,58,237,.2);border-radius:var(--radius-md)!important;display:flex;align-items:center;gap:9px}',
-  '.set2-side-hint-icon{width:28px;height:28px;border-radius:8px!important;background:#fff;color:var(--info);display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid rgba(124,58,237,.2)}',
-  '.set2-side-hint-icon .material-symbols-outlined{font-size:16px}',
-  '.set2-side-hint-body{display:flex;flex-direction:column;gap:1px;min-width:0}',
-  '.set2-side-hint-title{font-size:.74rem;font-weight:700;color:var(--text-1);line-height:1.2}',
-  '.set2-side-hint-link{font-size:.66rem;color:var(--info);font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:3px;margin-top:1px}',
-  '.set2-side-hint-link:hover{text-decoration:underline}',
+  /* ---------- Sidebar footer hint (vertical card style, matches reference) ---------- */
+  '.set2-side-spacer{flex:1 1 auto;min-height:24px}',
+  '.set2-side-hint{margin:0 4px;padding:16px 16px 14px;background:var(--bg-surface);border:1px solid var(--primary-glow);border-radius:14px!important;display:flex;flex-direction:column;gap:10px}',
+  '.set2-side-hint-head{display:flex;align-items:center;gap:8px}',
+  '.set2-side-hint-icon{width:24px;height:24px;color:var(--primary);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}',
+  '.set2-side-hint-icon .material-symbols-outlined{font-size:20px;font-variation-settings:"FILL" 1}',
+  '.set2-side-hint-title{font-size:.86rem;font-weight:800;color:var(--primary);line-height:1.2}',
+  '.set2-side-hint-desc{font-size:.72rem;color:var(--text-2);margin:0;line-height:1.65}',
+  '.set2-side-hint-link{display:flex;align-items:center;justify-content:center;gap:6px;padding:9px 12px;background:var(--bg-card);border:1px solid var(--border-default);border-radius:10px!important;color:var(--primary);font-size:.76rem;font-weight:700;text-decoration:none;transition:all .15s var(--ease-out-expo);box-shadow:var(--shadow-xs)}',
+  '.set2-side-hint-link:hover{background:var(--primary-glow);border-color:var(--primary);box-shadow:var(--shadow-ambient)}',
+  '.set2-side-hint-link .material-symbols-outlined{font-size:14px}',
 
   /* ---------- Section header ---------- */
   '.set2-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 24px 18px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient)}',
@@ -381,11 +383,12 @@ const SCRIPT = `(function(){
       spacer.className = 'set2-side-spacer';
       var hint = document.createElement('div');
       hint.className = 'set2-side-hint';
-      hint.innerHTML = '<div class="set2-side-hint-icon"><span class="material-symbols-outlined">tips_and_updates</span></div>'
-        + '<div class="set2-side-hint-body">'
-        +   '<div class="set2-side-hint-title">設定のヒント</div>'
-        +   '<a class="set2-side-hint-link" href="https://github.com/joseikininsight-hue/sales-claw#readme" target="_blank" rel="noopener">詳細ガイドを見る <span class="material-symbols-outlined" style="font-size:12px">open_in_new</span></a>'
-        + '</div>';
+      hint.innerHTML = '<div class="set2-side-hint-head">'
+        +   '<span class="set2-side-hint-icon"><span class="material-symbols-outlined">lightbulb</span></span>'
+        +   '<span class="set2-side-hint-title">設定のヒント</span>'
+        + '</div>'
+        + '<p class="set2-side-hint-desc">各設定はAIがフォームを自動生成・最適化するために使用されます。</p>'
+        + '<a class="set2-side-hint-link" href="https://github.com/joseikininsight-hue/sales-claw#readme" target="_blank" rel="noopener">詳細ガイドを見る <span class="material-symbols-outlined">open_in_new</span></a>';
       sidebar.appendChild(spacer);
       sidebar.appendChild(hint);
     }
