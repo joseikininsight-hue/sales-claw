@@ -11,10 +11,10 @@
 
 「確認待ち」(awaiting_approval) にログを記録する前に、以下の全ステップを**必ず完了**すること:
 
-1. **フォームURLにアクセス** — Electronモード: `/api/form-session/create`、MCPモード: `browser_navigate`
-2. **フォーム構造を解析** — Electronモード: `/api/form-session/{id}/structure`、MCPモード: `browser_snapshot`
-3. **全フィールドに実際に入力** — Electronモード: `/api/form-session/{id}/fill`、MCPモード: `browser_fill_form`
-4. **入力済みフォームのスクリーンショット撮影** — Electronモード: `/api/form-session/{id}/screenshot`、MCPモード: `browser_take_screenshot` で `screenshots/ss-{No}-input.png`
+1. **フォームURLにアクセス** — MCP Playwright の `browser_navigate` / `browser_tabs` で公式サイト・問い合わせページを開く
+2. **フォーム構造を解析** — MCP Playwright の `browser_snapshot` でフィールドを特定
+3. **全フィールドに実際に入力** — MCP Playwright の `browser_fill_form` / `browser_type` / `browser_select_option` で会社名・氏名・メール・電話・本文を入力
+4. **入力済みフォームのスクリーンショット撮影** — MCP Playwright の `browser_take_screenshot` で `screenshots/ss-{No}-input.png`
 5. **ログ記録** — `form_fill` → `confirm_reached` → `awaiting_approval` の順でログ
 
 ### やってはいけないこと（厳禁）:
@@ -50,22 +50,46 @@
 - Claude Codeがその場で企業を分析し、メッセージを作成し、フォームに入力する
 - ダッシュボード（localhost:設定ポート）はUI表示・操作・設定管理
 
-### フォーム入力モード（2種類、優先順位あり）
+### フォーム入力モード
 
-**【第1優先】Electronモード — Form Session API**
-- Electronアプリが起動しているとき（ダッシュボードにアクセス可能なとき）はこちらを使う
-- POST /api/form-session/create → 構造取得 → マッピングJSON生成 → fill → screenshot
-- MCP Playwright は**使わない**（接続されていなくてOK）
-- ユーザーはダッシュボードの「フォーム確認」ボタンでElectron内フォームを確認して手動送信
+**MCP Playwright モードのみを使用する。**
 
-**【第2優先・フォールバック】MCP Playwrightモード**
-- Electronが起動していないとき（CLIのみで動かすとき）に使う
-- MCP Playwrightが接続されていないなら**このモードは使えない → エラーにする**
-- 調査フェーズ: サブエージェントが並列で Bash + node -e 実行（MCP不使用）
-- 入力フェーズ: browser_snapshot → browser_fill_form → browser_take_screenshot で1社ずつ入力
-- タブは閉じない（ユーザーが各タブで内容を確認して手動送信）
+- Claude Code CLI が企業サイトを確認し、問い合わせページを探し、フォーム構造を理解し、入力済み状態を保持する
+- フォーム操作は必ず MCP Playwright の `browser_*` ツールで行う
+- `/api/form-session/*`、Electron WebContentsView、direct JS automation、独自 Playwright worker はフォーム入力の代替に使わない
+- Electron ダッシュボードは UI表示・設定管理・ログ確認のために使う。フォーム探索/入力の主体ではない
+- MCP Playwright が見当たらない場合は、まず Claude Code の MCP 登録/再接続を確認する。Electron Form Session API へ切り替えない
+- 入力済みフォーム/確認画面/CAPTCHA/エラー根拠の最終タブだけを残し、探索残骸タブは閉じる
 
-**モード選択の原則: MCP Playwright が使えないなら即座にElectronモードへ切替える。絶対にMCPを必須条件にしない。**
+### タブ管理契約
+
+- 会社ごとの処理開始時に `browser_tabs` で既存タブを記録し、`baselineTabs` として扱う
+- 探索で開いた検索結果・候補ページ・会社サイト・プライバシー・ニュース等は `workingTabs` として管理する
+- 入力済みフォーム、確認画面、CAPTCHA、またはエラー根拠ページのうち最終確認に必要な1タブだけを `finalFormTab` として残す
+- `awaiting_approval` / `error` / `skipped` にする直前に `browser_tabs` で確認し、`baselineTabs` と `finalFormTab` 以外の `workingTabs` は閉じる
+- `submitted` の場合は `ss-{No}-sent.png` 保存後、その会社の `workingTabs` を閉じる
+- 既存の他社タブ、ユーザーが元から開いていたタブ、`baselineTabs` は閉じない
+- `logAction` の details には `finalFormTab` のURL、閉じたタブ数、残した理由を入れる
+
+## Desktop Release / Auto Update Gate
+
+**開発環境・Web環境・インストール済みElectronの差分を放置してはいけない。**
+
+デスクトップ配布に関わる変更をした場合、Claude Code / Codex は以下を必ず守る:
+
+1. プレビューダッシュボードは必ずルートの `npm run dashboard:preview` を使う。`.claude/worktrees/*` の 3480 表示だけを最新扱いしない
+2. 運用ダッシュボードの正本は `src/dashboard-server.cjs` + `src/ui/**` + `src/routes/**`。プレビュー/Electron は同じ正本から起動する
+3. Web版 `npm run lp:dev` はランディング/公開Web用。運用ダッシュボードの代替正本にしてはいけない
+4. `npm start` / `npm run dashboard:preview` / `npm run lp:dev` の表示だけで「デスクトップ版も最新」と判断しない
+5. リリース対象なら `package.json` / `package-lock.json` の version を必ず上げる
+6. ビルド前に `npm run verify:release` を実行する
+7. Windows配布物は `npm run dist:win -- --publish never` で生成する
+8. ビルド後に `npm run verify:dist` を実行し、`app-update.yml` と `latest.yml` の整合を確認する
+9. ローカルPCへ入れる場合は `npm run install:win` を使う。全ユーザー版は管理者PowerShellで `scripts/install-latest-win.ps1 -AllUsers`
+10. `electron-builder.yml` に `local-test` / `${env.GH_OWNER}` / `${env.GH_REPO}` を戻してはいけない
+11. `npm run verify:dist` が通るまで、自動アップデート準備完了と言ってはいけない
+
+詳細手順は `docs/release-parity-and-autoupdate.md`。Claude Code では `/release-parity` コマンドを使える。
 
 ## Configuration
 
@@ -104,79 +128,46 @@ cp data/sample-settings.json data/settings.json
 
 **1社あたりの必須フロー（省略不可）:**
 ```
-Step 0: モード検出（必ず最初に実行）
-  → Bash で以下を実行してElectronダッシュボードの疎通確認:
-      node -e "
-        const s = require('./settings-manager.cjs');
-        const port = s.getPort();
-        require('http').get('http://127.0.0.1:'+port+'/api/form-session', r => {
-          process.stdout.write(r.statusCode < 400 ? 'electron' : 'mcp');
-          process.exit(0);
-        }).on('error', () => { process.stdout.write('mcp'); process.exit(0); });
-      "
-  → 出力が 'electron' → Electronモードで進める（Step 3〜6はすべてForm Session API使用）
-  → 出力が 'mcp' → MCP Playwrightが接続されているか確認
-      - MCP Playwright接続済み → MCPフォールバックモードで進める
-      - MCP Playwright未接続  → ユーザーに「Electronアプリを起動してください」と伝えてエラーログを記録して終了
-  ★ 「MCP Playwrightが接続されていない」は単独でエラーにしない。Electronモードで代替できる。
+Step 0: MCP Playwright の利用前提
+  → このバッチは Claude Code CLI managed session から実行される
+  → フォーム探索・入力は MCP Playwright の browser_* ツールで行う
+  → Electron Form Session API の疎通確認は不要。/api/form-session/* には切り替えない
+  → MCP Playwright が見えない場合は、接続不備として error ログを残し、Sales Claw 側の MCP 再登録/再起動を促す
 
 Step 1: 企業サイト分析
-  → company-analyzer.cjs (Bash) でサイト巡回（Playwright不要 — HTTP fetchベース）
+  → MCP Playwright で公式サイト・問い合わせ導線を確認する
+  → 必要に応じて company-analyzer.cjs / settings-manager.cjs を Bash で補助的に使ってよい
   → logAction(no, name, 'site_analysis', 分析結果)
 
-Step 2: メッセージ生成（CLI言語能力を活用）
-  → message-builder.cjs の buildMessagePrompt(analysis) でプロンプト+コンテキスト生成
-  → CLIエージェントが messagePrompt に基づき、企業ごとにパーソナライズした文面を実際に作成
-  → approachObjective / approachGuardrails が自動反映される
-  → フォールバック: buildCustomMessage(analysis) のテンプレート文面
+Step 2: メッセージ生成
+  → settings-manager.cjs から送信者情報・強み・テンプレートを読み取る
+  → 対象サイトで確認した事実だけを使い、企業ごとに本文を作成
   → logAction(no, name, 'message_draft', メッセージ全文)
 
-Step 3: フォームセッション作成（Electronモード） / またはMCPフォールバック
-  ─── Electronモード（推奨） ───────────────────────────────
-  → POST /api/form-session/create  { formUrl, companyNo }
-  → sessionId を受け取る（Electron内 WebContentsView がバックグラウンドで開く）
-  → フォームURLが未登録なら「会社名 問い合わせ」でGoogle検索し公式ドメインを使う
-  ─── MCP Playwright フォールバック（Electron非起動時） ────
-  → 1社目: browser_navigate でフォームURLを開く
+Step 3: フォームURL探索
+  → 1社目: browser_navigate で公式サイトまたは既知フォーム候補を開く
   → 2社目以降: browser_evaluate で window.open(url,'_blank') → browser_tabs
-  → browser_snapshot でフォーム構造を解析
+  → 既知URLがない/不正なら、公式サイト内の「お問い合わせ」「Contact」「資料請求」「パートナー」等を Playwright で探索
+  → 検索結果を使う場合も公式ドメインか確認する
 
-Step 4: フォーム構造解析とマッピング判断
-  ─── Electronモード ──────────────────────────────────────
-  → GET /api/form-session/{sessionId}/structure
-  → 返ってきた [{selector, label, type, required}] を見て、どの項目に何を入れるか判断
-  → 以下のフォーマットでマッピングJSONを生成:
-    [
-      { "selector": "#company", "valueKey": "companyName", "type": "text" },
-      { "selector": "#email",   "valueKey": "email",       "type": "text" },
-      { "selector": "#message", "value": "生成した本文",   "type": "textarea" }
-    ]
-  → valueKey は sender の既知フィールド名（companyName/contactName/email/phone/address等）
-  → 自由テキスト（本文）は value に直接入れる
-  ─── MCP Playwright フォールバック ────────────────────────
-  → browser_fill_form で全フィールドに入力（従来通り）
+Step 4: フォーム構造解析
+  → browser_snapshot でフォーム構造を解析
+  → 営業NG/対象外/CAPTCHA/既存顧客専用/採用専用/IR専用/報道専用なら入力せず skipped/error
 
 Step 5: フォームに入力 ★ 絶対省略するな
-  ─── Electronモード ──────────────────────────────────────
-  → POST /api/form-session/{sessionId}/fill  { mappings: [...] }
-  → backend が settings の値を検証してから WebContentsView に入力
+  → browser_fill_form / browser_type / browser_select_option / browser_click で実入力
+  → 会社名・氏名・メール・電話・問い合わせ本文を最低限入力する
   → logAction(no, name, 'form_fill', '入力完了')
-  ─── MCP Playwright フォールバック ────────────────────────
-  → 従来通り。logAction(no, name, 'form_fill', '入力完了')
 
-Step 6: スクリーンショット ★ 絶対省略するな（ファイル名を厳守すること）
-  ─── Electronモード ──────────────────────────────────────
-  → POST /api/form-session/{sessionId}/screenshot  { suffix: "input" }
-  → Electron が capturePage() で screenshots/ss-{No}-input.png に保存
-  ─── MCP Playwright フォールバック ────────────────────────
+Step 6: スクリーンショット ★ 絶対省略するな
   → browser_take_screenshot で screenshots/ss-{No}-input.png に保存（必須）
+  → 確認画面がある場合は screenshots/ss-{No}-confirm.png も保存してよい
   → logAction(no, name, 'confirm_reached', 'スクショ撮影完了')
 
 Step 7: 確認待ちに登録
   → logAction(no, name, 'awaiting_approval', 'ダッシュボードで確認待ち')
   → ★ Step 5, 6 が完了していない場合、このステップに進んではいけない
-  → Electronモードでは WebContentsView がバックグラウンドで保持される
-  → ユーザーは確認待ちタブの「フォーム確認」ボタンで Electron 内のフォームを見て送信する
+  → awaiting_approval 前にタブ管理契約を実行し、入力済みフォーム/確認画面の finalFormTab だけを保持する
 ```
 
 **複数社の場合（2フェーズ並列処理）:**
@@ -202,17 +193,10 @@ Step 7: 確認待ちに登録
 → templateDraft はCLI生成に失敗した場合のフォールバック
 
 フェーズB（順次実行 — フォーム入力）:
-→ フェーズA.5完了後、1社ずつフォーム入力（Step 0で決定したモードに従う）
-
-  ─── Electronモード（ダッシュボード起動済み） ─────────────────
-  → 各社: POST /api/form-session/create → GET structure → マッピングJSON → POST fill
-           → POST screenshot → logAction(awaiting_approval)
-  → MCP Playwright は使わない
-
-  ─── MCPフォールバック（Electron未起動 かつ MCP接続済み） ────
-  → 各社: browser_navigate(新タブ) → browser_snapshot → browser_fill_form
-           → browser_take_screenshot → logAction(awaiting_approval)
-  → タブは閉じずに残す
+→ 1社ずつ MCP Playwright でフォーム探索・構造解析・入力・スクショを実行
+→ 各社: browser_navigate / browser_tabs → browser_snapshot → browser_fill_form
+         → browser_take_screenshot → logAction(awaiting_approval)
+→ 各社ごとに finalFormTab だけ残し、探索残骸タブは閉じる
 
 → thinking() + updateLiveMonitor() で進行状況をダッシュボードに通知
 

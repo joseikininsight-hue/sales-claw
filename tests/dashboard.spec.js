@@ -96,6 +96,40 @@ test.describe('Suite 1: settings-manager', () => {
     expect(all.preferences).toBeDefined();
     expect(all.companyProfile).toBeDefined();
   });
+
+  test('AIフォーム入力プロンプトが finalFormTab タブ管理契約を含む', () => {
+    const dashboardServer = require(path.join(PROJECT_ROOT, 'src', 'dashboard-server.cjs'));
+    const prompt = dashboardServer.__test.buildClaudeFormFillPrompt([
+      {
+        no: 999,
+        companyName: 'Tab Contract Test',
+        url: 'https://example.com',
+        formUrl: '',
+      },
+    ], {
+      companyName: 'Sender Inc.',
+      name: 'Sender Name',
+      email: 'sender@example.com',
+      phone: '03-0000-0000',
+    }, 'claude', { autoSendSafe: false });
+
+    expect(prompt).toContain('SALES_CLAW_TAB_CONTRACT');
+    expect(prompt).toContain('finalFormTab');
+    expect(prompt).toContain('baselineTabs');
+    expect(prompt).toContain('workingTabs');
+    expect(prompt).toContain('既存の他社タブ');
+    expect(prompt).toContain('tabContract":"finalFormTabOnly');
+  });
+
+  test('managed session 契約も finalFormTab タブ管理契約を含む', () => {
+    const dashboardServer = require(path.join(PROJECT_ROOT, 'src', 'dashboard-server.cjs'));
+    const contract = dashboardServer.__test.buildManagedAiSessionContract('claude', { autoSendSafe: false });
+
+    expect(contract).toContain('SALES_CLAW_TAB_CONTRACT');
+    expect(contract).toContain('finalFormTab');
+    expect(contract).toContain('browser_tabs');
+    expect(contract).toContain('baselineTabs');
+  });
 });
 
 // ── Suite 2: Dashboard HTTP API tests ─────────────────────────────────────────

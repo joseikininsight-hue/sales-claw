@@ -128,6 +128,131 @@ function isPathInsideDirectory(baseDir, targetPath) {
   return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
+// ── Field purpose inference ──────────────────────────────────────────────
+//
+// フィールドの label/placeholder/name/id から用途を推定する純関数。
+// 判定優先度:
+//   1) type === 'textarea'  → 'message'（本文系はほぼ textarea）
+//   2) type === 'email'     → 'email'
+//   3) type === 'tel'       → 'phone'
+//   4) テキスト照合: label > placeholder > name > id の順で優先
+//
+// ラベルバリエーションをなるべく広くカバーする（和英混在・表記ゆれ対応）。
+const PURPOSE_PATTERNS = [
+  // kana 系は name 判定より先に除外（氏名と誤判定されないように）
+  { purpose: '__kana__', patterns: [/kana/i, /furigana/i, /フリガナ/, /ふりがな/, /カナ/] },
+  // message（本文系） — textarea で引っかからなかったケースの救済も兼ねる
+  {
+    purpose: 'message',
+    patterns: [
+      /お問い?合わせ内容/, /問い?合わせ内容/, /お問い?合せ内容/, /問い?合せ内容/,
+      /ご質問/, /ご要望/, /ご相談内容/, /ご相談/, /ご用件/, /用件/,
+      /メッセージ/, /ご意見/, /ご感想/,
+      /詳細/, /本文/, /内容/, /備考/, /自由記述/, /コメント/,
+      /inquiry/i, /message/i, /content/i, /comment/i, /details?/i, /body/i,
+      /question/i, /remarks?/i, /note[s]?/i, /description/i,
+    ],
+  },
+  // email
+  {
+    purpose: 'email',
+    patterns: [/メール/, /メアド/, /e-?mail/i, /email/i, /mail(?!ing)/i, /e_mail/i],
+  },
+  // phone
+  {
+    purpose: 'phone',
+    patterns: [
+      /電話/, /TEL/i, /tel[-_]?no/i, /phone/i, /telephone/i, /contact[-_]?number/i,
+    ],
+  },
+  // company
+  {
+    purpose: 'company',
+    patterns: [
+      /会社名/, /企業名/, /貴社名/, /御社名/, /法人名/, /団体名/, /事業者名/, /組織名/,
+      /^会社$/, /company/i, /corporation/i, /organi[sz]ation/i, /corp\b/i, /firm\b/i,
+    ],
+  },
+  // department
+  {
+    purpose: 'department',
+    patterns: [/部署/, /所属/, /部門/, /department/i, /division/i, /section/i],
+  },
+  // title / 役職
+  {
+    purpose: 'title',
+    patterns: [/役職/, /職位/, /肩書/, /ポジション/, /position/i, /job[-_]?title/i, /\btitle\b/i],
+  },
+  // address
+  {
+    purpose: 'address',
+    patterns: [
+      /住所/, /所在地/, /所在/, /市区町村/, /番地/, /ご住所/,
+      /address/i, /addr\b/i, /street/i, /city/i, /prefecture/i,
+    ],
+  },
+  // url / Webサイト
+  {
+    purpose: 'url',
+    patterns: [
+      /URL/i, /ウェブ?サイト/, /ホームページ/, /自社サイト/, /HP/,
+      /website/i, /web[-_]?site/i, /homepage/i, /site[-_]?url/i,
+    ],
+  },
+  // name（最後に判定 — 他分類より具体性が低いため）
+  {
+    purpose: 'name',
+    patterns: [
+      /お名前/, /氏名/, /担当者名/, /担当者/, /ご担当者/, /ご氏名/, /^名前$/,
+      /\bname\b/i, /full[-_]?name/i, /your[-_]?name/i, /contact[-_]?name/i,
+      /first[-_]?name/i, /last[-_]?name/i,
+    ],
+  },
+];
+
+function _matchPurpose(text) {
+  if (!text) return null;
+  const s = String(text);
+  // kana 判定は最優先で潰す（name 系に到達させない）
+  for (const { patterns } of PURPOSE_PATTERNS.filter((p) => p.purpose === '__kana__')) {
+    if (patterns.some((re) => re.test(s))) return '__kana__';
+  }
+  for (const { purpose, patterns } of PURPOSE_PATTERNS) {
+    if (purpose === '__kana__') continue;
+    if (patterns.some((re) => re.test(s))) return purpose;
+  }
+  return null;
+}
+
+function inferFieldPurpose(field) {
+  if (!field || typeof field !== 'object') return 'unknown';
+
+  const type = String(field.type || '').toLowerCase();
+
+  // type ベースの早期判定
+  if (type === 'textarea') return 'message';
+  if (type === 'email') return 'email';
+  if (type === 'tel') return 'phone';
+  if (type === 'url') return 'url';
+
+  // label > placeholder > name > id の順で判定
+  const candidates = [field.label, field.placeholder, field.name, field.id];
+  for (const c of candidates) {
+    const hit = _matchPurpose(c);
+    if (hit && hit !== '__kana__') return hit;
+    if (hit === '__kana__') {
+      // kana なら name には分類しない。以降の候補も name に該当しても返さない。
+      // ただし次の候補が email/phone/company 等の別カテゴリなら拾う。
+      for (const rest of candidates.slice(candidates.indexOf(c) + 1)) {
+        const h2 = _matchPurpose(rest);
+        if (h2 && h2 !== '__kana__' && h2 !== 'name') return h2;
+      }
+      return 'unknown';
+    }
+  }
+  return 'unknown';
+}
+
 class FormSessionManager {
   constructor(getMainWindow) {
     this._getMainWindow = getMainWindow;
@@ -267,7 +392,7 @@ class FormSessionManager {
     const session = this._sessions.get(sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
 
-    const structure = await session.view.webContents.executeJavaScript(`
+    const raw = await session.view.webContents.executeJavaScript(`
       (function () {
         const escapeCSS = (str) => str.replace(/([!"#$%&'()*+,./:;<=>?@[\\]^{|}~])/g, '\\\\$1');
         const fields = [];
@@ -314,11 +439,67 @@ class FormSessionManager {
           fields.push(field);
         });
 
-        return fields;
+        // CAPTCHA検出
+        const captchaNodes = document.querySelectorAll(
+          '.g-recaptcha, [data-sitekey], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="turnstile"]'
+        );
+        const hasCaptcha = captchaNodes.length > 0;
+
+        // iframe検出 + cross-origin判定
+        const iframes = document.querySelectorAll('iframe');
+        const hasIframeForm = iframes.length > 0;
+        let iframeIsCrossOrigin = false;
+        try {
+          const origin = window.location.origin;
+          for (const f of iframes) {
+            const src = f.getAttribute('src') || '';
+            if (!src) continue;
+            try {
+              const u = new URL(src, window.location.href);
+              if (u.origin && u.origin !== origin) { iframeIsCrossOrigin = true; break; }
+            } catch (_) {}
+          }
+        } catch (_) {}
+
+        return { fields, hasCaptcha, hasIframeForm, iframeIsCrossOrigin };
       })()
     `);
 
-    return structure;
+    const rawFields = Array.isArray(raw && raw.fields) ? raw.fields : [];
+    // サーバー側で用途ヒントを推定して付与する（CLIマッピング判断を支援）
+    const fields = rawFields.map((f) => ({ ...f, purpose: inferFieldPurpose(f) }));
+    const meta = {
+      fieldCount: fields.length,
+      hasCaptcha: !!(raw && raw.hasCaptcha),
+      hasIframeForm: !!(raw && raw.hasIframeForm),
+      iframeIsCrossOrigin: !!(raw && raw.iframeIsCrossOrigin),
+      hasMessageField: fields.some((f) => f.purpose === 'message'),
+    };
+
+    // 推奨ステータスの判定（純粋に meta から導出）
+    // - CAPTCHA検出 → 人間送信委譲
+    // - cross-origin iframe かつ項目検出不可 → 人間送信委譲
+    // - フォームなしの静的ページ → skipped（営業NGの可能性大）
+    // - それ以外 → proceed
+    let recommendedStatus;
+    let recommendedReason;
+    if (meta.hasCaptcha) {
+      recommendedStatus = 'awaiting_approval';
+      recommendedReason = 'CAPTCHA検出のため手動送信委譲';
+    } else if (meta.hasIframeForm && meta.iframeIsCrossOrigin && meta.fieldCount === 0) {
+      recommendedStatus = 'awaiting_approval';
+      recommendedReason = 'cross-origin iframe でフォーム項目が検出できないため手動送信委譲';
+    } else if (meta.fieldCount === 0 && !meta.hasIframeForm) {
+      recommendedStatus = 'skipped';
+      recommendedReason = 'フォーム項目が検出できない静的ページ（営業NG/対象外の可能性）';
+    } else {
+      recommendedStatus = 'proceed';
+      recommendedReason = 'フォーム項目を検出。通常フローで入力可能';
+    }
+    meta.recommendedStatus = recommendedStatus;
+    meta.recommendedReason = recommendedReason;
+
+    return { fields, meta };
   }
 
   // ── Form filling ─────────────────────────────────────────────────────
@@ -476,4 +657,4 @@ class FormSessionManager {
   }
 }
 
-module.exports = { FormSessionManager };
+module.exports = { FormSessionManager, inferFieldPurpose };

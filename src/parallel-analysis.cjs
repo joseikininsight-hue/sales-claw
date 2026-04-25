@@ -273,6 +273,8 @@ async function main() {
 
     let resolvedFormUrl = formUrl || '';
     let formResolutionMethod = resolvedFormUrl ? 'preset' : 'none';
+    // 初期値は 'unknown' としておき、下流で null チェック漏れが起きないようにする
+    let resolvedFormType = resolvedFormUrl ? 'contact_form' : 'unknown';
     if (!resolvedFormUrl && url) {
       thinking(`[No.${no}] ${companyName}: フォームURL探索中`);
       updateLiveMonitor(no, {
@@ -284,18 +286,50 @@ async function main() {
       });
       const resolved = await resolveContactFormUrl(url);
       if (resolved && resolved.found && resolved.formUrl) {
-        resolvedFormUrl = resolved.formUrl;
         formResolutionMethod = resolved.method || 'resolved';
-        log(`[No.${no}] ${companyName}: フォームURL解決 ${resolvedFormUrl}`, 'step');
+        resolvedFormType = resolved.formType || 'contact_form';
+        // 発見したページに <form> が存在しない場合（メール/電話のみ）は formUrl を採用しない
+        // → 下流の email_only/phone_only 分岐で skipped になる
+        if (resolved.hasForm === false && (resolvedFormType === 'email_only' || resolvedFormType === 'phone_only')) {
+          log(`[No.${no}] ${companyName}: 問い合わせページ発見もフォームなし (${resolvedFormType}) → skipped 対象`, 'warn');
+        } else {
+          resolvedFormUrl = resolved.formUrl;
+          log(`[No.${no}] ${companyName}: フォームURL解決 ${resolvedFormUrl}`, 'step');
+        }
       } else {
         formResolutionMethod = resolved && resolved.reason ? resolved.reason : 'unresolved';
-        log(`[No.${no}] ${companyName}: フォームURL未解決 (${formResolutionMethod})`, 'warn');
+        resolvedFormType = (resolved && resolved.formType) || 'not_found';
+        log(`[No.${no}] ${companyName}: フォームURL未解決 (${formResolutionMethod}, type=${resolvedFormType})`, 'warn');
       }
     }
 
     if (resolvedFormUrl) {
       analysis.resolvedFormUrl = resolvedFormUrl;
       analysis.formResolutionMethod = formResolutionMethod;
+      analysis.formType = resolvedFormType;
+    } else if (resolvedFormType) {
+      analysis.formType = resolvedFormType;
+    }
+
+    // formType に応じた早期リターン分岐:
+    //   email_only → skipped (メールのみ = フォームなし)
+    //   phone_only → skipped (電話のみ = フォームなし)
+    //   not_found  → 従来の error 経路を維持（下流でメッセージ生成失敗時に拾う）
+    if (!resolvedFormUrl && (resolvedFormType === 'email_only' || resolvedFormType === 'phone_only')) {
+      const skipReason = resolvedFormType === 'email_only'
+        ? 'メール問い合わせのみ: フォームなし'
+        : '電話問い合わせのみ: フォームなし';
+      log(`[No.${no}] ${companyName}: ${skipReason}`, 'warn');
+      actionLogger.logAction(no, companyName, 'skipped', skipReason);
+      updateLiveMonitor(no, {
+        companyNo: no,
+        companyName,
+        status: 'skipped',
+        step: skipReason,
+      });
+      const result = { ok: false, no, companyName, skipped: true, reason: skipReason, formType: resolvedFormType };
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exit(0);
     }
 
     // Step 2: メッセージ生成

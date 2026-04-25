@@ -58,6 +58,26 @@
   - 入力フェーズ: メインがMCP Playwrightで snapshot→ref指定→fill_form で1社ずつ確実入力
   - 各社を別タブで処理し、タブは閉じない（ユーザーが各タブで送信操作可能）
 
+## Desktop Release / Auto Update Gate
+
+**開発環境・Web環境・インストール済みElectronの差分を放置してはいけない。**
+
+デスクトップ配布に関わる変更をした場合、Claude Code / Codex は以下を必ず守る:
+
+1. プレビューダッシュボードは必ずルートの `npm run dashboard:preview` を使う。`.claude/worktrees/*` の 3480 表示だけを最新扱いしない
+2. 運用ダッシュボードの正本は `src/dashboard-server.cjs` + `src/ui/**` + `src/routes/**`。プレビュー/Electron は同じ正本から起動する
+3. Web版 `npm run lp:dev` はランディング/公開Web用。運用ダッシュボードの代替正本にしてはいけない
+4. `npm start` / `npm run dashboard:preview` / `npm run lp:dev` の表示だけで「デスクトップ版も最新」と判断しない
+5. リリース対象なら `package.json` / `package-lock.json` の version を必ず上げる
+6. ビルド前に `npm run verify:release` を実行する
+7. Windows配布物は `npm run dist:win -- --publish never` で生成する
+8. ビルド後に `npm run verify:dist` を実行し、`app-update.yml` と `latest.yml` の整合を確認する
+9. ローカルPCへ入れる場合は `npm run install:win` を使う。全ユーザー版は管理者PowerShellで `scripts/install-latest-win.ps1 -AllUsers`
+10. `electron-builder.yml` に `local-test` / `${env.GH_OWNER}` / `${env.GH_REPO}` を戻してはいけない
+11. `npm run verify:dist` が通るまで、自動アップデート準備完了と言ってはいけない
+
+詳細手順は `docs/release-parity-and-autoupdate.md`。Claude Code では `/release-parity` コマンドを使える。
+
 ## Configuration
 
 全設定は `data/settings.json` で管理。ダッシュボードのSettingsタブから編集可能。

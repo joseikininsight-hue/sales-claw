@@ -142,6 +142,22 @@ function looksLikeContactPage(html) {
   );
 }
 
+// ページ本文から接触手段を判別するヘルパー
+// 'contact_form' — <form>/<input name=...> を含む
+// 'email_only' — mailto: リンクのみ
+// 'phone_only' — tel:リンクのみ
+// 'not_found' — いずれもなし
+function classifyPageContent(html) {
+  const safe = String(html || '').toLowerCase();
+  const hasForm = /<form\b[^>]*>/i.test(safe) || /<input\b[^>]+name\s*=/i.test(safe);
+  const hasMailto = /mailto:/i.test(safe);
+  const hasTel = /tel:\+?\d/i.test(safe);
+  if (hasForm) return 'contact_form';
+  if (hasMailto) return 'email_only';
+  if (hasTel) return 'phone_only';
+  return 'not_found';
+}
+
 async function probeUrl(targetUrl) {
   const html = await fetchText(targetUrl);
   if (!html) return { ok: false, url: targetUrl };
@@ -154,12 +170,12 @@ async function probeUrl(targetUrl) {
 
 async function resolveContactFormUrl(siteUrl) {
   if (!siteUrl || !isSafeUrl(siteUrl)) {
-    return { found: false, reason: 'invalid-url', formUrl: '' };
+    return { found: false, reason: 'invalid-url', formUrl: '', formType: 'not_found' };
   }
 
   const html = await fetchText(siteUrl);
   if (!html) {
-    return { found: false, reason: 'fetch-failed', formUrl: '' };
+    return { found: false, reason: 'fetch-failed', formUrl: '', formType: 'not_found' };
   }
 
   const links = extractLinks(html, siteUrl)
@@ -168,15 +184,25 @@ async function resolveContactFormUrl(siteUrl) {
     .sort((a, b) => b.score - a.score)
     .slice(0, 6);
 
+  let lastCandidateHtml = '';
+
   for (const link of links) {
-    const probed = await probeUrl(link.href);
-    if (probed.ok) {
+    const candidateHtml = await fetchText(link.href);
+    if (candidateHtml) lastCandidateHtml = candidateHtml;
+    const isContact = looksLikeContactPage(candidateHtml);
+    if (isContact) {
+      const hasForm = /<form\b/i.test(candidateHtml) || /<textarea\b/i.test(candidateHtml);
+      // looksLikeContactPage が true でも <form> が無ければ、本文から mailto:/tel: を判定して分類
+      const formType = hasForm
+        ? 'contact_form'
+        : classifyPageContent(candidateHtml);
       return {
         found: true,
         formUrl: link.href,
         method: 'link',
         linkText: link.text,
-        hasForm: !!probed.hasForm,
+        hasForm,
+        formType,
       };
     }
   }
@@ -197,25 +223,48 @@ async function resolveContactFormUrl(siteUrl) {
 
   for (const pathName of commonPaths) {
     const candidate = new URL(pathName, base).href;
-    const probed = await probeUrl(candidate);
-    if (probed.ok) {
+    const candidateHtml = await fetchText(candidate);
+    if (candidateHtml) lastCandidateHtml = candidateHtml;
+    const isContact = looksLikeContactPage(candidateHtml);
+    if (isContact) {
+      const hasForm = /<form\b/i.test(candidateHtml) || /<textarea\b/i.test(candidateHtml);
+      const formType = hasForm ? 'contact_form' : classifyPageContent(candidateHtml);
       return {
         found: true,
         formUrl: candidate,
         method: 'common-path',
-        hasForm: !!probed.hasForm,
+        hasForm,
+        formType,
       };
     }
+  }
+
+  // リンク候補あり / 接触ページと判定できない場合: 最後に見たページ or トップを分類
+  // 候補がない場合はトップページを分類して email_only / phone_only を判定
+  const classifyTarget = lastCandidateHtml || html;
+  const pageType = classifyPageContent(classifyTarget);
+
+  // pageType が 'contact_form' でも resolveContactFormUrl がここまで来るのは
+  // looksLikeContactPage が false だった稀なケース → 保守的に not_found 扱い
+  let formType;
+  if (pageType === 'email_only') {
+    formType = 'email_only';
+  } else if (pageType === 'phone_only') {
+    formType = 'phone_only';
+  } else {
+    formType = 'not_found';
   }
 
   return {
     found: false,
     reason: links.length > 0 ? 'candidate-not-contact' : 'no-candidate',
     formUrl: '',
+    formType,
   };
 }
 
 module.exports = {
   resolveContactFormUrl,
   isSafeUrl,
+  classifyPageContent,
 };

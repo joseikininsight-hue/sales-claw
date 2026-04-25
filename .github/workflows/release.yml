@@ -47,12 +47,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify release/update guardrails
+        run: npm run verify:release
+
       - name: Build Electron app
         run: npx electron-builder --${{ matrix.platform }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_OWNER: ${{ github.repository_owner }}
-          GH_REPO: ${{ github.event.repository.name }}
+
+      - name: Verify packaged update metadata
+        if: matrix.platform == 'win'
+        run: npm run verify:dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -60,8 +65,11 @@ jobs:
           name: dist-${{ matrix.platform }}
           path: |
             dist/*.exe
+            dist/*.exe.blockmap
             dist/*.dmg
+            dist/*.dmg.blockmap
             dist/*.AppImage
+            dist/*.AppImage.blockmap
             dist/latest*.yml
           if-no-files-found: warn
           retention-days: 7
@@ -91,8 +99,11 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             dist-all/*.exe
+            dist-all/*.exe.blockmap
             dist-all/*.dmg
+            dist-all/*.dmg.blockmap
             dist-all/*.AppImage
+            dist-all/*.AppImage.blockmap
             dist-all/latest*.yml
           body: |
             ## ダウンロード方法

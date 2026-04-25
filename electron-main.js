@@ -26,6 +26,7 @@ const settingsManager = require('./src/settings-manager.cjs');
 const { resolveDataPath } = require('./src/data-paths.cjs');
 const { readRuntime } = require('./src/dashboard-runtime.cjs');
 const { FormSessionManager } = require('./src/form-session-manager.cjs');
+const { cleanupStaleFiles } = require('./src/startup-cleanup.cjs');
 
 let mainWindow = null;
 let tray = null;
@@ -91,6 +92,12 @@ function getIcon(size = 'icon') {
     path.join(__dirname, 'assets', `${size}.png`),
     path.join(__dirname, 'assets', 'icon.png'),
   ];
+  if (process.resourcesPath && app.isPackaged) {
+    candidates.push(
+      path.join(process.resourcesPath, 'assets', `${size}.png`),
+      path.join(process.resourcesPath, 'assets', 'icon.png')
+    );
+  }
   for (const p of candidates) {
     if (fs.existsSync(p)) return nativeImage.createFromPath(p);
   }
@@ -295,6 +302,18 @@ if (singleInstanceLock) {
 }
 
 app.whenReady().then(async () => {
+  try {
+    const cleanup = cleanupStaleFiles();
+    if (cleanup.removed.length > 0) {
+      console.log(`[startup-cleanup] removed ${cleanup.removed.length} stale files`);
+    }
+    if (cleanup.errors.length > 0) {
+      console.warn(`[startup-cleanup] ${cleanup.errors.length} errors during cleanup`);
+    }
+  } catch (e) {
+    console.warn('[startup-cleanup] unexpected error:', e.message);
+  }
+
   // macOS Dock 非表示（トレイアプリとして動作）
   if (process.platform === 'darwin' && app.dock) app.dock.hide();
 

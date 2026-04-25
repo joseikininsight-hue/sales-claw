@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1440">
+<title>Sales Claw — AI営業自動化ダッシュボード</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700;900&display=swap" rel="stylesheet">
+<style>
+/* ─── Reset & Base ─── */
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --blue:#3b82f6;--blue-dim:#2563eb;--blue-glow:rgba(59,130,246,.1);
+  --green:#10b981;--amber:#f59e0b;--red:#ef4444;--violet:#8b5cf6;
+  --ink1:#0f172a;--ink2:#334155;--ink3:#64748b;--ink4:#94a3b8;--ink5:#cbd5e1;
+  --bg0:#f0eee9;--bg1:#f8f7f3;--bg2:#fff;--bg3:#f1f5f9;
+  --border:rgba(15,23,42,.08);--border2:rgba(15,23,42,.14);
+  --shadow-xs:0 1px 2px rgba(15,23,42,.05);
+  --shadow-sm:0 1px 3px rgba(15,23,42,.08),0 4px 12px rgba(15,23,42,.04);
+  --shadow-md:0 4px 16px rgba(15,23,42,.08),0 12px 32px rgba(15,23,42,.05);
+  --shadow-lg:0 8px 32px rgba(15,23,42,.1),0 24px 64px rgba(15,23,42,.06);
+  --ease:cubic-bezier(.16,1,.3,1);
+  --font:'Inter','Noto Sans JP',system-ui,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+  --r-sm:4px;--r-md:8px;--r-lg:12px;--r-xl:16px;--r-2xl:20px;--r-full:9999px;
+}
+html,body{font-family:var(--font);background:var(--bg0);color:var(--ink1);font-size:14px;line-height:1.5;min-height:100vh;overflow-x:hidden}
+img{display:block}
+
+/* ─── Page Layout ─── */
+.page-wrap{max-width:1440px;margin:0 auto}
+
+/* ─── Hero Section ─── */
+.hero{
+  background:linear-gradient(160deg,#0b0f1a 0%,#111827 40%,#0f1e3a 100%);
+  padding:72px 60px 0;
+  position:relative;overflow:hidden;
+}
+.hero::before{
+  content:'';position:absolute;top:-200px;right:-200px;
+  width:700px;height:700px;
+  background:radial-gradient(circle,rgba(59,130,246,.15) 0%,transparent 70%);
+  pointer-events:none;
+}
+.hero::after{
+  content:'';position:absolute;bottom:0;left:0;right:0;height:120px;
+  background:linear-gradient(to bottom,transparent,var(--bg0));
+  pointer-events:none;
+}
+.hero-inner{position:relative;z-index:1}
+.hero-eyebrow{
+  display:inline-flex;align-items:center;gap:8px;
+  background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.25);
+  color:#93c5fd;font-size:.72rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  padding:5px 14px;border-radius:var(--r-full);margin-bottom:20px;
+}
+.hero-eyebrow span{width:6px;height:6px;background:#3b82f6;border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(59,130,246,.5)}50%{box-shadow:0 0 0 5px rgba(59,130,246,0)}}
+.hero-title{font-size:3.4rem;font-weight:900;line-height:1.08;color:#fff;letter-spacing:-.02em;margin-bottom:16px}
+.hero-title .accent{
+  background:linear-gradient(135deg,#60a5fa,#a78bfa);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+}
+.hero-sub{font-size:1.1rem;color:#94a3b8;max-width:560px;line-height:1.65;margin-bottom:32px}
+.hero-cta{display:flex;align-items:center;gap:12px;margin-bottom:48px}
+.btn-primary{
+  display:inline-flex;align-items:center;gap:8px;
+  background:linear-gradient(135deg,#3b82f6,#2563eb);
+  color:#fff;font-size:.88rem;font-weight:700;padding:12px 24px;
+  border:none;border-radius:var(--r-lg);cursor:pointer;
+  box-shadow:0 4px 16px rgba(59,130,246,.35);
+  text-decoration:none;
+}
+.btn-ghost{
+  display:inline-flex;align-items:center;gap:6px;
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);
+  color:#cbd5e1;font-size:.88rem;font-weight:600;padding:12px 22px;
+  border-radius:var(--r-lg);cursor:pointer;text-decoration:none;
+}
+.hero-stats{display:flex;gap:32px;margin-bottom:48px}
+.hero-stat-n{font-size:1.8rem;font-weight:900;color:#fff;font-family:var(--mono);line-height:1}
+.hero-stat-l{font-size:.7rem;color:#64748b;margin-top:4px;letter-spacing:.06em;text-transform:uppercase}
+.hero-stat-sep{width:1px;background:rgba(255,255,255,.08);align-self:stretch}
+
+/* ─── App Frame ─── */
+.app-frame-wrap{
+  position:relative;margin-top:8px;
+  background:var(--bg2);border-radius:var(--r-2xl) var(--r-2xl) 0 0;
+  border:1px solid rgba(255,255,255,.1);border-bottom:none;
+  box-shadow:0 -8px 40px rgba(0,0,0,.4);overflow:hidden;
+}
+.app-frame-chrome{
+  height:36px;background:#1a1d27;display:flex;align-items:center;
+  padding:0 16px;gap:8px;border-bottom:1px solid rgba(255,255,255,.06);
+}
+.chrome-dot{width:10px;height:10px;border-radius:50%}
+.chrome-url{
+  flex:1;background:rgba(255,255,255,.06);border-radius:6px;
+  height:20px;margin:0 12px;display:flex;align-items:center;padding:0 10px;
+  font-size:.65rem;color:#4b5563;font-family:var(--mono);
+}
+.app-shell{display:flex;height:820px;background:var(--bg1)}
+
+/* ─── Sidebar ─── */
+.sidebar{
+  width:224px;flex-shrink:0;background:var(--bg2);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;
+}
+.sb-brand{
+  display:flex;align-items:center;gap:10px;padding:14px 16px;
+  border-bottom:1px solid var(--border);
+}
+.sb-logo{
+  width:34px;height:34px;border-radius:10px;
+  background:linear-gradient(145deg,#eff6ff,#dbeafe);
+  border:1px solid rgba(37,99,235,.15);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.sb-logo svg{display:block}
+.sb-title{font-size:.8rem;font-weight:800;letter-spacing:.02em;line-height:1}
+.sb-sub{font-size:.58rem;color:var(--ink4);font-family:var(--mono);margin-top:2px}
+.sb-search{
+  display:flex;align-items:center;gap:6px;margin:10px 12px;
+  padding:0 10px;height:32px;border-radius:var(--r-md);
+  background:var(--bg3);border:1px solid var(--border);
+}
+.sb-search svg{flex-shrink:0;color:var(--ink4)}
+.sb-search span{font-size:.72rem;color:var(--ink4)}
+.sb-search kbd{
+  margin-left:auto;font-size:.58rem;background:var(--bg0);
+  border:1px solid var(--border2);color:var(--ink4);padding:1px 5px;
+  border-radius:3px;font-family:var(--mono);
+}
+.sb-section{font-size:.58rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--ink4);padding:12px 16px 4px}
+.sb-item{
+  display:flex;align-items:center;gap:8px;padding:7px 14px;
+  font-size:.75rem;font-weight:500;color:var(--ink3);cursor:pointer;
+  transition:all .15s;border-left:2.5px solid transparent;
+}
+.sb-item:hover{background:var(--bg3);color:var(--ink1)}
+.sb-item.active{
+  background:var(--blue-glow);color:var(--blue);font-weight:600;
+  border-left-color:var(--blue);
+}
+.sb-item svg{flex-shrink:0;opacity:.7}
+.sb-item.active svg{opacity:1}
+.sb-badge{
+  margin-left:auto;font-size:.58rem;font-weight:700;
+  background:var(--blue);color:#fff;padding:1px 6px;border-radius:var(--r-full);min-width:18px;text-align:center;
+}
+.sb-badge.warn{background:var(--amber)}
+.sb-badge.green{background:var(--green);color:#000}
+.sb-divider{height:1px;background:var(--border);margin:8px 0}
+.sb-footer{
+  margin-top:auto;padding:10px 12px;
+  border-top:1px solid var(--border);
+}
+.ai-status-card{
+  padding:8px 10px;border-radius:var(--r-md);
+  background:linear-gradient(135deg,rgba(99,102,241,.06),rgba(139,92,246,.04));
+  border:1px solid rgba(99,102,241,.15);
+}
+.ai-status-row{display:flex;align-items:center;gap:6px;font-size:.7rem}
+.ai-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;flex-shrink:0}
+.ai-name{font-weight:700;color:var(--ink1)}
+.ai-mode{font-size:.6rem;color:var(--ink4);font-family:var(--mono)}
+.ai-tokens{font-size:.6rem;color:var(--ink4);margin-top:3px;font-family:var(--mono)}
+
+/* ─── Main Content ─── */
+.main-area{flex:1;overflow:auto;display:flex;flex-direction:column}
+
+/* ─── Top Bar ─── */
+.topbar{
+  height:48px;flex-shrink:0;
+  background:rgba(255,255,255,.85);backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;padding:0 20px;gap:10px;
+  position:sticky;top:0;z-index:30;
+}
+.topbar-title{font-size:.8rem;font-weight:800;letter-spacing:.02em;flex:1}
+.live-badge{
+  display:flex;align-items:center;gap:5px;
+  font-size:.62rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--green);
+}
+.live-dot2{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+.ai-widget{
+  display:flex;align-items:center;gap:0;
+  background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);
+  font-size:.7rem;overflow:hidden;
+}
+.ai-widget-left{display:flex;align-items:center;gap:6px;padding:4px 10px;border-right:1px solid var(--border)}
+.ai-widget-btn{
+  padding:4px 10px;background:var(--blue);color:#fff;
+  font-size:.66rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  border:none;cursor:pointer;
+}
+.tab-nav{
+  display:flex;align-items:stretch;padding:0 20px;gap:1px;
+  background:rgba(248,247,243,.9);backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);position:sticky;top:48px;z-index:29;
+}
+.tab{
+  display:flex;align-items:center;gap:5px;padding:9px 14px;
+  font-size:.72rem;font-weight:600;color:var(--ink4);cursor:pointer;
+  border-bottom:2.5px solid transparent;white-space:nowrap;transition:all .15s;
+}
+.tab:hover{color:var(--ink1)}
+.tab.active{color:var(--blue);border-bottom-color:var(--blue);font-weight:700}
+.tab-count{
+  font-size:.6rem;background:var(--bg3);border:1px solid var(--border);
+  color:var(--ink3);padding:1px 5px;border-radius:var(--r-full);font-weight:600;
+}
+.tab.active .tab-count{background:rgba(59,130,246,.12);border-color:rgba(59,130,246,.2);color:var(--blue)}
+
+/* ─── Dashboard Body ─── */
+.dash-body{padding:16px 20px;flex:1}
+
+/* ─── KPI Strip ─── */
+.kpi-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
+.kpi-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:12px 14px 10px;cursor:default;
+  transition:box-shadow .2s var(--ease),transform .2s var(--ease);overflow:hidden;
+  position:relative;
+}
+.kpi-card:hover{box-shadow:var(--shadow-md);transform:translateY(-2px)}
+.kpi-accent{
+  position:absolute;top:0;left:0;right:0;height:3px;border-radius:var(--r-lg) var(--r-lg) 0 0;
+}
+.kpi-label{font-size:.58rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink4);margin-bottom:6px}
+.kpi-val{font-size:1.65rem;font-weight:700;font-family:var(--mono);line-height:1;color:var(--ink1)}
+.kpi-delta{font-size:.65rem;font-weight:700;margin-top:3px}
+.kpi-delta.up{color:var(--green)}
+.kpi-delta.dn{color:var(--red)}
+.kpi-delta.neutral{color:var(--ink4)}
+.kpi-spark{margin-top:8px;height:28px;opacity:.75}
+
+/* ─── Charts Row ─── */
+.charts-row{display:grid;grid-template-columns:1fr 260px 200px;gap:12px;margin-bottom:14px}
+.chart-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:14px 16px;
+}
+.chart-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.chart-title{font-size:.72rem;font-weight:700;color:var(--ink1)}
+.chart-sub{font-size:.62rem;color:var(--ink4)}
+.chart-legend{display:flex;align-items:center;gap:10px}
+.legend-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.legend-label{font-size:.62rem;color:var(--ink3)}
+
+/* ─── Pipeline ─── */
+.pipeline-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-lg);padding:14px 16px}
+.pipe-stage{display:flex;align-items:center;gap:8px;padding:5px 0}
+.pipe-bar-wrap{flex:1;background:var(--bg3);border-radius:2px;height:6px;overflow:hidden}
+.pipe-bar{height:100%;border-radius:2px;transition:width .5s var(--ease)}
+.pipe-n{font-size:.72rem;font-weight:700;font-family:var(--mono);color:var(--ink1);min-width:32px;text-align:right}
+.pipe-label{font-size:.68rem;color:var(--ink3);min-width:80px}
+
+/* ─── Table ─── */
+.table-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;
+  box-shadow:var(--shadow-xs);
+}
+.table-toolbar{
+  display:flex;align-items:center;gap:8px;padding:10px 14px;
+  border-bottom:1px solid var(--border);
+}
+.filter-pill{
+  display:flex;align-items:center;gap:6px;
+  padding:5px 14px;border:1px solid var(--border);background:transparent;
+  color:var(--ink3);font-size:.7rem;font-weight:500;border-radius:var(--r-full);
+  cursor:pointer;
+}
+.filter-pill.active{background:var(--blue);color:#fff;border-color:var(--blue);box-shadow:0 2px 8px rgba(59,130,246,.25)}
+.search-box{
+  display:flex;align-items:center;gap:6px;
+  background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);
+  padding:0 10px;height:30px;margin-left:auto;
+}
+.search-box input{
+  border:none;background:transparent;outline:none;font-size:.75rem;
+  color:var(--ink1);width:150px;font-family:var(--font);
+}
+.search-box input::placeholder{color:var(--ink4)}
+table.main{width:100%;border-collapse:collapse;font-size:.75rem}
+table.main thead th{
+  font-size:.6rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--ink4);padding:7px 12px;background:var(--bg3);
+  border-bottom:1px solid var(--border);white-space:nowrap;text-align:left;
+}
+table.main tbody td{
+  padding:8px 12px;border-bottom:1px solid rgba(15,23,42,.04);
+  vertical-align:middle;color:var(--ink1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+table.main tbody tr{transition:background .15s;cursor:pointer}
+table.main tbody tr:nth-child(even){background:rgba(241,245,249,.4)}
+table.main tbody tr:hover{background:var(--blue-glow)}
+.co-name{font-weight:600;font-size:.78rem}
+.co-type{font-size:.65rem;color:var(--ink4)}
+.status-pill{
+  display:inline-flex;align-items:center;gap:4px;
+  font-size:.62rem;font-weight:700;padding:2px 8px;border-radius:var(--r-full);
+  white-space:nowrap;border:1px solid;
+}
+.sp-sent{background:rgba(16,185,129,.1);color:#059669;border-color:rgba(16,185,129,.2)}
+.sp-await{background:rgba(245,158,11,.1);color:#d97706;border-color:rgba(245,158,11,.2)}
+.sp-error{background:rgba(239,68,68,.1);color:#dc2626;border-color:rgba(239,68,68,.2)}
+.sp-draft{background:rgba(139,92,246,.1);color:#7c3aed;border-color:rgba(139,92,246,.2)}
+.sp-idle{background:var(--bg3);color:var(--ink3);border-color:var(--border)}
+.sp-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
+.action-btns{display:flex;gap:4px}
+.act-btn{
+  padding:3px 9px;font-size:.66rem;font-weight:700;border-radius:var(--r-sm);
+  border:1px solid;cursor:pointer;transition:all .15s;
+}
+.act-fill{background:rgba(59,130,246,.1);color:var(--blue);border-color:rgba(59,130,246,.25)}
+.act-fill:hover{background:var(--blue);color:#fff}
+.act-view{background:transparent;color:var(--ink3);border-color:var(--border)}
+.act-view:hover{background:var(--bg3);color:var(--ink1)}
+.act-send{background:rgba(16,185,129,.1);color:var(--green);border-color:rgba(16,185,129,.25)}
+.act-send:hover{background:var(--green);color:#000}
+
+/* ─── Live Monitor Float ─── */
+.monitor-fab{
+  position:absolute;bottom:20px;right:20px;
+  width:44px;height:44px;border-radius:50%;
+  background:linear-gradient(135deg,#3b82f6,#2563eb);
+  box-shadow:0 4px 20px rgba(59,130,246,.4);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  border:2px solid rgba(255,255,255,.15);
+}
+.monitor-fab-badge{
+  position:absolute;top:-3px;right:-3px;
+  width:17px;height:17px;border-radius:50%;background:var(--red);
+  font-size:.58rem;font-weight:700;color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  border:1.5px solid var(--bg2);
+}
+
+/* ─── Features Section ─── */
+.features-section{padding:80px 60px;background:var(--bg1)}
+.section-eyebrow{
+  font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--blue);margin-bottom:10px;
+}
+.section-title{font-size:2.2rem;font-weight:900;line-height:1.15;letter-spacing:-.02em;margin-bottom:12px}
+.section-sub{font-size:1rem;color:var(--ink3);max-width:540px;line-height:1.65;margin-bottom:52px}
+
+.features-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.feature-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-xl);
+  padding:24px;transition:box-shadow .2s var(--ease),transform .2s var(--ease);
+}
+.feature-card:hover{box-shadow:var(--shadow-md);transform:translateY(-3px)}
+.feature-icon{
+  width:40px;height:40px;border-radius:var(--r-lg);margin-bottom:14px;
+  display:flex;align-items:center;justify-content:center;
+}
+.feature-title{font-size:.9rem;font-weight:800;margin-bottom:6px}
+.feature-desc{font-size:.78rem;color:var(--ink3);line-height:1.65}
+.feature-tag{
+  display:inline-flex;align-items:center;margin-top:12px;
+  font-size:.62rem;font-weight:700;color:var(--blue);letter-spacing:.04em;
+}
+
+/* ─── Dark Variant Section ─── */
+.dark-section{
+  background:linear-gradient(160deg,#0b0f1a 0%,#0f172a 60%,#111827 100%);
+  padding:80px 60px;
+}
+.dark-app-frame{
+  background:#13182a;border:1px solid rgba(255,255,255,.08);
+  border-radius:var(--r-2xl);overflow:hidden;
+  box-shadow:0 32px 80px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.04);
+}
+.dark-header{
+  height:48px;background:#0d1117;border-bottom:1px solid rgba(255,255,255,.06);
+  display:flex;align-items:center;padding:0 20px;gap:10px;
+}
+.dark-body{display:flex;height:460px}
+.dark-sidebar{width:200px;background:#0d1117;border-right:1px solid rgba(255,255,255,.06);padding:12px 0}
+.dark-sb-item{
+  display:flex;align-items:center;gap:8px;padding:6px 14px;
+  font-size:.72rem;color:rgba(255,255,255,.4);cursor:pointer;
+  border-left:2.5px solid transparent;
+}
+.dark-sb-item.active{color:#93c5fd;border-left-color:#3b82f6;background:rgba(59,130,246,.08)}
+.dark-main{flex:1;padding:16px;overflow:hidden}
+.dark-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.dkpi{
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);
+  border-radius:var(--r-md);padding:10px 12px;
+}
+.dkpi-label{font-size:.58rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.35);margin-bottom:4px}
+.dkpi-val{font-size:1.4rem;font-weight:700;font-family:var(--mono);color:#fff;line-height:1}
+.dkpi-delta{font-size:.62rem;font-weight:700;margin-top:3px}
+.dark-chart{
+  background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);
+  border-radius:var(--r-md);padding:12px;height:180px;
+}
+.dark-table-row{
+  display:flex;align-items:center;gap:12px;padding:7px 0;
+  border-bottom:1px solid rgba(255,255,255,.04);
+}
+
+/* ─── Stats Banner ─── */
+.stats-banner{
+  background:linear-gradient(135deg,#1d4ed8,#4f46e5);
+  padding:52px 60px;display:grid;grid-template-columns:repeat(4,1fr);gap:40px;
+}
+.stat-block{text-align:center}
+.stat-n{font-size:2.6rem;font-weight:900;color:#fff;font-family:var(--mono);line-height:1}
+.stat-l{font-size:.78rem;color:rgba(255,255,255,.65);margin-top:6px;letter-spacing:.04em}
+
+/* ─── Workflow Section ─── */
+.workflow-section{padding:80px 60px;background:var(--bg0)}
+.workflow-steps{display:flex;gap:0;margin-top:44px;position:relative}
+.workflow-steps::before{
+  content:'';position:absolute;top:28px;left:28px;right:28px;height:2px;
+  background:linear-gradient(90deg,var(--blue),var(--violet));z-index:0;
+}
+.step{flex:1;display:flex;flex-direction:column;align-items:center;text-align:center;position:relative;z-index:1}
+.step-num{
+  width:56px;height:56px;border-radius:50%;margin-bottom:16px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.1rem;font-weight:900;font-family:var(--mono);
+  background:var(--bg2);border:2px solid var(--blue);color:var(--blue);
+  box-shadow:0 0 0 4px var(--bg0),var(--shadow-sm);
+}
+.step-num.done{background:var(--green);border-color:var(--green);color:#000}
+.step-num.active{background:var(--blue);color:#fff;box-shadow:0 0 0 4px var(--bg0),0 0 20px rgba(59,130,246,.3)}
+.step-title{font-size:.82rem;font-weight:800;margin-bottom:4px}
+.step-desc{font-size:.72rem;color:var(--ink3);max-width:130px;line-height:1.5}
+.step-tag{font-size:.6rem;font-weight:700;color:var(--blue);margin-top:6px;letter-spacing:.04em}
+
+/* ─── Footer ─── */
+.footer{padding:32px 60px;background:var(--bg2);border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.footer-brand{display:flex;align-items:center;gap:10px}
+.footer-copy{font-size:.72rem;color:var(--ink4)}
+.footer-links{display:flex;gap:20px}
+.footer-link{font-size:.72rem;color:var(--ink3);text-decoration:none;cursor:pointer}
+.footer-link:hover{color:var(--ink1)}
+
+/* ─── Sparkline SVG ─── */
+.spark-svg{width:100%;height:28px;display:block}
+
+/* ─── Accessibility: focus visible ─── */
+*:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+</style>
+</head>
+<body>
+<div class="page-wrap">
+
+<!-- ══════════════ HERO ══════════════ -->
+<section class="hero">
+  <div class="hero-inner">
+    <div class="hero-eyebrow">
+      <span></span>
+      AI × Claude Code × 営業自動化
+    </div>
+    <h1 class="hero-title">
+      フォーム営業を<br>
+      <span class="accent">10倍速く、10倍賢く。</span>
+    </h1>
+    <p class="hero-sub">
+      Sales Clawは、Claude Code CLIがターゲット企業を分析し、パーソナライズされたメッセージを作成し、お問い合わせフォームへの入力まで自動化するB2B営業ツールです。
+    </p>
+    <div class="hero-cta">
+      <a class="btn-primary" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        今すぐ始める
+      </a>
+      <a class="btn-ghost" href="#">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+        デモを見る
+      </a>
+    </div>
+    <div class="hero-stats">
+      <div>
+        <div class="hero-stat-n">488</div>
+        <div class="hero-stat-l">企業 / セッション</div>
+      </div>
+      <div class="hero-stat-sep"></div>
+      <div>
+        <div class="hero-stat-n">96%</div>
+        <div class="hero-stat-l">フォーム入力率</div>
+      </div>
+      <div class="hero-stat-sep"></div>
+      <div>
+        <div class="hero-stat-n">3AI</div>
+        <div class="hero-stat-l">Claude / Codex / Gemini</div>
+      </div>
+      <div class="hero-stat-sep"></div>
+      <div>
+        <div class="hero-stat-n">&lt;2min</div>
+        <div class="hero-stat-l">1社あたりの処理時間</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- App Frame Preview -->
+  <div class="app-frame-wrap">
+    <div class="app-frame-chrome">
+      <div class="chrome-dot" style="background:#ff5f57"></div>
+      <div class="chrome-dot" style="background:#febc2e"></div>
+      <div class="chrome-dot" style="background:#28c840"></div>
+      <div class="chrome-url">localhost:3456 — Sales Claw</div>
+    </div>
+    <div class="app-shell">
+      <!-- Sidebar -->
+      <aside class="sidebar">
+        <div class="sb-brand">
+          <div class="sb-logo">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linecap="round">
+              <path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+            </svg>
+          </div>
+          <div>
+            <div class="sb-title">Sales Claw</div>
+            <div class="sb-sub">v2.4.1 · Electron</div>
+          </div>
+        </div>
+        <div class="sb-search">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <span>企業を検索...</span>
+          <kbd>⌘K</kbd>
+        </div>
+        <div class="sb-section">メイン</div>
+        <div class="sb-item active">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          企業一覧
+          <span class="sb-badge">488</span>
+        </div>
+        <div class="sb-item">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          確認待ち
+          <span class="sb-badge warn">12</span>
+        </div>
+        <div class="sb-item">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          送信済み
+          <span class="sb-badge green">211</span>
+        </div>
+        <div class="sb-item">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+          Analytics
+        </div>
+        <div class="sb-divider"></div>
+        <div class="sb-section">ビュー</div>
+        <div class="sb-item">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="3" style="transform:scale(0)"/><path d="M22 12h-4M6 12H2M12 6V2M12 22v-4"/></svg>
+          CLI Activity
+        </div>
+        <div class="sb-item">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+          メール
+        </div>
+        <div class="sb-item">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+          設定
+        </div>
+        <div class="sb-footer">
+          <div class="ai-status-card">
+            <div class="ai-status-row">
+              <div class="ai-dot"></div>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style="opacity:.6"><path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z"/></svg>
+              <span class="ai-name">Claude</span>
+              <span class="ai-mode" style="margin-left:auto">auto</span>
+            </div>
+            <div class="ai-tokens">処理中 · 3/5社完了 · ~2min残</div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main -->
+      <div class="main-area">
+        <div class="topbar">
+          <span class="topbar-title">企業ダッシュボード</span>
+          <div class="live-badge"><div class="live-dot2"></div> LIVE</div>
+          <span style="font-size:.6rem;color:var(--ink4);font-family:var(--mono)">更新: 12:04:33</span>
+          <div class="ai-widget">
+            <div class="ai-widget-left">
+              <div class="live-dot2" style="background:var(--green)"></div>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" style="opacity:.6"><path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z"/></svg>
+              <span style="font-size:.68rem;color:var(--ink2)">Claude · 実行中</span>
+            </div>
+            <div class="ai-widget-btn">STOP</div>
+          </div>
+          <button style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;background:none;border:1px solid transparent;cursor:pointer;color:var(--ink4);border-radius:var(--r-sm)" title="Export">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          </button>
+        </div>
+
+        <!-- Tab Nav -->
+        <nav class="tab-nav">
+          <div class="tab active">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            全企業
+            <span class="tab-count">488</span>
+          </div>
+          <div class="tab">フォームあり <span class="tab-count">376</span></div>
+          <div class="tab">フォームなし <span class="tab-count">56</span></div>
+          <div class="tab">送信済み <span class="tab-count">211</span></div>
+          <div class="tab">確認待ち <span class="tab-count">12</span></div>
+          <div class="tab">エラー <span class="tab-count">8</span></div>
+        </nav>
+
+        <div class="dash-body">
+          <!-- KPI Strip -->
+          <div class="kpi-strip">
+            <!-- Total -->
+            <div class="kpi-card">
+              <div class="kpi-accent" style="background:linear-gradient(90deg,#3b82f6,#60a5fa)"></div>
+              <div class="kpi-label">総企業数</div>
+              <div class="kpi-val">488</div>
+              <div class="kpi-delta up">▲ +24 今月</div>
+              <svg class="kpi-spark spark-svg" viewBox="0 0 80 28" preserveAspectRatio="none">
+                <defs><linearGradient id="g1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3b82f6" stop-opacity=".25"/><stop offset="100%" stop-color="#3b82f6" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,22 L10,20 L20,18 L30,16 L40,14 L50,12 L60,10 L70,8 L80,4" fill="none" stroke="#3b82f6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M0,22 L10,20 L20,18 L30,16 L40,14 L50,12 L60,10 L70,8 L80,4 L80,28 L0,28 Z" fill="url(#g1)"/>
+              </svg>
+            </div>
+            <!-- Sent -->
+            <div class="kpi-card">
+              <div class="kpi-accent" style="background:linear-gradient(90deg,#10b981,#34d399)"></div>
+              <div class="kpi-label">送信済み</div>
+              <div class="kpi-val" style="color:var(--green)">211</div>
+              <div class="kpi-delta up">▲ +18 今週</div>
+              <svg class="kpi-spark spark-svg" viewBox="0 0 80 28" preserveAspectRatio="none">
+                <defs><linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#10b981" stop-opacity=".25"/><stop offset="100%" stop-color="#10b981" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,24 L10,22 L20,19 L30,17 L40,15 L50,12 L60,9 L70,6 L80,3" fill="none" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M0,24 L10,22 L20,19 L30,17 L40,15 L50,12 L60,9 L70,6 L80,3 L80,28 L0,28 Z" fill="url(#g2)"/>
+              </svg>
+            </div>
+            <!-- Awaiting -->
+            <div class="kpi-card">
+              <div class="kpi-accent" style="background:linear-gradient(90deg,#f59e0b,#fbbf24)"></div>
+              <div class="kpi-label">確認待ち</div>
+              <div class="kpi-val" style="color:var(--amber)">12</div>
+              <div class="kpi-delta neutral">→ 要確認</div>
+              <svg class="kpi-spark spark-svg" viewBox="0 0 80 28" preserveAspectRatio="none">
+                <defs><linearGradient id="g3" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f59e0b" stop-opacity=".25"/><stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,14 L10,12 L20,16 L30,10 L40,14 L50,8 L60,12 L70,10 L80,6" fill="none" stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M0,14 L10,12 L20,16 L30,10 L40,14 L50,8 L60,12 L70,10 L80,6 L80,28 L0,28 Z" fill="url(#g3)"/>
+              </svg>
+            </div>
+            <!-- Error -->
+            <div class="kpi-card">
+              <div class="kpi-accent" style="background:linear-gradient(90deg,#ef4444,#f87171)"></div>
+              <div class="kpi-label">エラー</div>
+              <div class="kpi-val" style="color:var(--red)">8</div>
+              <div class="kpi-delta dn">▼ -3 先週比</div>
+              <svg class="kpi-spark spark-svg" viewBox="0 0 80 28" preserveAspectRatio="none">
+                <defs><linearGradient id="g4" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#ef4444" stop-opacity=".2"/><stop offset="100%" stop-color="#ef4444" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,6 L10,10 L20,8 L30,14 L40,10 L50,16 L60,12 L70,18 L80,14" fill="none" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="3,2" stroke-linecap="round"/>
+                <path d="M0,6 L10,10 L20,8 L30,14 L40,10 L50,16 L60,12 L70,18 L80,14 L80,28 L0,28 Z" fill="url(#g4)"/>
+              </svg>
+            </div>
+            <!-- Approachable -->
+            <div class="kpi-card">
+              <div class="kpi-accent" style="background:linear-gradient(90deg,#8b5cf6,#a78bfa)"></div>
+              <div class="kpi-label">アプローチ可</div>
+              <div class="kpi-val" style="color:var(--violet)">376</div>
+              <div class="kpi-delta up">▲ +12 今月</div>
+              <svg class="kpi-spark spark-svg" viewBox="0 0 80 28" preserveAspectRatio="none">
+                <defs><linearGradient id="g5" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#8b5cf6" stop-opacity=".25"/><stop offset="100%" stop-color="#8b5cf6" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,20 L10,18 L20,16 L30,15 L40,13 L50,11 L60,9 L70,7 L80,5" fill="none" stroke="#8b5cf6" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M0,20 L10,18 L20,16 L30,15 L40,13 L50,11 L60,9 L70,7 L80,5 L80,28 L0,28 Z" fill="url(#g5)"/>
+              </svg>
+            </div>
+            <!-- Rate -->
+            <div class="kpi-card" style="background:linear-gradient(135deg,#eff6ff,#dbeafe);border-color:rgba(59,130,246,.2)">
+              <div class="kpi-accent" style="background:linear-gradient(90deg,#1d4ed8,#3b82f6)"></div>
+              <div class="kpi-label" style="color:var(--blue-dim)">送信率</div>
+              <div class="kpi-val" style="color:#1d4ed8">56%</div>
+              <div class="kpi-delta" style="color:var(--blue-dim)">▲ +8pt 先月比</div>
+              <svg class="kpi-spark spark-svg" viewBox="0 0 80 28" preserveAspectRatio="none">
+                <defs><linearGradient id="g6" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2563eb" stop-opacity=".3"/><stop offset="100%" stop-color="#2563eb" stop-opacity="0"/></linearGradient></defs>
+                <path d="M0,24 L10,22 L20,20 L30,18 L40,15 L50,12 L60,9 L70,6 L80,3" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M0,24 L10,22 L20,20 L30,18 L40,15 L50,12 L60,9 L70,6 L80,3 L80,28 L0,28 Z" fill="url(#g6)"/>
+              </svg>
+            </div>
+          </div><!-- /kpi-strip -->
+
+          <!-- Charts Row -->
+          <div class="charts-row">
+            <!-- Area Chart -->
+            <div class="chart-card">
+              <div class="chart-head">
+                <div>
+                  <div class="chart-title">30日間アクティビティ</div>
+                  <div class="chart-sub">送信済み · 確認待ち · エラー推移</div>
+                </div>
+                <div class="chart-legend">
+                  <div style="display:flex;align-items:center;gap:4px"><div class="legend-dot" style="background:#10b981"></div><span class="legend-label">送信済み</span></div>
+                  <div style="display:flex;align-items:center;gap:4px"><div class="legend-dot" style="background:#f59e0b"></div><span class="legend-label">確認待ち</span></div>
+                  <div style="display:flex;align-items:center;gap:4px"><div class="legend-dot" style="background:#ef4444"></div><span class="legend-label">エラー</span></div>
+                </div>
+              </div>
+              <!-- SVG Area Chart -->
+              <svg viewBox="0 0 440 140" style="width:100%;height:140px" preserveAspectRatio="none">
+                <defs>
+                  <linearGradient id="ag1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#10b981" stop-opacity=".3"/><stop offset="100%" stop-color="#10b981" stop-opacity="0"/></linearGradient>
+                  <linearGradient id="ag2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f59e0b" stop-opacity=".2"/><stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/></linearGradient>
+                </defs>
+                <!-- Grid lines -->
+                <line x1="0" y1="28" x2="440" y2="28" stroke="rgba(15,23,42,.04)" stroke-width="1"/>
+                <line x1="0" y1="56" x2="440" y2="56" stroke="rgba(15,23,42,.04)" stroke-width="1"/>
+                <line x1="0" y1="84" x2="440" y2="84" stroke="rgba(15,23,42,.04)" stroke-width="1"/>
+                <line x1="0" y1="112" x2="440" y2="112" stroke="rgba(15,23,42,.04)" stroke-width="1"/>
+                <!-- Awaiting fill -->
+                <path d="M0,105 C20,102 40,98 60,95 C80,92 100,96 120,90 C140,84 160,88 180,82 C200,76 220,80 240,72 C260,64 280,68 300,60 C320,52 340,56 360,48 C380,40 400,44 420,38 L440,32 L440,140 L0,140 Z" fill="url(#ag2)" stroke="none"/>
+                <path d="M0,105 C20,102 40,98 60,95 C80,92 100,96 120,90 C140,84 160,88 180,82 C200,76 220,80 240,72 C260,64 280,68 300,60 C320,52 340,56 360,48 C380,40 400,44 420,38 L440,32" fill="none" stroke="#f59e0b" stroke-width="1.8" stroke-linejoin="round"/>
+                <!-- Sent fill -->
+                <path d="M0,115 C20,112 40,108 60,104 C80,100 100,105 120,98 C140,91 160,96 180,88 C200,80 220,86 240,75 C260,64 280,70 300,60 C320,50 340,55 360,44 C380,33 400,38 420,28 L440,20 L440,140 L0,140 Z" fill="url(#ag1)" stroke="none"/>
+                <path d="M0,115 C20,112 40,108 60,104 C80,100 100,105 120,98 C140,91 160,96 180,88 C200,80 220,86 240,75 C260,64 280,70 300,60 C320,50 340,55 360,44 C380,33 400,38 420,28 L440,20" fill="none" stroke="#10b981" stroke-width="2" stroke-linejoin="round"/>
+                <!-- Error dashed -->
+                <path d="M0,128 C20,126 40,124 60,125 C80,126 100,122 120,124 C140,126 160,120 180,122 C200,124 220,118 240,120 C260,122 280,116 300,118 C320,120 340,114 360,116 C380,118 400,112 420,114 L440,112" fill="none" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="4,3" stroke-linejoin="round"/>
+                <!-- X labels -->
+                <text x="0" y="135" font-size="8" fill="#94a3b8" font-family="JetBrains Mono,monospace">3/25</text>
+                <text x="100" y="135" font-size="8" fill="#94a3b8" font-family="JetBrains Mono,monospace">4/1</text>
+                <text x="200" y="135" font-size="8" fill="#94a3b8" font-family="JetBrains Mono,monospace">4/8</text>
+                <text x="300" y="135" font-size="8" fill="#94a3b8" font-family="JetBrains Mono,monospace">4/15</text>
+                <text x="400" y="135" font-size="8" fill="#94a3b8" font-family="JetBrains Mono,monospace">4/23</text>
+              </svg>
+            </div>
+
+            <!-- Donut Chart -->
+            <div class="chart-card">
+              <div class="chart-head"><div class="chart-title">ステータス分布</div></div>
+              <svg viewBox="0 0 200 170" style="width:100%;height:170px">
+                <!-- Donut segments using stroke-dasharray trick -->
+                <circle cx="100" cy="90" r="55" fill="none" stroke="#e2e8f0" stroke-width="22"/>
+                <!-- Sent: 43% = 345.4 of 801.1 circumference → use stroke-dasharray -->
+                <circle cx="100" cy="90" r="55" fill="none" stroke="#10b981" stroke-width="22"
+                  stroke-dasharray="148 208" stroke-dashoffset="0" transform="rotate(-90 100 90)"/>
+                <!-- Awaiting: 11% -->
+                <circle cx="100" cy="90" r="55" fill="none" stroke="#f59e0b" stroke-width="22"
+                  stroke-dasharray="38 318" stroke-dashoffset="-148" transform="rotate(-90 100 90)"/>
+                <!-- Error: 4% -->
+                <circle cx="100" cy="90" r="55" fill="none" stroke="#ef4444" stroke-width="22"
+                  stroke-dasharray="14 342" stroke-dashoffset="-186" transform="rotate(-90 100 90)"/>
+                <!-- Unprocessed: 42% -->
+                <circle cx="100" cy="90" r="55" fill="none" stroke="#e2e8f0" stroke-width="22"
+                  stroke-dasharray="144 212" stroke-dashoffset="-200" transform="rotate(-90 100 90)"/>
+                <!-- Center text -->
+                <text x="100" y="85" text-anchor="middle" font-size="22" font-weight="700" fill="#0f172a" font-family="JetBrains Mono,monospace">43%</text>
+                <text x="100" y="100" text-anchor="middle" font-size="9" fill="#94a3b8" font-family="JetBrains Mono,monospace">送信率</text>
+                <!-- Legend -->
+                <rect x="8" y="152" width="8" height="8" rx="2" fill="#10b981"/>
+                <text x="20" y="160" font-size="9" fill="#64748b" font-family="JetBrains Mono,monospace">送信済み 211</text>
+                <rect x="98" y="152" width="8" height="8" rx="2" fill="#f59e0b"/>
+                <text x="110" y="160" font-size="9" fill="#64748b" font-family="JetBrains Mono,monospace">確認待ち 12</text>
+              </svg>
+            </div>
+
+            <!-- Pipeline -->
+            <div class="pipeline-card">
+              <div class="chart-head"><div class="chart-title">パイプライン</div></div>
+              <div style="display:flex;flex-direction:column;gap:10px;margin-top:4px">
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:.65rem;margin-bottom:4px">
+                    <span style="color:var(--ink3);font-weight:600">ターゲット</span>
+                    <span style="font-weight:700;font-family:var(--mono)">488</span>
+                  </div>
+                  <div style="background:var(--bg3);border-radius:2px;height:7px;overflow:hidden">
+                    <div style="width:100%;height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:2px"></div>
+                  </div>
+                </div>
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:.65rem;margin-bottom:4px">
+                    <span style="color:var(--ink3);font-weight:600">フォームあり</span>
+                    <span style="font-weight:700;font-family:var(--mono)">376</span>
+                  </div>
+                  <div style="background:var(--bg3);border-radius:2px;height:7px;overflow:hidden">
+                    <div style="width:77%;height:100%;background:linear-gradient(90deg,#8b5cf6,#a78bfa);border-radius:2px"></div>
+                  </div>
+                </div>
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:.65rem;margin-bottom:4px">
+                    <span style="color:var(--ink3);font-weight:600">入力完了</span>
+                    <span style="font-weight:700;font-family:var(--mono)">231</span>
+                  </div>
+                  <div style="background:var(--bg3);border-radius:2px;height:7px;overflow:hidden">
+                    <div style="width:47%;height:100%;background:linear-gradient(90deg,#f59e0b,#fbbf24);border-radius:2px"></div>
+                  </div>
+                </div>
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:.65rem;margin-bottom:4px">
+                    <span style="color:var(--ink3);font-weight:600">送信済み</span>
+                    <span style="font-weight:700;font-family:var(--mono)">211</span>
+                  </div>
+                  <div style="background:var(--bg3);border-radius:2px;height:7px;overflow:hidden">
+                    <div style="width:43%;height:100%;background:linear-gradient(90deg,#10b981,#34d399);border-radius:2px"></div>
+                  </div>
+                </div>
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:.65rem;margin-bottom:4px">
+                    <span style="color:var(--ink3);font-weight:600">エラー</span>
+                    <span style="font-weight:700;font-family:var(--mono)">8</span>
+                  </div>
+                  <div style="background:var(--bg3);border-radius:2px;height:7px;overflow:hidden">
+                    <div style="width:2%;height:100%;background:var(--red);border-radius:2px"></div>
+                  </div>
+                </div>
+              </div>
+              <!-- Conversion rate -->
+              <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+                <span style="font-size:.62rem;color:var(--ink4)">コンバージョン率</span>
+                <span style="font-size:.82rem;font-weight:800;color:var(--green);font-family:var(--mono)">56.1%</span>
+              </div>
+            </div>
+          </div><!-- /charts-row -->
+
+          <!-- Table -->
+          <div class="table-card">
+            <div class="table-toolbar">
+              <div class="filter-pill active">全て <span style="opacity:.8">488</span></div>
+              <div class="filter-pill">IT業界 <span style="opacity:.7">134</span></div>
+              <div class="filter-pill">製造業 <span style="opacity:.7">89</span></div>
+              <div class="filter-pill">サービス <span style="opacity:.7">112</span></div>
+              <div class="search-box" style="margin-left:auto">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+                <input placeholder="企業名・URLで検索" type="text">
+              </div>
+            </div>
+            <table class="main">
+              <thead>
+                <tr>
+                  <th style="width:28px"><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></th>
+                  <th>No.</th>
+                  <th>企業名</th>
+                  <th>業種</th>
+                  <th>ステータス</th>
+                  <th>最終アクション</th>
+                  <th>フォームURL</th>
+                  <th>アクション</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></td>
+                  <td style="font-family:var(--mono);color:var(--ink4);font-size:.68rem">001</td>
+                  <td>
+                    <div class="co-name">株式会社テクノソリューション</div>
+                    <div class="co-type">SaaS · B2B</div>
+                  </td>
+                  <td style="font-size:.7rem;color:var(--ink3)">IT・ソフトウェア</td>
+                  <td><span class="status-pill sp-sent"><span class="sp-dot"></span>送信済み</span></td>
+                  <td style="font-size:.68rem;color:var(--ink4);font-family:var(--mono)">4/23 11:42</td>
+                  <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.68rem;color:var(--blue)">techno-sol.co.jp/contact</td>
+                  <td class="action-btns">
+                    <button class="act-btn act-view">確認</button>
+                  </td>
+                </tr>
+                <tr>
+                  <td><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></td>
+                  <td style="font-family:var(--mono);color:var(--ink4);font-size:.68rem">002</td>
+                  <td>
+                    <div class="co-name">グローバルマーケティング株式会社</div>
+                    <div class="co-type">広告代理店</div>
+                  </td>
+                  <td style="font-size:.7rem;color:var(--ink3)">マーケティング</td>
+                  <td><span class="status-pill sp-await"><span class="sp-dot"></span>確認待ち</span></td>
+                  <td style="font-size:.68rem;color:var(--ink4);font-family:var(--mono)">4/23 12:01</td>
+                  <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.68rem;color:var(--blue)">globalmarketing.jp/inquiry</td>
+                  <td class="action-btns">
+                    <button class="act-btn act-send">送信</button>
+                    <button class="act-btn act-view">確認</button>
+                  </td>
+                </tr>
+                <tr style="background:rgba(16,185,129,.03)">
+                  <td><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></td>
+                  <td style="font-family:var(--mono);color:var(--ink4);font-size:.68rem">003</td>
+                  <td>
+                    <div class="co-name">日本ロジスティクス協会</div>
+                    <div class="co-type">業界団体 · 非営利</div>
+                  </td>
+                  <td style="font-size:.7rem;color:var(--ink3)">物流・運輸</td>
+                  <td><span class="status-pill sp-sent"><span class="sp-dot"></span>送信済み</span></td>
+                  <td style="font-size:.68rem;color:var(--ink4);font-family:var(--mono)">4/22 16:33</td>
+                  <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.68rem;color:var(--blue)">japan-logistics.or.jp/contact</td>
+                  <td class="action-btns">
+                    <button class="act-btn act-view">確認</button>
+                  </td>
+                </tr>
+                <tr>
+                  <td><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></td>
+                  <td style="font-family:var(--mono);color:var(--ink4);font-size:.68rem">004</td>
+                  <td>
+                    <div class="co-name">フューチャーAI株式会社</div>
+                    <div class="co-type">AI・機械学習</div>
+                  </td>
+                  <td style="font-size:.7rem;color:var(--ink3)">IT・AI</td>
+                  <td><span class="status-pill sp-draft"><span class="sp-dot"></span>下書き</span></td>
+                  <td style="font-size:.68rem;color:var(--ink4);font-family:var(--mono)">4/23 12:03</td>
+                  <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.68rem;color:var(--blue)">future-ai.co.jp/contact</td>
+                  <td class="action-btns">
+                    <button class="act-btn act-fill">AI FILL</button>
+                    <button class="act-btn act-view">確認</button>
+                  </td>
+                </tr>
+                <tr style="background:rgba(239,68,68,.03)">
+                  <td><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></td>
+                  <td style="font-family:var(--mono);color:var(--ink4);font-size:.68rem">005</td>
+                  <td>
+                    <div class="co-name">東京製造株式会社</div>
+                    <div class="co-type">製造業 · BtoB</div>
+                  </td>
+                  <td style="font-size:.7rem;color:var(--ink3)">製造業</td>
+                  <td><span class="status-pill sp-error"><span class="sp-dot"></span>エラー</span></td>
+                  <td style="font-size:.68rem;color:var(--ink4);font-family:var(--mono)">4/22 10:18</td>
+                  <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.68rem;color:var(--ink4)">（CAPTCHA検出）</td>
+                  <td class="action-btns">
+                    <button class="act-btn act-fill" style="color:var(--red);border-color:rgba(239,68,68,.25)">再試行</button>
+                  </td>
+                </tr>
+                <tr>
+                  <td><input type="checkbox" style="width:14px;height:14px;accent-color:var(--blue)"></td>
+                  <td style="font-family:var(--mono);color:var(--ink4);font-size:.68rem">006</td>
+                  <td>
+                    <div class="co-name">スマートリテール株式会社</div>
+                    <div class="co-type">EC・小売</div>
+                  </td>
+                  <td style="font-size:.7rem;color:var(--ink3)">小売・EC</td>
+                  <td><span class="status-pill sp-await"><span class="sp-dot"></span>確認待ち</span></td>
+                  <td style="font-size:.68rem;color:var(--ink4);font-family:var(--mono)">4/23 11:55</td>
+                  <td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;font-size:.68rem;color:var(--blue)">smart-retail.jp/contact</td>
+                  <td class="action-btns">
+                    <button class="act-btn act-send">送信</button>
+                    <button class="act-btn act-view">確認</button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <!-- Pagination -->
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-top:1px solid var(--border);background:var(--bg3)">
+              <span style="font-size:.68rem;color:var(--ink4)">6 / 488件表示</span>
+              <div style="display:flex;gap:4px">
+                <button style="padding:3px 10px;font-size:.68rem;border:1px solid var(--border);background:var(--bg2);color:var(--ink3);border-radius:var(--r-sm);cursor:pointer">前へ</button>
+                <button style="padding:3px 10px;font-size:.68rem;border:1px solid var(--blue);background:var(--blue);color:#fff;border-radius:var(--r-sm);cursor:pointer">1</button>
+                <button style="padding:3px 10px;font-size:.68rem;border:1px solid var(--border);background:var(--bg2);color:var(--ink3);border-radius:var(--r-sm);cursor:pointer">2</button>
+                <button style="padding:3px 10px;font-size:.68rem;border:1px solid var(--border);background:var(--bg2);color:var(--ink3);border-radius:var(--r-sm);cursor:pointer">次へ</button>
+              </div>
+            </div>
+          </div><!-- /table-card -->
+        </div><!-- /dash-body -->
+
+        <!-- Monitor FAB -->
+        <div style="position:fixed;bottom:24px;right:28px;z-index:50" title="ライブモニター">
+          <div class="monitor-fab">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <div class="monitor-fab-badge">3</div>
+          </div>
+        </div>
+      </div><!-- /main-area -->
+    </div><!-- /app-shell -->
+  </div><!-- /app-frame-wrap -->
+</section><!-- /hero -->
+
+<!-- ══════════════ STATS BANNER ══════════════ -->
+<section class="stats-banner">
+  <div class="stat-block">
+    <div class="stat-n">488+</div>
+    <div class="stat-l">1セッションで処理可能な企業数</div>
+  </div>
+  <div class="stat-block">
+    <div class="stat-n">96%</div>
+    <div class="stat-l">フォーム自動入力成功率</div>
+  </div>
+  <div class="stat-block">
+    <div class="stat-n">3AI</div>
+    <div class="stat-l">Claude · Codex · Gemini 対応</div>
+  </div>
+  <div class="stat-block">
+    <div class="stat-n">60%↓</div>
+    <div class="stat-l">OMCルーティングでトークンコスト削減</div>
+  </div>
+</section>
+
+<!-- ══════════════ FEATURES ══════════════ -->
+<section class="features-section">
+  <div class="section-eyebrow">機能ハイライト</div>
+  <h2 class="section-title">なぜ Sales Claw なのか</h2>
+  <p class="section-sub">従来の営業自動化ツールと異なり、Sales ClawはAI CLIが主体で動く。フォームごとに構造を解析し、その会社にしか刺さらないメッセージを生成する。</p>
+
+  <div class="features-grid">
+    <div class="feature-card">
+      <div class="feature-icon" style="background:linear-gradient(135deg,#eff6ff,#dbeafe)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+      </div>
+      <div class="feature-title">企業サイト深掘り分析</div>
+      <div class="feature-desc">company-analyzerがサイト全体を巡回し、事業領域・ギャップ・注力分野を自動抽出。テンプレートではなく、その企業のためだけの文面を生成します。</div>
+      <div class="feature-tag">→ 分析 + メッセージ生成まで自動</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon" style="background:linear-gradient(135deg,#ecfdf5,#d1fae5)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+      </div>
+      <div class="feature-title">Electron内フォーム自動入力</div>
+      <div class="feature-desc">WebContentsViewでフォームを直接操作。セレクタマッピング → 入力 → スクリーンショットまで全自動。ユーザーはダッシュボードで確認して送信するだけ。</div>
+      <div class="feature-tag">→ 入力後スクショ必須 · 送信は人間が判断</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon" style="background:linear-gradient(135deg,#fef3c7,#fde68a)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </div>
+      <div class="feature-title">3AI プロバイダー対応</div>
+      <div class="feature-desc">Claude Code / OpenAI Codex / Gemini CLIの3つをUI上で切り替え可能。OMCモデルルーティングでステップ別に最適なモデルを自動選択し、コストを60%削減。</div>
+      <div class="feature-tag">→ haiku / sonnet / opus で自動コスト最適化</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon" style="background:linear-gradient(135deg,#f5f3ff,#ede9fe)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      </div>
+      <div class="feature-title">リアルタイム ライブモニター</div>
+      <div class="feature-desc">CLI ActivityフィードとWebSocket SSEでリアルタイム進捗表示。各社の処理ステータスをチャット風UIで確認。フロートパネルで常時監視可能。</div>
+      <div class="feature-tag">→ フォーム入力中の進捗もリアルタイム反映</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon" style="background:linear-gradient(135deg,#fff7ed,#ffedd5)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ea580c" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      </div>
+      <div class="feature-title">並列フェーズ処理</div>
+      <div class="feature-desc">フェーズA（分析）は全社を並列サブエージェントで同時処理。フェーズB（フォーム入力）は順次実行。2フェーズ設計で最大スループットを実現。</div>
+      <div class="feature-tag">→ N社を並列分析 → 順次入力 → 完全自動化</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon" style="background:linear-gradient(135deg,#f0fdf4,#dcfce7)">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+      </div>
+      <div class="feature-title">承認ワークフロー</div>
+      <div class="feature-desc">入力済みフォームのスクリーンショット・本文・安全チェックをダッシュボードで一覧表示。人間が内容を確認してから送信。CAPTCHA・営業NG企業は自動スキップ。</div>
+      <div class="feature-tag">→ 人間の判断を最終ゲートとして確保</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════ DARK MODE PREVIEW ══════════════ -->
+<section class="dark-section">
+  <div style="max-width:900px;margin:0 auto">
+    <div class="section-eyebrow" style="color:#60a5fa">ダークモード対応</div>
+    <h2 class="section-title" style="color:#fff">深夜の営業作業も、目に優しく。</h2>
+    <p class="section-sub" style="color:#64748b;margin-bottom:36px">ダークテーマは単なる外観ではなく、長時間作業での疲労軽減のための設計です。</p>
+
+    <div class="dark-app-frame">
+      <div class="dark-header">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="width:28px;height:28px;border-radius:8px;background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.2);display:flex;align-items:center;justify-content:center">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2.5" stroke-linecap="round"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+          </div>
+          <span style="font-size:.78rem;font-weight:800;color:#e2e8f0">Sales Claw</span>
+          <span style="font-size:.58rem;background:rgba(59,130,246,.2);color:#60a5fa;padding:1px 6px;border-radius:20px;font-family:var(--mono)">DARK</span>
+        </div>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
+          <div style="display:flex;align-items:center;gap:5px;font-size:.62rem;color:#22c55e;font-weight:700">
+            <div style="width:5px;height:5px;border-radius:50%;background:#22c55e;animation:pulse 2s infinite"></div>
+            LIVE
+          </div>
+          <span style="font-size:.62rem;color:#475569;font-family:var(--mono)">更新: 23:41:07</span>
+        </div>
+      </div>
+      <div class="dark-body">
+        <div class="dark-sidebar">
+          <div class="dark-sb-item active">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            企業一覧
+          </div>
+          <div class="dark-sb-item">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            確認待ち
+            <span style="margin-left:auto;background:rgba(245,158,11,.25);color:#fbbf24;font-size:.58rem;font-weight:700;padding:1px 5px;border-radius:10px">12</span>
+          </div>
+          <div class="dark-sb-item">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            送信済み
+          </div>
+          <div class="dark-sb-item">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+            Analytics
+          </div>
+          <div class="dark-sb-item" style="margin-top:8px;border-top:1px solid rgba(255,255,255,.04);padding-top:8px">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M22 12h-4M6 12H2M12 6V2M12 22v-4"/></svg>
+            CLI Activity
+          </div>
+        </div>
+        <div class="dark-main">
+          <!-- Dark KPI -->
+          <div class="dark-kpi">
+            <div class="dkpi">
+              <div class="dkpi-label">送信済み</div>
+              <div class="dkpi-val" style="color:#34d399">211</div>
+              <div class="dkpi-delta" style="color:#34d399">▲ +18 今週</div>
+            </div>
+            <div class="dkpi">
+              <div class="dkpi-label">確認待ち</div>
+              <div class="dkpi-val" style="color:#fbbf24">12</div>
+              <div class="dkpi-delta" style="color:#94a3b8">→ 要確認</div>
+            </div>
+            <div class="dkpi">
+              <div class="dkpi-label">送信率</div>
+              <div class="dkpi-val" style="color:#60a5fa">56%</div>
+              <div class="dkpi-delta" style="color:#60a5fa">▲ +8pt</div>
+            </div>
+          </div>
+          <!-- Dark Chart -->
+          <div class="dark-chart">
+            <div style="font-size:.65rem;font-weight:700;color:rgba(255,255,255,.5);margin-bottom:10px">30日間送信推移</div>
+            <svg viewBox="0 0 500 120" style="width:100%;height:100px" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="dag1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#10b981" stop-opacity=".3"/><stop offset="100%" stop-color="#10b981" stop-opacity="0"/></linearGradient>
+              </defs>
+              <line x1="0" y1="30" x2="500" y2="30" stroke="rgba(255,255,255,.04)" stroke-width="1"/>
+              <line x1="0" y1="60" x2="500" y2="60" stroke="rgba(255,255,255,.04)" stroke-width="1"/>
+              <line x1="0" y1="90" x2="500" y2="90" stroke="rgba(255,255,255,.04)" stroke-width="1"/>
+              <path d="M0,95 C30,90 60,85 90,80 C120,75 150,85 180,72 C210,60 240,70 270,55 C300,40 330,50 360,38 C390,26 420,35 450,22 L500,12 L500,110 L0,110 Z" fill="url(#dag1)"/>
+              <path d="M0,95 C30,90 60,85 90,80 C120,75 150,85 180,72 C210,60 240,70 270,55 C300,40 330,50 360,38 C390,26 420,35 450,22 L500,12" fill="none" stroke="#10b981" stroke-width="2" stroke-linejoin="round"/>
+              <path d="M0,100 C30,98 60,96 90,95 C120,94 150,97 180,90 C210,83 240,88 270,82 C300,76 330,80 360,74 C390,68 420,72 450,66 L500,60" fill="none" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="4,3" stroke-linejoin="round"/>
+              <text x="0" y="115" font-size="7" fill="#475569" font-family="JetBrains Mono,monospace">3/25</text>
+              <text x="230" y="115" font-size="7" fill="#475569" font-family="JetBrains Mono,monospace">4/8</text>
+              <text x="478" y="115" font-size="7" fill="#475569" font-family="JetBrains Mono,monospace">4/23</text>
+            </svg>
+          </div>
+          <!-- Dark CLI Feed -->
+          <div style="margin-top:10px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.06);border-radius:var(--r-md);padding:10px;max-height:120px;overflow:hidden">
+            <div style="font-size:.6rem;font-weight:700;letter-spacing:.08em;color:rgba(255,255,255,.3);margin-bottom:8px">CLI ACTIVITY</div>
+            <div style="display:flex;flex-direction:column;gap:5px">
+              <div style="display:flex;align-items:center;gap:8px;padding:3px 6px;background:rgba(16,185,129,.08);border-left:2px solid #10b981;border-radius:0 3px 3px 0">
+                <div style="width:5px;height:5px;border-radius:50%;background:#10b981;flex-shrink:0"></div>
+                <span style="font-size:.62rem;color:#34d399;font-family:var(--mono)">[No.3] 日本ロジスティクス: 確認待ち登録完了</span>
+                <span style="font-size:.58rem;color:#475569;margin-left:auto;font-family:var(--mono)">23:41</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;padding:3px 6px;background:rgba(59,130,246,.06);border-left:2px solid rgba(59,130,246,.4);border-radius:0 3px 3px 0">
+                <div style="width:5px;height:5px;border-radius:50%;background:#3b82f6;flex-shrink:0;animation:pulse 1.5s infinite"></div>
+                <span style="font-size:.62rem;color:#93c5fd;font-family:var(--mono)">[No.4] フューチャーAI: フォーム入力中...</span>
+                <span style="font-size:.58rem;color:#475569;margin-left:auto;font-family:var(--mono)">23:41</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;padding:3px 6px;background:rgba(255,255,255,.02);border-left:2px solid rgba(255,255,255,.08);border-radius:0 3px 3px 0">
+                <div style="width:5px;height:5px;border-radius:50%;background:#475569;flex-shrink:0"></div>
+                <span style="font-size:.62rem;color:#475569;font-family:var(--mono)">[No.5] メッセージ生成完了</span>
+                <span style="font-size:.58rem;color:#334155;margin-left:auto;font-family:var(--mono)">23:40</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════ WORKFLOW ══════════════ -->
+<section class="workflow-section">
+  <div class="section-eyebrow">自動化ワークフロー</div>
+  <h2 class="section-title">7ステップで完全自動化</h2>
+  <p class="section-sub">「3社確認待ちまで」と指示するだけで、CLIが全ステップを自律実行します。途中でメッセージ承認を求めて止まりません。</p>
+
+  <div class="workflow-steps">
+    <div class="step">
+      <div class="step-num done">1</div>
+      <div class="step-title">モード検出</div>
+      <div class="step-desc">Electron / MCP Playwright を自動判定</div>
+      <div class="step-tag">自動</div>
+    </div>
+    <div class="step">
+      <div class="step-num done">2</div>
+      <div class="step-title">企業分析</div>
+      <div class="step-desc">サイト全体を巡回し事業領域を抽出</div>
+      <div class="step-tag">Haiku · 並列</div>
+    </div>
+    <div class="step">
+      <div class="step-num done">3</div>
+      <div class="step-title">メッセージ生成</div>
+      <div class="step-desc">企業ごとにパーソナライズした文面を生成</div>
+      <div class="step-tag">Sonnet · CLI言語能力</div>
+    </div>
+    <div class="step">
+      <div class="step-num active">4</div>
+      <div class="step-title">フォーム解析</div>
+      <div class="step-desc">セレクタ・ラベル・必須項目を自動マッピング</div>
+      <div class="step-tag">処理中...</div>
+    </div>
+    <div class="step">
+      <div class="step-num" style="border-color:var(--ink5);color:var(--ink4)">5</div>
+      <div class="step-title">フォーム入力</div>
+      <div class="step-desc">WebContentsViewで全フィールドに実入力</div>
+      <div class="step-tag">待機中</div>
+    </div>
+    <div class="step">
+      <div class="step-num" style="border-color:var(--ink5);color:var(--ink4)">6</div>
+      <div class="step-title">スクショ撮影</div>
+      <div class="step-desc">入力済み画面を自動保存（必須）</div>
+      <div class="step-tag">待機中</div>
+    </div>
+    <div class="step">
+      <div class="step-num" style="border-color:var(--ink5);color:var(--ink4)">7</div>
+      <div class="step-title">承認待ち</div>
+      <div class="step-desc">人間が確認・送信を最終判断</div>
+      <div class="step-tag">人間の判断</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════ FOOTER ══════════════ -->
+<footer class="footer">
+  <div class="footer-brand">
+    <div style="width:30px;height:30px;border-radius:8px;background:linear-gradient(145deg,#eff6ff,#dbeafe);border:1px solid rgba(37,99,235,.15);display:flex;align-items:center;justify-content:center">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linecap="round"><path d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+    </div>
+    <div>
+      <div style="font-size:.8rem;font-weight:800">Sales Claw</div>
+      <div style="font-size:.62rem;color:var(--ink4)">Powered by Claude Code · Electron</div>
+    </div>
+  </div>
+  <div class="footer-links">
+    <span class="footer-link">ドキュメント</span>
+    <span class="footer-link">設定ガイド</span>
+    <span class="footer-link">ワークフロー</span>
+    <span class="footer-link">リリースノート</span>
+  </div>
+  <div class="footer-copy">© 2026 Sales Claw · v2.4.1</div>
+</footer>
+
+</div><!-- /page-wrap -->
+
+<script>
+/* ─── Animated Counters ─── */
+function animateCounter(el, from, to, duration) {
+  const start = performance.now();
+  function step(now) {
+    const elapsed = now - start;
+    const pct = Math.min(elapsed / duration, 1);
+    const ease = 1 - Math.pow(1 - pct, 3);
+    el.textContent = Math.round(from + (to - from) * ease);
+    if (pct < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const targets = entry.target.querySelectorAll('[data-count]');
+      targets.forEach(el => {
+        const to = parseInt(el.dataset.count, 10);
+        animateCounter(el, 0, to, 1200);
+      });
+      observer.unobserve(entry.target);
+    }
+  });
+}, { threshold: 0.2 });
+
+document.querySelectorAll('.stats-banner').forEach(el => observer.observe(el));
+
+/* ─── CLI feed animation ─── */
+const feedMsgs = [
+  { text: '[No.4] フューチャーAI: フォーム構造解析完了', color: '#60a5fa', bg: 'rgba(59,130,246,.06)', border: 'rgba(59,130,246,.4)', dot: '#3b82f6' },
+  { text: '[No.4] フューチャーAI: 全フィールドへ入力中...', color: '#93c5fd', bg: 'rgba(59,130,246,.08)', border: '#3b82f6', dot: '#3b82f6', pulse: true },
+  { text: '[No.5] スマートリテール: サイト分析開始', color: '#a78bfa', bg: 'rgba(139,92,246,.06)', border: 'rgba(139,92,246,.3)', dot: '#8b5cf6' },
+  { text: '[No.4] フューチャーAI: スクショ撮影完了', color: '#34d399', bg: 'rgba(16,185,129,.08)', border: '#10b981', dot: '#10b981' },
+  { text: '[No.4] フューチャーAI: 確認待ち登録完了', color: '#34d399', bg: 'rgba(16,185,129,.1)', border: '#10b981', dot: '#10b981' },
+];
+let feedIdx = 0;
+const darkFeed = document.querySelector('.dark-main .dark-chart + div > div > div + div + div');
+</script>
+</body>
+</html>

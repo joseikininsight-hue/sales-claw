@@ -41,6 +41,15 @@ const {
   listProviders,
   normalizeProviderId,
 } = require('./ai-providers.cjs');
+const { detectStalledCompanies, formatStallReason } = require('./batch-watchdog.cjs');
+const { saveRecoverySnapshot, loadRecoverySnapshot, clearRecoverySnapshot } = require('./recovery-store.cjs');
+// AI runtime 分離モジュール (Phase 3 の分割先)
+const batchUtils = require('./ai-runtime/batch-utils.cjs');
+const ptyLog = require('./ai-runtime/pty-log.cjs');
+// UI テンプレート分離 (Phase 1)
+const renderStyles = require('./ui/styles.cjs');
+const renderDashboardScript = require('./ui/client-scripts/dashboard.cjs');
+const renderAnalyticsScript = require('./ui/client-scripts/dashboard-analytics.cjs');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const AI_STATUS_CACHE_TTL_MS = 15000;
@@ -78,7 +87,7 @@ let managedAiRecoveryState = null;
 let managedAiRecoveryTimer = null;
 let managedAiSuppressAutoRecovery = false;
 
-const MANAGED_AI_FORM_BATCH_SIZE = 4;
+const MANAGED_AI_FORM_BATCH_SIZE = 3;
 const MANAGED_AI_BATCH_POLL_MS = 5000;
 const MANAGED_AI_BATCH_STALL_MS = 5 * 60 * 1000;
 const MANAGED_AI_PTY_LOG_MAX_BYTES = 1024 * 1024;
@@ -444,12 +453,9 @@ function getManagedAiSubmitSequence(providerId) {
   }
 }
 
+// stripAnsiCodes は ./ai-runtime/batch-utils.cjs に分離済み。既存呼び出しのため wrap を残す
 function stripAnsiCodes(value) {
-  return String(value || '').replace(
-    // eslint-disable-next-line no-control-regex
-    /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-_]|\u009b[0-9;?]*[ -/]*[@-~]/g,
-    '',
-  );
+  return batchUtils.stripAnsiCodes(value);
 }
 
 function clearManagedAiSessionStateTimers(state = managedAiSessionState) {
@@ -482,14 +488,8 @@ function resetManagedAiBatchController() {
 }
 
 function createManagedAiBatchController(providerId, autoSendSafe) {
-  return {
-    providerId: normalizeProviderId(providerId),
-    autoSendSafe: !!autoSendSafe,
-    pending: [],
-    activeBatch: null,
-    batchCounter: 0,
-    pollTimer: null,
-  };
+  // 実体は ./ai-runtime/batch-utils.cjs。providerId 正規化だけ wrap。
+  return batchUtils.createManagedAiBatchController(normalizeProviderId(providerId), autoSendSafe);
 }
 
 function ensureManagedAiBatchController(providerId, autoSendSafe) {
@@ -537,7 +537,11 @@ function snapshotManagedAiBatchesForRecovery() {
       options: { ...(batch.options || {}) },
     });
   });
-  return snapshot.batches.length > 0 ? snapshot : null;
+  if (snapshot.batches.length > 0) {
+    try { saveRecoverySnapshot(snapshot); } catch (_) {}
+    return snapshot;
+  }
+  return null;
 }
 
 function restoreManagedAiBatchesFromRecovery(snapshot) {
@@ -556,71 +560,27 @@ function restoreManagedAiBatchesFromRecovery(snapshot) {
       dispatchNextManagedAiFormFillBatch();
     }, 350);
   }
+  try { clearRecoverySnapshot(); } catch (_) {}
   return controller;
 }
 
+// chunkManagedAiCompanies / buildManagedAiBatchOptionsSubset / parseEventTimestampMs は
+// ./ai-runtime/batch-utils.cjs に分離済み (batchUtils.* として参照)
+// getManagedAiPtyLogFile / appendManagedAiPtyLog は ./ai-runtime/pty-log.cjs に分離済み
 function chunkManagedAiCompanies(companies, chunkSize = MANAGED_AI_FORM_BATCH_SIZE) {
-  const normalizedChunkSize = Math.max(1, Number(chunkSize) || MANAGED_AI_FORM_BATCH_SIZE);
-  const chunks = [];
-  for (let i = 0; i < companies.length; i += normalizedChunkSize) {
-    chunks.push(companies.slice(i, i + normalizedChunkSize));
-  }
-  return chunks;
+  return batchUtils.chunkManagedAiCompanies(companies, chunkSize);
 }
-
-function buildManagedAiBatchOptionsSubset(baseOptions = {}, companies = []) {
-  const companyKeySet = new Set(companies.map((company) => String(company.no)));
-  const subsetMap = new Map();
-  const sourceMap = baseOptions.phaseAByCompany instanceof Map ? baseOptions.phaseAByCompany : null;
-  if (sourceMap) {
-    companies.forEach((company) => {
-      const key = String(company.no);
-      if (sourceMap.has(key)) subsetMap.set(key, sourceMap.get(key));
-    });
-  }
-  return {
-    ...baseOptions,
-    phaseAByCompany: subsetMap,
-    phaseASuccesses: Array.isArray(baseOptions.phaseASuccesses)
-      ? baseOptions.phaseASuccesses.filter((entry) => companyKeySet.has(String(entry.companyNo)))
-      : [],
-    phaseAFailures: Array.isArray(baseOptions.phaseAFailures)
-      ? baseOptions.phaseAFailures.filter((entry) => companyKeySet.has(String(entry.companyNo)))
-      : [],
-  };
+function buildManagedAiBatchOptionsSubset(baseOptions, companies) {
+  return batchUtils.buildManagedAiBatchOptionsSubset(baseOptions, companies);
 }
-
-function getManagedAiPtyLogFile(providerId = getManagedAiProvider()) {
-  return resolveDataPath(path.join('ai-runs', `managed-${normalizeProviderId(providerId)}-session.log`));
-}
-
-function appendManagedAiPtyLog(providerId, chunk, kind = 'output') {
-  const text = stripAnsiCodes(String(chunk || '')).replace(/\r/g, '');
-  if (!text.trim()) return;
-  const logFile = getManagedAiPtyLogFile(providerId);
-  ensureParentDir(logFile);
-  try {
-    if (fs.existsSync(logFile) && fs.statSync(logFile).size > MANAGED_AI_PTY_LOG_MAX_BYTES) {
-      const backupFile = `${logFile}.1`;
-      try {
-        if (fs.existsSync(backupFile)) fs.unlinkSync(backupFile);
-      } catch (_) {}
-      fs.renameSync(logFile, backupFile);
-    }
-  } catch (_) {}
-
-  const lines = text.split('\n').filter((line) => line.trim());
-  if (lines.length === 0) return;
-  const stamp = new Date().toISOString();
-  const payload = lines.map((line) => `[${stamp}] [${kind}] ${line}`).join('\n') + '\n';
-  fs.appendFileSync(logFile, payload, 'utf8');
-}
-
 function parseEventTimestampMs(value) {
-  if (!value) return 0;
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  const parsed = Date.parse(String(value));
-  return Number.isFinite(parsed) ? parsed : 0;
+  return batchUtils.parseEventTimestampMs(value);
+}
+function getManagedAiPtyLogFile(providerId = getManagedAiProvider()) {
+  return ptyLog.getManagedAiPtyLogFile(normalizeProviderId(providerId));
+}
+function appendManagedAiPtyLog(providerId, chunk, kind = 'output') {
+  ptyLog.appendManagedAiPtyLog(providerId, chunk, kind, { maxBytes: MANAGED_AI_PTY_LOG_MAX_BYTES });
 }
 
 function getManagedAiBatchProgressSnapshot(companyNos = []) {
@@ -658,11 +618,17 @@ function getManagedAiBatchProgressSnapshot(companyNos = []) {
       parseEventTimestampMs(latestLog && (latestLog.timestamp || latestLog.date || latestLog.time)),
       parseEventTimestampMs(latestMonitor && (latestMonitor.updatedAt || latestMonitor.timestamp || latestMonitor.time)),
     );
+    // latestTimestamp: watchdog の per-company 判定に使う。
+    // action-log の timestamp を優先し、無ければ monitor の updatedAt をフォールバック
+    const latestTimestamp = (latestLog && (latestLog.timestamp || latestLog.date || latestLog.time))
+      || (latestMonitor && (latestMonitor.updatedAt || latestMonitor.timestamp || latestMonitor.time))
+      || null;
     statuses.push({
       companyNo: Number(key),
       action,
       monitorStatus,
       terminal,
+      latestTimestamp,
     });
   });
 
@@ -1062,6 +1028,7 @@ function startManagedAiBatchPoller() {
       activeController.activeBatch = null;
       if (activeController.pending.length === 0) {
         clearManagedAiBatchControllerTimer(activeController);
+        try { clearRecoverySnapshot(); } catch (_) {}
       } else {
         setTimeout(() => {
           dispatchNextManagedAiFormFillBatch();
@@ -1086,6 +1053,45 @@ function startManagedAiBatchPoller() {
         'warn',
         activeController.providerId,
       );
+
+      // stallNotified が立った直後、message_draft/site_analysis/form_fill で停滞中の企業を自動 error 化
+      const stalledNos = detectStalledCompanies(
+        activeController.activeBatch,
+        snapshot.statuses,
+        { stallMs: MANAGED_AI_BATCH_STALL_MS }
+      );
+      if (stalledNos.length > 0) {
+        stalledNos.forEach((companyNo) => {
+          const status = snapshot.statuses.find((s) => Number(s.companyNo) === Number(companyNo));
+          const company = activeController.activeBatch.companies.find((c) => Number(c.no) === Number(companyNo));
+          const tsRaw = status && (status.latestTimestamp || status.updatedAt || status.timestamp);
+          const idleMs = tsRaw ? Date.now() - Date.parse(tsRaw) : Date.now() - activeController.activeBatch.lastProgressAt;
+          const stalledAt = status ? (status.latestAction || status.action || 'unknown') : 'unknown';
+          const reason = formatStallReason(stalledAt, idleMs);
+          logAction(Number(companyNo), company ? company.companyName : '', 'error', {
+            source: 'batch-watchdog',
+            reason,
+            idleMs,
+            stalledAt,
+          });
+          finishLiveMonitor(Number(companyNo), {
+            companyNo: Number(companyNo),
+            companyName: company ? company.companyName : '',
+            status: 'error',
+            step: reason,
+          });
+        });
+        appendDiagnosticEvent('managed_ai_batch_auto_failed', {
+          provider: activeController.providerId,
+          batchId: activeController.activeBatch.id,
+          stalledCompanyNos: stalledNos,
+        });
+        emitClaudeAutomationLog(
+          `[自動タイムアウト] ${stalledNos.length}社を error として記録しバッチを進めます: ${stalledNos.join(',')}\n`,
+          'warn',
+          activeController.providerId,
+        );
+      }
     }
   }, MANAGED_AI_BATCH_POLL_MS);
   if (typeof controller.pollTimer.unref === 'function') {
@@ -1692,15 +1698,45 @@ async function ensureProviderPlaywrightMcp(providerId, options = {}) {
   };
 }
 
-function getAssetCandidates(filename) {
-  const safeName = path.basename(filename || '');
+// レガシー: basename のみ (e.g. favicon.png)
+// 新規: subpath 対応 (e.g. vendor/fonts/inter.woff2)
+function getAssetCandidates(relativePath) {
+  // パストラバーサル防止: `..` を含むパスは拒否
+  const safe = String(relativePath || '').replace(/\\/g, '/');
+  if (safe.includes('..') || safe.startsWith('/') || safe.includes('\0')) return [];
+  const normalized = path.posix.normalize(safe);
+  if (normalized.startsWith('..') || path.isAbsolute(normalized)) return [];
   const candidates = [
-    path.join(__dirname, '..', 'assets', safeName),
+    // dev モード: worktree/assets 配下
+    path.join(__dirname, '..', 'assets', normalized),
   ];
   if (process.resourcesPath) {
-    candidates.push(path.join(process.resourcesPath, 'assets', safeName));
+    // packaged モード: extraResources の resources/assets 配下
+    candidates.push(path.join(process.resourcesPath, 'assets', normalized));
   }
   return Array.from(new Set(candidates.map((entry) => path.resolve(entry))));
+}
+
+const ASSET_MIME_TYPES = {
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.eot': 'application/vnd.ms-fontobject',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+};
+function assetMimeFor(ext) {
+  return ASSET_MIME_TYPES[ext] || 'application/octet-stream';
 }
 
 function ensureDashboardSessionToken() {
@@ -4673,14 +4709,32 @@ function loadData(options = {}) {
 }
 
 // JSON body parser helper
-function parseJsonBody(req) {
+// デフォルトのリクエストボディ最大サイズ (2 MiB)
+// マッピング JSON / 設定 JSON を許容しつつ、意図的な memory 圧迫を防ぐ。
+const PARSE_JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
+
+function parseJsonBody(req, maxBytes = PARSE_JSON_BODY_MAX_BYTES) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    let aborted = false;
+    req.on('data', chunk => {
+      if (aborted) return;
+      body += chunk;
+      if (body.length > maxBytes) {
+        aborted = true;
+        const err = new Error('Request body too large');
+        err.code = 'BODY_TOO_LARGE';
+        err.maxBytes = maxBytes;
+        try { req.destroy(); } catch (_) {}
+        reject(err);
+      }
+    });
     req.on('end', () => {
+      if (aborted) return;
       try { resolve(JSON.parse(body)); }
       catch (e) { reject(e); }
     });
+    req.on('error', (e) => { if (!aborted) reject(e); });
   });
 }
 
@@ -4712,458 +4766,25 @@ function buildPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sales Claw</title>
 <link rel="icon" type="image/png" href="/assets/favicon.png">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
-<link href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css" rel="stylesheet">
-<script>
-tailwind={config:{darkMode:'class',theme:{extend:{colors:{'primary':'#3b82f6','primary-c':'#2563eb','surface':'#f8f9fa','surface-low':'#f1f5f9','surface-lowest':'#ffffff','surface-container':'#e2e8f0','surface-high':'#f1f5f9','on-surface':'#0f172a','on-surface-v':'#475569','outline-v':'#cbd5e1','outline':'#64748b','error':'#ef4444','tertiary':'#f59e0b','secondary':'#8b5cf6'},fontFamily:{sans:['Inter','"Noto Sans JP"','sans-serif'],mono:['"JetBrains Mono"','monospace']},borderRadius:{DEFAULT:'0',none:'0',sm:'4px',md:'8px',lg:'12px',xl:'16px','2xl':'20px','full':'9999px'}}}}}
-</script>
-<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<!-- ローカルバンドル: フォント・Material Symbols・Phosphor・Tailwind (全てオフライン動作) -->
+<link rel="stylesheet" href="/assets/vendor/fonts.css">
+<link rel="stylesheet" href="/assets/vendor/material-symbols.css">
+<link rel="stylesheet" href="/assets/vendor/phosphor.css">
+<link rel="stylesheet" href="/assets/vendor/tailwind.css">
 <style>
-:root{
-  /* Base surfaces — Premium SaaS cool palette */
-  --bg-deep:#e2e8f0;--bg-base:#f8f9fa;--bg-surface:#f1f5f9;--bg-card:#ffffff;--bg-raised:#e2e8f0;--bg-hover:#dde4ee;
-  /* Brand */
-  --primary:#3b82f6;--primary-dim:#2563eb;--primary-glow:rgba(59,130,246,.08);--on-primary:#ffffff;
-  /* Semantic */
-  --success:#10b981;--success-dim:rgba(16,185,129,.08);
-  --error:#ef4444;--error-dim:rgba(239,68,68,.08);
-  --warning:#f59e0b;--warning-dim:rgba(245,158,11,.08);
-  --info:#8b5cf6;--info-dim:rgba(139,92,246,.08);
-  /* Text — cool slate hierarchy */
-  --text-1:#0f172a;--text-2:#475569;--text-3:#94a3b8;
-  /* Borders — slate-based */
-  --border-subtle:rgba(15,23,42,.06);--border-default:rgba(15,23,42,.12);--border-strong:rgba(15,23,42,.20);
-  /* Legacy compat aliases */
-  --surface:var(--bg-base);--surface-low:var(--bg-deep);--surface-lowest:var(--bg-card);--surface-high:var(--bg-raised);--surface-container:var(--bg-hover);
-  --on-surface:var(--text-1);--on-surface-variant:var(--text-2);--outline-variant:var(--border-subtle);--outline:var(--text-3);
-  --error-container:var(--error-dim);--success-container:var(--success-dim);--warning-container:var(--warning-dim);--info-container:var(--info-dim);
-  --secondary-container:rgba(139,92,246,.08);
-  /* Typography */
-  --font-body:'Inter','Noto Sans JP',system-ui,-apple-system,sans-serif;--font-mono:'JetBrains Mono','Fira Code',ui-monospace,monospace;
-  /* Radii — crisp SaaS */
-  --radius-sm:4px;--radius-md:8px;--radius-lg:12px;--radius-xl:20px;
-  /* Shadows — premium 4-layer system */
-  --shadow-xs:0 1px 2px rgba(15,23,42,.05);
-  --shadow-ambient:0 1px 3px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04);
-  --shadow-card:0 1px 3px rgba(15,23,42,.06),0 4px 12px rgba(15,23,42,.04),0 8px 24px rgba(15,23,42,.02);
-  --shadow-modal:0 4px 12px rgba(15,23,42,.08),0 16px 40px rgba(15,23,42,.06),0 24px 64px rgba(15,23,42,.04);
-  /* Transition tokens */
-  --ease-out-expo:cubic-bezier(.16,1,.3,1);
-  --ease-spring:cubic-bezier(.34,1.56,.64,1);
-  /* Glass-morphism */
-  --glass-bg:rgba(255,255,255,.72);--glass-blur:blur(20px) saturate(180%);--glass-border:rgba(255,255,255,.25);
-}
-*{box-sizing:border-box}
-body{font-family:var(--font-body);background:var(--bg-base);margin:0;color:var(--text-1);font-size:.875rem;line-height:1.5}
-.mono{font-family:var(--font-mono)}
-.material-symbols-outlined{font-variation-settings:'FILL' 0,'wght' 400,'GRAD' 0,'opsz' 20;vertical-align:middle;line-height:1}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:var(--bg-deep)}
-::-webkit-scrollbar-thumb{background:var(--border-default);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:var(--border-strong)}
-
-/* Header brand — glass morphism */
-.app-header{position:fixed;top:0;left:0;right:0;height:48px;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border-bottom:1px solid var(--glass-border);display:flex;align-items:center;padding:0 14px;gap:10px;z-index:50;box-shadow:var(--shadow-ambient),inset 0 -1px 0 var(--glass-border)}
-.app-brand{display:flex;align-items:center;gap:10px;flex:0 0 220px;min-width:220px;padding-right:14px;border-right:1px solid var(--border-subtle);height:100%}
-.app-brand-mark{width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:linear-gradient(145deg,#eff6ff,#dbeafe);border:1px solid rgba(37,99,235,.14);box-shadow:0 4px 16px rgba(37,99,235,.12);overflow:hidden;flex-shrink:0;border-radius:10px}
-.app-brand-logo{width:100%;height:100%;object-fit:contain;display:block}
-.app-brand-fallback{display:none;align-items:center;justify-content:center;width:100%;height:100%;font-size:.78rem;font-weight:800;letter-spacing:.08em;color:var(--primary);font-family:var(--font-mono)}
-.app-brand-copy{display:flex;flex-direction:column;justify-content:center;gap:2px;min-width:0}
-.app-brand-title{font-size:.82rem;font-weight:800;letter-spacing:.02em;color:var(--text-1);line-height:1;white-space:nowrap}
-.app-brand-caption{font-size:.58rem;color:var(--text-3);font-family:var(--font-mono);line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:152px}
-.app-brand-meta{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto}
-.app-version-chip{font-size:.58rem;font-weight:700;background:var(--primary);color:#fff;padding:1px 6px;letter-spacing:.03em;flex-shrink:0;border-radius:999px}
-.app-build-chip{font-size:.56rem;font-weight:700;padding:2px 6px;letter-spacing:.05em;flex-shrink:0;border-radius:999px}
-@media (max-width: 900px){.app-brand{flex-basis:170px;min-width:170px}.app-brand-caption{display:none}.app-build-chip{display:none}}
-
-/* Stat cards */
-.sn{font-family:var(--font-mono);font-size:1.6rem;font-weight:700;transition:color .3s var(--ease-out-expo);line-height:1}
-.sn.changed{animation:pop .4s var(--ease-spring)}
-.sl{font-size:.6rem;color:var(--text-2);margin-top:6px;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
-@keyframes pop{0%{transform:scale(1)}50%{transform:scale(1.15)}100%{transform:scale(1)}}
-#statsRow > div{background:var(--bg-card)!important;border:1px solid var(--border-subtle)!important;border-radius:var(--radius-md)!important;transition:box-shadow .25s var(--ease-out-expo),transform .25s var(--ease-out-expo),border-color .25s;cursor:default;overflow:hidden}
-#statsRow > div:hover{box-shadow:var(--shadow-card),0 0 0 1px var(--border-default);transform:translateY(-2px);border-color:var(--border-default)!important}
-
-/* Table */
-.sc{background:var(--bg-card);box-shadow:var(--shadow-card);border-radius:var(--radius-lg)!important;overflow:hidden;border:1px solid var(--border-subtle);transition:box-shadow .2s,transform .2s}
-.tc{background:var(--bg-card);box-shadow:var(--shadow-ambient);border:1px solid var(--border-subtle);border-radius:var(--radius-md)!important;transition:box-shadow .2s,transform .2s}
-.furl{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sort-icon{font-size:.55rem;color:var(--primary);margin-left:2px}
-.main-table{width:100%;border-collapse:collapse;font-size:.8rem;table-layout:fixed}
-.main-table thead th{font-size:.6rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text-3);user-select:none;padding:.7rem .75rem;background:var(--bg-surface);border-bottom:1px solid var(--border-default);white-space:nowrap;overflow:hidden}
-.main-table thead th[onclick]:hover{background:var(--bg-raised);cursor:pointer;color:var(--text-1)}
-.main-table tbody td{padding:.55rem .75rem;border-bottom:1px solid var(--border-subtle);vertical-align:middle;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;height:44px;max-height:44px}
-.main-table tbody tr{background:var(--bg-card);transition:background .2s var(--ease-out-expo);cursor:pointer}
-.main-table tbody tr:nth-child(even){background:var(--bg-surface)}
-.main-table tbody tr:hover{background:var(--primary-glow)}
-.main-table .company-meta{display:none}
-.main-table td.action-cell{overflow:visible;cursor:default}
-tr.excluded{opacity:.3}
-tr.updated{animation:rowFlash .8s}
-@keyframes rowFlash{0%{background:rgba(16,185,129,.15)}100%{background:transparent}}
-
-/* Filter buttons */
-.fb{font-size:.7rem;padding:5px 14px;border:1px solid var(--border-default);background:transparent;color:var(--text-2);cursor:pointer;transition:all .2s var(--ease-out-expo);font-weight:500;border-radius:var(--radius-xl)!important}
-.fb.active{background:var(--primary);color:#fff;border-color:var(--primary);box-shadow:0 2px 10px rgba(59,130,246,.3)}
-.fb:not(.active):hover{background:var(--bg-hover);color:var(--text-1);border-color:var(--border-strong);transform:translateY(-1px)}
-
-/* Filter bar */
-.filter-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-md);margin-top:8px;box-shadow:var(--shadow-ambient)}
-.filter-field{display:flex;align-items:center;gap:4px;background:var(--bg-base);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:0 10px;height:32px;transition:all .2s;flex-shrink:0}
-.filter-field:focus-within{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
-.filter-field .ms{font-size:14px;color:var(--text-3);flex-shrink:0;font-family:'Material Symbols Outlined';font-variation-settings:'FILL' 0,'wght' 300}
-.filter-field select,.filter-field input{border:none;background:transparent;outline:none;font-size:.78rem;color:var(--text-1);font-family:var(--font-body);min-width:0}
-.filter-field select{min-width:100px;cursor:pointer}
-.filter-field input{width:170px}
-.filter-field input::placeholder{color:var(--text-3)}
-.filter-clear-btn{display:none;align-items:center;gap:3px;padding:3px 9px;font-size:.7rem;font-weight:600;border:1px solid var(--border-default);border-radius:6px;background:transparent;color:var(--text-2);cursor:pointer;transition:all .15s;white-space:nowrap}
-.filter-clear-btn:hover{background:var(--bg-raised);color:var(--text-1)}
-.filter-clear-btn.visible{display:flex}
-
-/* Tab system */
-.tab-content{display:none}
-.tab-content.active{display:block}
-
-/* Horizontal tab bar */
-#mainTabNav{position:sticky;top:48px;z-index:39;background:var(--glass-bg);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);border-bottom:1px solid var(--border-subtle);display:flex;align-items:stretch;padding:0 16px;gap:1px}
-.tab-btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;font-size:.74rem;font-weight:600;background:none;border:none;border-bottom:2.5px solid transparent;color:var(--text-3);cursor:pointer;transition:all .18s var(--ease-out-expo);white-space:nowrap;flex-shrink:0;border-radius:0!important;letter-spacing:.02em}
-.tab-btn:hover{color:var(--text-1);background:rgba(59,130,246,.04)}
-.tab-btn.active{color:var(--primary);border-bottom-color:var(--primary);font-weight:700;background:rgba(59,130,246,.05)}
-.tab-btn .tab-icon{font-size:17px;opacity:.5;flex-shrink:0}
-.tab-btn:hover .tab-icon{opacity:.8}
-.tab-btn.active .tab-icon{opacity:1}
-
-/* Badges / chips */
-.badge,.chip{display:inline-block;font-size:.58rem;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:var(--radius-xl)!important;transition:all .15s var(--ease-out-expo)}
-.chip-success{background:var(--success-dim);color:var(--success);border:1px solid rgba(16,185,129,.2)}
-.chip-error{background:var(--error-dim);color:var(--error);border:1px solid rgba(239,68,68,.2)}
-.chip-warning{background:var(--warning-dim);color:var(--warning);border:1px solid rgba(245,158,11,.2)}
-.chip-info{background:var(--info-dim);color:var(--info);border:1px solid rgba(139,92,246,.2)}
-.chip-neutral{background:var(--bg-raised);color:var(--text-2);border:1px solid var(--border-subtle)}
-.chip-primary{background:rgba(59,130,246,.15);color:var(--primary);border:1px solid rgba(59,130,246,.25)}
-.badge{border-radius:var(--radius-xl)!important}
-.badge.bg-success{background:var(--success-dim)!important;color:var(--success)!important}
-.badge.bg-danger{background:var(--error-dim)!important;color:var(--error)!important}
-.badge.bg-warning,.badge.bg-warning.text-dark{background:var(--warning-dim)!important;color:var(--warning)!important}
-.badge.bg-info{background:var(--info-dim)!important;color:var(--info)!important}
-.badge.bg-secondary{background:var(--bg-raised)!important;color:var(--text-2)!important}
-.badge.bg-primary{background:rgba(59,130,246,.15)!important;color:var(--primary)!important;border:1px solid rgba(59,130,246,.25)}
-
-/* Live dot */
-.live-dot{width:7px;height:7px;border-radius:50%!important;display:inline-block;flex-shrink:0;background:var(--text-3)}
-.live-dot.on{background:var(--success);box-shadow:0 0 0 0 rgba(16,185,129,.5);animation:pulse 2.2s infinite}
-.live-dot.off{background:var(--error);animation:none}
-.live-dot.warn{background:var(--warning)}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(16,185,129,.5)}70%{box-shadow:0 0 0 6px rgba(16,185,129,0)}100%{box-shadow:0 0 0 0 rgba(16,185,129,0)}}
-
-/* Progress pipeline */
-.progress-pipeline{display:flex;gap:1px;align-items:stretch;height:8px;margin:.4rem 0;border-radius:var(--radius-sm);overflow:hidden}
-.pip-seg{height:8px;transition:width .5s;min-width:2px}
-.log-entry{font-size:.72rem;font-family:var(--font-mono);color:var(--text-2);padding:4px 10px;margin:2px 0;background:var(--bg-surface);border-left:2px solid var(--border-default);border-radius:0 var(--radius-sm) var(--radius-sm) 0!important;transition:background .1s}
-.log-entry:hover{background:var(--bg-hover)}
-.log-entry.error{background:var(--error-dim);border-left-color:var(--error)}
-.log-entry.success{background:var(--success-dim);border-left-color:var(--success)}
-.ts{font-size:.65rem;color:var(--text-3)}
-
-/* Toast */
-.toast-container{position:fixed;top:3.5rem;right:16px;z-index:10000;display:flex;flex-direction:column;gap:8px}
-.toast-msg{padding:11px 18px;font-size:.8rem;font-weight:600;box-shadow:var(--shadow-modal);animation:slideIn .3s var(--ease-spring);border-radius:var(--radius-md)!important;border:1px solid var(--border-default);backdrop-filter:blur(8px)}
-.toast-msg.success{background:rgba(16,185,129,.15);color:var(--success);border-color:rgba(16,185,129,.3)}
-.toast-msg.error{background:rgba(239,68,68,.15);color:var(--error);border-color:rgba(239,68,68,.3)}
-.toast-msg.info{background:rgba(59,130,246,.15);color:var(--primary);border-color:rgba(59,130,246,.3)}
-@keyframes slideIn{from{opacity:0;transform:translateX(24px) scale(.95)}to{opacity:1;transform:translateX(0) scale(1)}}
-
-/* Memo dropdown panel */
-#memoBtn{display:none;align-items:center;gap:5px;background:var(--warning-dim);border:1px solid rgba(245,158,11,.25);padding:4px 10px;font-size:.72rem;font-weight:600;cursor:pointer;color:var(--warning);transition:all .12s;white-space:nowrap;border-radius:var(--radius-sm)!important}
-#memoBtn:hover{filter:brightness(1.15)}
-#memoBtn.has-issues{display:flex}
-#memoBadge{background:var(--warning);color:#000;font-size:.58rem;font-weight:700;padding:1px 5px;border-radius:var(--radius-xl)}
-#memoPanel{display:none;position:fixed;top:48px;right:0;z-index:48;width:360px;background:var(--bg-card);border:1px solid rgba(245,158,11,.2);border-top:none;box-shadow:var(--shadow-modal);padding:14px 18px;animation:slideIn .15s ease}
-#memoPanel.open{display:block}
-#memoPanel strong{font-size:.82rem;font-weight:700;color:#92400e}
-#memoPanel ul{margin:6px 0 0;padding-left:16px}
-#memoPanel li{font-size:.78rem;line-height:1.5;margin-bottom:3px;color:var(--on-surface)}
-.status-meta{font-size:.72rem;color:var(--on-surface-variant);margin-top:6px}
-
-/* Action buttons */
-.btn-act{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;font-size:.72rem;font-weight:600;border:1px solid;cursor:pointer;transition:all .2s var(--ease-out-expo);border-radius:var(--radius-sm)!important}
-.btn-act:active{transform:translateY(1px)}
-.btn-act-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
-.btn-act-primary:hover{background:var(--primary-dim);border-color:var(--primary-dim);box-shadow:0 2px 12px rgba(59,130,246,.3)}
-.btn-act-success{background:var(--success);color:#000;border-color:var(--success)}
-.btn-act-success:hover{opacity:.85;box-shadow:0 0 12px rgba(16,185,129,.25)}
-.btn-act-danger{background:none;color:var(--error);border-color:rgba(239,68,68,.4)}
-.btn-act-danger:hover{background:var(--error-dim);border-color:var(--error)}
-.btn-act-neutral{background:var(--bg-raised);color:var(--text-1);border-color:var(--border-default)}
-.btn-act-neutral:hover{background:rgba(255,255,255,.1);border-color:var(--border-strong)}
-.company-action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;width:100%;max-width:196px}
-.company-action-grid.single-row{grid-template-columns:repeat(2,minmax(0,1fr))}
-.company-action-btn{display:inline-flex;align-items:center;justify-content:center;width:100%;min-width:0;padding:6px 8px;font-size:.71rem;font-weight:700;line-height:1.2;border-radius:var(--radius-sm)!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.company-action-grid .btn{margin:0!important}
-/* legacy Bootstrap compat — used in JS-generated table buttons */
-.btn{display:inline-flex;align-items:center;gap:3px;font-size:.73rem;font-weight:600;border:1px solid var(--border-default);cursor:pointer;transition:all .15s;padding:4px 11px;border-radius:var(--radius-sm)!important;background:rgba(255,255,255,.05);color:var(--text-1)}
-.btn:active{transform:translateY(1px)}
-.btn-sm{padding:3px 9px;font-size:.68rem}
-.btn-success{background:var(--success);color:#000;border-color:var(--success)}
-.btn-success:hover{opacity:.85;box-shadow:0 0 12px rgba(16,185,129,.25)}
-.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
-.btn-primary:hover{background:var(--primary-dim);box-shadow:0 0 12px rgba(59,130,246,.25)}
-.btn-outline-danger{background:none;color:var(--error);border-color:rgba(239,68,68,.4)}
-.btn-outline-danger:hover{background:var(--error-dim);border-color:var(--error)}
-.btn-outline-primary{background:none;color:var(--primary);border-color:rgba(59,130,246,.4)}
-.btn-outline-primary:hover{background:var(--primary-glow);border-color:var(--primary)}
-.btn-outline-secondary{background:none;color:var(--text-2);border-color:var(--border-default)}
-.btn-outline-secondary:hover{background:var(--bg-raised);color:var(--text-1)}
-.btn-close{background:none;border:none;font-size:1.2rem;cursor:pointer;color:var(--text-2);padding:0;line-height:1}
-.btn-close:hover{color:var(--text-1)}
-
-/* Spinner */
-.spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.15);border-top-color:var(--primary);border-radius:50%!important;animation:spin .6s linear infinite;vertical-align:middle}
-@keyframes spin{to{transform:rotate(360deg)}}
-/* AI thinking indicator */
-.think-spin{width:10px;height:10px;border:1.5px solid rgba(99,102,241,.2);border-top-color:#818cf8;border-radius:50%!important;animation:spin .8s linear infinite;flex-shrink:0;display:inline-block}
-.cli-thinking-line{display:flex!important;align-items:center;gap:6px;padding:4px 10px!important;background:rgba(99,102,241,.05);border-left:2px solid rgba(99,102,241,.3)}
-
-/* Card containers for awaiting/sent */
-.awaiting-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-left:3px solid var(--warning);margin-bottom:10px;border-radius:var(--radius-md)!important;box-shadow:var(--shadow-card);transition:all .25s var(--ease-out-expo)}
-.awaiting-card:hover{box-shadow:var(--shadow-card),0 6px 24px rgba(15,23,42,.06);transform:translateY(-1px);border-color:var(--border-default)}
-.sent-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-left:3px solid var(--success);margin-bottom:10px;border-radius:var(--radius-md)!important;box-shadow:var(--shadow-card);transition:all .25s var(--ease-out-expo)}
-.sent-card:hover{box-shadow:var(--shadow-card),0 6px 24px rgba(15,23,42,.06);transform:translateY(-1px)}
-.row-danger td{background:rgba(239,68,68,.06)!important}
-.row-success td{background:rgba(16,185,129,.06)!important}
-.row-warning td{background:rgba(245,158,11,.06)!important}
-
-/* Bootstrap grid compat — used in render() JS */
-.row{display:flex;flex-wrap:wrap;gap:12px}.col-md-4{width:calc(33.333% - 8px);min-width:200px}.col-md-8{width:calc(66.666% - 4px)}.g-3,.row.g-3{gap:12px}
-.d-flex{display:flex}.align-items-center{align-items:center}.justify-content-between{justify-content:space-between}.flex-wrap{flex-wrap:wrap}.flex-column{flex-direction:column}.gap-1{gap:4px}.gap-2{gap:8px}.gap-3{gap:12px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mt-1{margin-top:4px}.mt-2{margin-top:8px}.ms-2{margin-left:8px}.ms-auto{margin-left:auto}.me-1{margin-right:4px}.me-2{margin-right:8px}.fw-bold{font-weight:700}.text-muted{color:var(--on-surface-variant)}.text-center{text-align:center}.py-4{padding:16px 0}.py-0{padding-top:0;padding-bottom:0}.px-1{padding-left:4px;padding-right:4px}.form-check-input{appearance:none;-webkit-appearance:none;width:16px;height:16px;border:2px solid var(--border-strong);border-radius:4px;background:var(--bg-card);cursor:pointer;transition:all .15s var(--ease-out-expo);position:relative}
-.form-check-input:checked{background:var(--primary);border-color:var(--primary)}
-.form-check-input:checked::after{content:'';position:absolute;left:4px;top:1px;width:5px;height:9px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
-.form-check-input:focus{box-shadow:0 0 0 3px rgba(59,130,246,.15);border-color:var(--primary)}
-.form-check-input:hover:not(:checked){border-color:var(--primary);background:rgba(59,130,246,.04)}
-/* Stat pills */
-.stat-pill{display:flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;border-radius:5px;border:1px solid var(--border-default);border-left:3px solid;background:var(--bg-card);box-shadow:var(--shadow-xs);cursor:default;transition:all .15s var(--ease-out-expo)}
-.stat-pill:hover{box-shadow:var(--shadow-ambient);transform:translateY(-1px)}
-.stat-pill-label{font-size:.62rem;font-weight:500;color:var(--text-2)}
-.stat-pill-val{font-size:.78rem!important;font-weight:700!important;font-family:var(--font-mono)!important;line-height:1}
-.stat-pill-warn{border-color:var(--warning);background:rgba(245,158,11,.04)}
-/* Sparkline prep */
-.stat-sparkline{display:block;width:100%;height:32px;margin-top:8px;opacity:.6}
-.stat-sparkline path{fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
-/* Glass utility */
-.glass{background:var(--glass-bg);backdrop-filter:var(--glass-blur);border-color:var(--glass-border)}
-/* Premium transitions */
-.transition-smooth{transition:all .25s var(--ease-out-expo)}
-.transition-spring{transition:all .3s var(--ease-spring)}
-/* Monitor floating panel animations */
-@keyframes monitorPanelIn{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
-@keyframes monitorToastIn{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:translateX(0)}}
-@keyframes monitorToastOut{from{opacity:1;transform:translateX(0)}to{opacity:0;transform:translateX(24px)}}
-#monitorFab:hover{box-shadow:var(--shadow-modal),0 0 20px rgba(59,130,246,.2)}
-.monitor-dot-active{animation:monitorDotPulse 2s infinite}
-@keyframes monitorDotPulse{0%{box-shadow:0 0 0 0 rgba(59,130,246,.5)}70%{box-shadow:0 0 0 6px rgba(59,130,246,0)}100%{box-shadow:0 0 0 0 rgba(59,130,246,0)}}
-
-/* Form inputs */
-.form-control,.form-control-sm{width:100%;padding:7px 11px;border:1px solid var(--border-default);background:var(--bg-deep);color:var(--text-1);font-size:.82rem;font-family:var(--font-body);transition:border-color .15s,box-shadow .15s;border-radius:var(--radius-sm)!important}
-.form-control-sm{font-size:.78rem;padding:5px 9px}
-.form-control:focus,.form-control-sm:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
-
-/* Settings */
-.settings-layout{display:flex;gap:0;min-height:500px}
-.settings-sidebar{width:210px;background:var(--bg-surface);border-right:1px solid var(--border-subtle);padding:8px 0;flex-shrink:0}
-.settings-sidebar-btn{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;text-align:left;background:none;border:none;border-left:3px solid transparent;padding:9px 18px;font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-2);cursor:pointer;transition:all .15s var(--ease-out-expo)}
-.settings-sidebar-btn:hover{background:var(--bg-hover);color:var(--text-1)}
-.settings-sidebar-btn.active{background:var(--primary-glow);color:var(--primary);font-weight:700;border-left-color:var(--primary)}
-.settings-sidebar-label{min-width:0;flex:1}
-.settings-sidebar-status{display:inline-flex;align-items:center;justify-content:center;padding:2px 6px;border:1px solid var(--border-default);font-size:.58rem;font-weight:700;letter-spacing:.04em;text-transform:none;color:var(--text-3);background:var(--bg-card);white-space:nowrap;border-radius:var(--radius-sm)!important}
-.settings-sidebar-status.ready{border-color:rgba(16,185,129,.3);color:var(--success);background:var(--success-dim)}
-.settings-sidebar-status.attention{border-color:rgba(245,158,11,.3);color:var(--warning);background:var(--warning-dim)}
-.settings-sidebar-status.optional{border-color:var(--border-subtle);color:var(--text-3);background:transparent}
-.settings-main{flex:1;padding:20px 24px;background:var(--bg-card);overflow-y:auto;max-height:75vh}
-.settings-section{display:none}
-.settings-section.active{display:block}
-.settings-section h3{font-size:.9rem;font-weight:700;margin-bottom:4px;color:var(--text-1);text-transform:uppercase;letter-spacing:.06em}
-.settings-section .section-desc{font-size:.78rem;color:var(--text-2);margin-bottom:18px}
-.settings-callout{display:flex;align-items:flex-start;gap:8px;padding:10px 12px;border:1px solid var(--border-subtle);margin-bottom:16px;background:var(--bg-surface);font-size:.76rem;color:var(--text-2);border-radius:var(--radius-sm)!important}
-.settings-callout.required{background:var(--warning-dim);border-color:rgba(245,158,11,.25);color:var(--warning)}
-.settings-callout.recommended{background:var(--info-dim);border-color:rgba(139,92,246,.25);color:var(--info)}
-.settings-callout.optional{background:var(--bg-surface);color:var(--text-2)}
-.settings-callout strong{color:inherit}
-.settings-group{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border-subtle)}
-.settings-group:last-child{border-bottom:none}
-.settings-group label{display:block;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-2);margin-bottom:5px}
-.settings-group .help-text{font-size:.68rem;color:var(--text-3);margin-top:3px}
-.settings-group input[type="text"],.settings-group input[type="number"],.settings-group input[type="email"],.settings-group input[type="tel"],.settings-group textarea,.settings-group select{width:100%;padding:7px 11px;border:1px solid var(--border-default);font-size:.82rem;background:var(--bg-deep);color:var(--text-1);transition:border-color .15s,box-shadow .15s;font-family:var(--font-body);border-radius:var(--radius-sm)!important}
-.settings-group input:focus,.settings-group textarea:focus,.settings-group select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-.settings-group textarea{min-height:80px;resize:vertical}
-.settings-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.settings-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-.settings-field-chip{display:inline-flex;align-items:center;padding:1px 6px;border:1px solid var(--outline-variant);font-size:.56rem;font-weight:800;letter-spacing:.04em;color:var(--on-surface-variant);background:var(--surface-lowest);vertical-align:middle;margin-left:6px}
-.settings-field-chip.required{background:var(--warning-container);border-color:rgba(138,87,0,.22);color:var(--warning)}
-.settings-field-chip.recommended{background:var(--info-container);border-color:rgba(26,111,154,.22);color:var(--info)}
-.settings-field-chip.optional{background:var(--surface-low);color:var(--outline)}
-/* === Setup Guide redesign: compact list === */
-.settings-setup-guide{border:1px solid var(--border-default);background:var(--bg-card);padding:0;margin-bottom:18px;box-shadow:var(--shadow-ambient);border-radius:var(--radius-lg)!important;overflow:hidden}
-.settings-setup-head{display:flex;align-items:center;gap:16px;padding:14px 18px;border-bottom:1px solid var(--border-subtle);background:linear-gradient(135deg,var(--primary-glow) 0%,transparent 100%)}
-.settings-setup-eyebrow{font-size:.58rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--primary);margin-bottom:3px}
-.settings-setup-title{font-size:.88rem;font-weight:800;margin:0;color:var(--text-1);letter-spacing:.02em}
-.settings-setup-overview{display:flex;align-items:center;gap:12px;margin-left:auto;flex-shrink:0}
-.settings-setup-progress-label{font-size:.78rem;font-weight:800;color:var(--text-1);white-space:nowrap}
-.settings-setup-progress-track{width:120px;height:6px;background:var(--bg-raised);overflow:hidden;border-radius:3px!important;flex-shrink:0}
-.settings-setup-progress-track span{display:block;height:100%;background:linear-gradient(90deg,var(--primary) 0%,#60a5fa 100%);width:0;transition:width .3s ease;border-radius:3px!important}
-.settings-setup-progress-note{font-size:.7rem;color:var(--text-2);white-space:nowrap}
-/* Grid → list rows */
-.settings-setup-grid{display:flex;flex-direction:column;gap:0}
-.setup-check-card{display:flex;align-items:center;gap:14px;width:100%;padding:11px 18px;background:var(--bg-card);border:none;border-bottom:1px solid var(--border-subtle);text-align:left;cursor:pointer;transition:background .12s;border-radius:0!important}
-.setup-check-card:last-child{border-bottom:none}
-.setup-check-card:hover{background:var(--bg-raised)}
-.setup-check-card-head{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
-.setup-check-card-title{font-size:.8rem;font-weight:700;color:var(--text-1);white-space:nowrap}
-.setup-check-card-hint{font-size:.72rem;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
-.setup-status-chip{display:inline-flex;align-items:center;justify-content:center;padding:2px 10px;font-size:.6rem;font-weight:700;letter-spacing:.03em;border:1px solid var(--border-default);background:var(--bg-surface);color:var(--text-3);white-space:nowrap;border-radius:var(--radius-xl)!important;flex-shrink:0}
-.setup-status-chip.ready{background:var(--success-dim);border-color:rgba(5,150,105,.25);color:var(--success)}
-.setup-status-chip.attention{background:var(--warning-dim);border-color:rgba(217,119,6,.25);color:var(--warning)}
-.setup-status-chip.optional{background:transparent;border-color:var(--border-subtle);color:var(--text-3)}
-/* show setup checklist items inline so minimum required fields are always visible */
-.setup-check-list{display:flex;flex-wrap:wrap;gap:8px 12px;margin-top:8px;padding:0;list-style:none}
-.setup-check-item{display:flex;align-items:flex-start;gap:8px;font-size:.72rem;color:var(--text-1)}
-.setup-check-item.pending{color:var(--text-2)}
-.setup-check-dot{width:10px;height:10px;border:2px solid var(--border-default);margin-top:3px;flex-shrink:0;background:transparent;border-radius:2px!important}
-.setup-check-item.done .setup-check-dot{background:var(--success);border-color:var(--success)}
-.setup-check-level{margin-left:6px}
-.list-manager{border:1px solid var(--border-subtle);padding:10px;background:var(--bg-surface);border-radius:var(--radius-sm)!important}
-.list-manager .list-item{display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg-card);border:1px solid var(--border-subtle);margin-bottom:4px;font-size:.78rem;border-radius:var(--radius-sm)!important}
-.list-manager .list-item .remove-btn{background:none;border:none;color:var(--error);cursor:pointer;font-size:1rem;padding:0 4px;line-height:1}
-.list-manager .add-row{display:flex;gap:6px;margin-top:8px}
-.list-manager .add-row input{flex:1;padding:5px 9px;border:1px solid var(--border-default);font-size:.78rem;background:var(--bg-deep);color:var(--text-1);border-radius:var(--radius-sm)!important}
-.list-manager .add-row button{padding:5px 13px;background:var(--primary);color:#fff;border:none;font-size:.75rem;cursor:pointer;font-weight:600;border-radius:var(--radius-sm)!important}
-.save-bar{position:sticky;bottom:0;background:var(--bg-card);border-top:1px solid var(--border-subtle);padding:10px 0;display:flex;justify-content:flex-end;gap:8px;z-index:10}
-.save-bar .btn-save{padding:7px 22px;background:var(--primary);color:#fff;border:none;font-size:.8rem;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.05em;transition:all .12s;border-radius:var(--radius-sm)!important}
-.save-bar .btn-save:hover{opacity:.85;box-shadow:0 0 14px rgba(59,130,246,.3)}
-
-/* Preview/mapping tables */
-.preview-table{font-size:.72rem;width:100%;border-collapse:collapse;margin-top:8px}
-.preview-table th,.preview-table td{padding:4px 8px;border:1px solid var(--border-subtle);text-align:left;color:var(--text-1)}
-.preview-table th{background:var(--bg-surface);font-weight:700;text-transform:uppercase;letter-spacing:.05em;font-size:.62rem;color:var(--text-2)}
-.settings-path-picker{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
-.btn-picker{padding:7px 12px;border:1px solid var(--border-default);background:var(--bg-surface);color:var(--text-1);font-size:.75rem;font-weight:700;cursor:pointer;white-space:nowrap;border-radius:var(--radius-sm)!important}
-.btn-picker:hover{background:var(--bg-raised)}
-.column-map-toolbar{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}
-.column-map-list{display:flex;flex-direction:column;gap:6px}
-.column-map-row{display:grid;grid-template-columns:minmax(0,1fr) 92px auto;gap:8px;align-items:center}
-.column-map-row label,.column-map-label{font-size:.75rem;font-weight:700;color:var(--text-1)}
-.column-map-row input[type="number"]{width:92px;padding:4px 8px;border:1px solid var(--border-default);font-size:.78rem;text-align:center;background:var(--bg-deep);color:var(--text-1);border-radius:var(--radius-sm)!important}
-.column-map-row .column-map-key{width:100%;padding:4px 8px;border:1px solid var(--border-default);font-size:.78rem;background:var(--bg-deep);color:var(--text-1);border-radius:var(--radius-sm)!important}
-.column-map-row .remove-btn{justify-self:end}
-.obj-list-item{border:1px solid var(--border-subtle);padding:10px;margin-bottom:8px;background:var(--bg-surface);border-radius:var(--radius-sm)!important}
-.obj-list-item .obj-row{display:flex;gap:8px;margin-bottom:4px;align-items:center}
-.obj-list-item .obj-row label{font-size:.7rem;color:var(--text-2);min-width:60px}
-.obj-list-item .obj-row input{flex:1;padding:4px 8px;border:1px solid var(--border-default);font-size:.78rem;background:var(--bg-deep);color:var(--text-1);border-radius:var(--radius-sm)!important}
-.company-toolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:10px}
-.bulk-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
-.company-meta{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
-.checkbox-cell{text-align:center;width:34px}
-.modal-shell{position:fixed;top:0;left:0;width:100%;height:100%;padding:18px;background:rgba(15,23,42,.6);backdrop-filter:blur(8px);z-index:9998;display:none;align-items:center;justify-content:center}
-.modal-shell.open{display:flex}
-.modal-panel{background:var(--bg-card);border:1px solid var(--border-default);width:min(760px,100%);max-height:90vh;overflow-y:auto;box-shadow:var(--shadow-modal);border-radius:var(--radius-lg)!important}
-.modal-head{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border-subtle)}
-.modal-head h3{margin:0;font-size:.88rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--text-1)}
-.modal-body{padding:18px}
-.modal-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.modal-grid-full{grid-column:1/-1}
-.modal-actions{display:flex;justify-content:flex-end;gap:8px;padding:0 18px 18px}
-@media (max-width: 960px){#liveMonitorBody{grid-template-columns:1fr!important}#liveMonitorBody > div:first-child{border-right:none!important;border-bottom:1px solid var(--border-subtle)!important}}
-@keyframes monitorPulse{0%,100%{opacity:1}50%{opacity:.4}}
-.monitor-dot-active{animation:monitorPulse 1.6s ease-in-out infinite}
-@media (max-width: 840px){.modal-grid{grid-template-columns:1fr}.company-toolbar{flex-direction:column}.bulk-toolbar{justify-content:flex-start}.settings-row,.settings-row-3{grid-template-columns:1fr}.settings-setup-head{flex-direction:column}.settings-sidebar{width:180px}}
-
-/* Analytics cards */
-.stat-card{transition:transform .18s,box-shadow .18s}
-.stat-card:hover{transform:translateY(-2px)}
-.stat-card-primary{background:linear-gradient(135deg,rgba(59,130,246,.25),rgba(29,78,216,.35));color:var(--text-1);border:1px solid rgba(59,130,246,.2)}
-
-/* Chart containers */
-.chart-panel{background:var(--bg-card);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-card);padding:18px;border:1px solid var(--border-subtle);transition:box-shadow .25s var(--ease-out-expo),transform .25s var(--ease-out-expo)}
-.chart-panel:hover{box-shadow:var(--shadow-card),0 6px 24px rgba(15,23,42,.06)}
-@keyframes modalIn{from{opacity:0;transform:scale(.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
-/* Launch Modal Provider Cards */
-.launch-provider-card{flex:1;display:flex;flex-direction:column;align-items:center;padding:12px 8px 10px;border:2px solid #e2e8f0;border-radius:14px;cursor:pointer;transition:all .2s;background:#fff;gap:5px;position:relative;min-width:0;text-align:center}
-.launch-provider-card:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,0,0,.1)}
-.launch-provider-card.selected.claude{border-color:#CC785C;background:linear-gradient(145deg,#fff7f3,#fff)}
-.launch-provider-card.selected.codex{border-color:#10a37f;background:linear-gradient(145deg,#f0fdf8,#fff)}
-.launch-provider-card.selected.gemini{border-color:#4285F4;background:linear-gradient(145deg,#eff6ff,#fff)}
-.lp-icon{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.lp-name{font-size:.74rem;font-weight:800;letter-spacing:.02em;line-height:1}
-.lp-sub{font-size:.58rem;color:#94a3b8;line-height:1}
-.lp-check{position:absolute;top:7px;right:7px;width:16px;height:16px;border-radius:50%;display:none;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff}
-.launch-provider-card.selected .lp-check{display:flex}
-.launch-provider-card.selected.claude .lp-check{background:#CC785C}
-.launch-provider-card.selected.codex .lp-check{background:#10a37f}
-.launch-provider-card.selected.gemini .lp-check{background:#4285F4}
-body.perf-mode{
---glass-bg:#ffffff;
---glass-blur:none;
---glass-border:rgba(148,163,184,.18);
---shadow-ambient:0 1px 2px rgba(15,23,42,.05);
---shadow-card:0 1px 3px rgba(15,23,42,.06),0 8px 18px rgba(15,23,42,.04);
---shadow-modal:0 8px 24px rgba(15,23,42,.12);
-}
-body.perf-mode .app-header,
-body.perf-mode #mainTabNav,
-body.perf-mode .glass,
-body.perf-mode .toast-msg,
-body.perf-mode .modal-shell{
-backdrop-filter:none!important;
--webkit-backdrop-filter:none!important;
-}
-body.perf-mode .sn.changed,
-body.perf-mode tr.updated,
-body.perf-mode .live-dot.on,
-body.perf-mode .monitor-dot-active,
-body.perf-mode .toast-msg,
-body.perf-mode .spin,
-body.perf-mode .think-spin{
-animation:none!important;
-}
-body.perf-mode .app-header *,
-body.perf-mode #mainTabNav *,
-body.perf-mode .chart-panel,
-body.perf-mode .sc,
-body.perf-mode .tc,
-body.perf-mode .awaiting-card,
-body.perf-mode .sent-card,
-body.perf-mode .stat-pill,
-body.perf-mode .btn,
-body.perf-mode #monitorFab{
-transition:none!important;
-}
-body.perf-mode #statsRow > div:hover,
-body.perf-mode .sc:hover,
-body.perf-mode .tc:hover,
-body.perf-mode .awaiting-card:hover,
-body.perf-mode .sent-card:hover,
-body.perf-mode .chart-panel:hover,
-body.perf-mode .stat-pill:hover,
-body.perf-mode #monitorFab:hover,
-body.perf-mode .launch-provider-card:hover{
-transform:none!important;
-box-shadow:var(--shadow-card)!important;
-}
-body.perf-mode .main-table tbody tr,
-body.perf-mode .awaiting-card,
-body.perf-mode .sent-card{
-content-visibility:auto;
-contain:layout paint style;
-}
-body.perf-mode .main-table tbody tr{contain-intrinsic-size:56px}
-body.perf-mode .awaiting-card,
-body.perf-mode .sent-card{contain-intrinsic-size:420px}
-body.perf-mode #monitorEventList > div{
-content-visibility:auto;
-contain:layout paint style;
-contain-intrinsic-size:84px;
-}
+${renderStyles()}
 </style>
+<script>
+// Early theme init (FOUC prevention) — runs before body renders.
+(function(){
+  try{
+    var saved=localStorage.getItem('dashboardTheme');
+    var prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var theme=saved||(prefersDark?'dark':'light');
+    document.documentElement.setAttribute('data-theme',theme);
+  }catch(_){ document.documentElement.setAttribute('data-theme','light'); }
+})();
+</script>
 </head>
 <body class="${APP_BUILD_SOURCE === 'installed' ? 'desktop-build perf-mode' : ''}">
 <!-- Toast container -->
@@ -5204,6 +4825,10 @@ contain-intrinsic-size:84px;
   </div>
   <!-- Icon-only action buttons -->
   <div style="display:flex;align-items:center;gap:2px">
+    <button class="theme-toggle" onclick="toggleTheme()" title="${_lang === 'ja' ? 'テーマ切替' : 'Toggle theme'}" aria-label="Toggle theme">
+      <span class="ti sun"><span class="material-symbols-outlined" style="font-size:18px">light_mode</span></span>
+      <span class="ti moon"><span class="material-symbols-outlined" style="font-size:18px">dark_mode</span></span>
+    </button>
     <button onclick="showDocsModal()" title="${_t['app.docsTitle'] || 'Guide'}" style="display:flex;align-items:center;justify-content:center;width:32px;height:32px;background:none;border:1px solid transparent;cursor:pointer;color:var(--text-3);transition:all .15s;border-radius:var(--radius-sm)" onmouseover="this.style.background='var(--bg-hover)';this.style.color='var(--text-1)';this.style.borderColor='var(--border-default)'" onmouseout="this.style.background='none';this.style.color='var(--text-3)';this.style.borderColor='transparent'">
       <span class="material-symbols-outlined" style="font-size:18px">menu_book</span>
     </button>
@@ -5225,158 +4850,163 @@ contain-intrinsic-size:84px;
 <span id="headerLastUpdate" style="display:none"></span>
 
 <!-- Auto-update banner (shown by pollUpdateStatus) -->
-<div id="updateBanner" style="display:none;position:fixed;top:48px;left:0;right:0;z-index:49;background:#0043ce;color:#fff;padding:6px 16px;font-size:.75rem;font-weight:600;align-items:center;gap:8px;justify-content:center"></div>
+<div id="updateBanner" style="display:none;position:fixed;top:48px;left:0;right:0;z-index:49;background:#2563eb;color:#fff;padding:6px 16px;font-size:.75rem;font-weight:600;align-items:center;gap:8px;justify-content:center"></div>
 
 <!-- Docs Modal -->
 <!-- AI 起動モード選択モーダル -->
-<div id="launchModal" onclick="if(event.target===this)closeLaunchModal()" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(15,23,42,.75);backdrop-filter:blur(6px);z-index:10000;align-items:center;justify-content:center">
-  <div style="background:#fff;width:780px;max-width:95vw;border-radius:24px;overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.28);animation:modalIn .22s cubic-bezier(.34,1.2,.64,1)">
-    <!-- ヘッダー: プロバイダー別動的グラデーション -->
-    <div id="launchModalHeader" style="background:linear-gradient(135deg,#CC785C,#E8935A);padding:20px 24px;position:relative;overflow:hidden">
-      <div style="position:absolute;top:-30px;right:-30px;width:130px;height:130px;background:rgba(255,255,255,.07);border-radius:50%"></div>
-      <div style="position:absolute;bottom:-40px;right:55px;width:80px;height:80px;background:rgba(0,0,0,.06);border-radius:50%"></div>
-      <div style="display:flex;align-items:center;justify-content:space-between;position:relative">
-        <div style="display:flex;align-items:center;gap:14px">
-          <div id="launchModalHeaderIcon" style="width:46px;height:46px;border-radius:14px;background:rgba(255,255,255,.16);display:flex;align-items:center;justify-content:center;flex-shrink:0">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 3v2.5M12 18.5V21M3 12h2.5M18.5 12H21M5.64 5.64l1.77 1.77M16.59 16.59l1.77 1.77M5.64 18.36l1.77-1.77M16.59 7.41l1.77-1.77" stroke="white" stroke-width="2.2" stroke-linecap="round"/></svg>
-          </div>
-          <div>
-            <div id="launchProviderTitle" style="color:#fff;font-size:1.15rem;font-weight:900;letter-spacing:.02em">${_lang === 'ja' ? 'AI を起動' : 'Launch AI'}</div>
-            <div id="launchProviderSubtitle" style="color:rgba(255,255,255,.78);font-size:.72rem;margin-top:2px">${_lang === 'ja' ? '起動する AI とモードを選択してください' : 'Select AI and mode to launch'}</div>
-          </div>
-        </div>
-        <button onclick="closeLaunchModal()" style="background:rgba(255,255,255,.15);border:none;color:#fff;width:30px;height:30px;border-radius:50%;cursor:pointer;font-size:1.1rem;display:flex;align-items:center;justify-content:center;transition:background .15s" onmouseover="this.style.background='rgba(255,255,255,.28)'" onmouseout="this.style.background='rgba(255,255,255,.15)'">&times;</button>
+<div id="launchModal" class="launch-modal-shell" onclick="if(event.target===this)closeLaunchModal()">
+  <div class="launch-modal-panel">
+    <!-- HEAD -->
+    <div class="launch-head">
+      <div id="launchModalHeaderIcon" class="launch-head-icon">
+        <img src="/assets/vendor/ai-icons/claude-code.svg" width="26" height="26" alt="Claude Code">
       </div>
+      <div class="launch-head-copy">
+        <div id="launchProviderTitle" class="launch-head-title">${_lang === 'ja' ? 'AI を起動' : 'Launch AI'}</div>
+        <div id="launchProviderSubtitle" class="launch-head-sub">${_lang === 'ja' ? 'CLI 環境で AI を起動します' : 'Launch AI in CLI environment'}</div>
+      </div>
+      <button class="launch-close" onclick="closeLaunchModal()" aria-label="Close">
+        <span class="material-symbols-outlined">close</span>
+      </button>
+      <div id="launchModalHeader" style="display:none"></div>
     </div>
-    <!-- ボディ -->
-    <div style="padding:20px 20px 12px;max-height:calc(85vh - 160px);overflow-y:auto">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
-      <!-- 左カラム: プロバイダー + 診断 -->
-      <div style="display:flex;flex-direction:column;gap:14px">
-        <!-- プロバイダー選択カード -->
-        <div>
-          <div style="font-size:.6rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:#94a3b8;margin-bottom:8px">${_lang === 'ja' ? '起動する AI' : 'AI Provider'}</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
-            <div id="launchProviderCard_claude" class="launch-provider-card claude" onclick="selectLaunchProvider('claude')">
-              <div class="lp-check">✓</div>
-              <div class="lp-icon" style="background:linear-gradient(135deg,#CC785C,#E8935A)">
-                <img src="https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/claude-code/default.svg" width="26" height="26" alt="Claude Code" style="filter:brightness(0) invert(1)">
-              </div>
-              <div class="lp-name" style="color:#7c3d1e">Claude</div>
-              <div class="lp-sub">Anthropic</div>
+    <div class="launch-divider"></div>
+
+    <!-- BODY -->
+    <div class="launch-body">
+      <!-- AI モデル -->
+      <section class="launch-section">
+        <div class="launch-section-label">${_lang === 'ja' ? 'AI モデル' : 'AI model'}</div>
+        <div class="launch-providers">
+          <div id="launchProviderCard_claude" class="launch-provider-card claude" onclick="selectLaunchProvider('claude')">
+            <div class="lp-check">✓</div>
+            <div class="lp-icon" data-provider="claude">
+              <img src="/assets/vendor/ai-icons/claude-code.svg" width="26" height="26" alt="Claude Code">
             </div>
-            <div id="launchProviderCard_codex" class="launch-provider-card codex" onclick="selectLaunchProvider('codex')">
-              <div class="lp-check">✓</div>
-              <div class="lp-icon" style="background:linear-gradient(135deg,#ecfdf5,#d1fae5)">
-                <img src="https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/codex-openai/default.svg" width="26" height="26" alt="Codex">
-              </div>
-              <div class="lp-name" style="color:#065f46">Codex</div>
-              <div class="lp-sub">OpenAI</div>
+            <div class="lp-name">Claude</div>
+            <div class="lp-sub">Anthropic</div>
+          </div>
+          <div id="launchProviderCard_codex" class="launch-provider-card codex" onclick="selectLaunchProvider('codex')">
+            <div class="lp-check">✓</div>
+            <div class="lp-icon" data-provider="codex">
+              <img src="/assets/vendor/ai-icons/codex-openai.svg" width="26" height="26" alt="Codex">
             </div>
-            <div id="launchProviderCard_gemini" class="launch-provider-card gemini" onclick="selectLaunchProvider('gemini')">
-              <div class="lp-check">✓</div>
-              <div class="lp-icon" style="background:linear-gradient(135deg,#eff6ff,#dbeafe)">
-                <img src="https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/gemini-cli/default.svg" width="26" height="26" alt="Gemini CLI">
-              </div>
-              <div class="lp-name" style="color:#1d4ed8">Gemini</div>
-              <div class="lp-sub">Google</div>
+            <div class="lp-name">CodeX</div>
+            <div class="lp-sub">OpenAI</div>
+          </div>
+          <div id="launchProviderCard_gemini" class="launch-provider-card gemini" onclick="selectLaunchProvider('gemini')">
+            <div class="lp-check">✓</div>
+            <div class="lp-icon" data-provider="gemini">
+              <img src="/assets/vendor/ai-icons/gemini-cli.svg" width="26" height="26" alt="Gemini CLI">
             </div>
+            <div class="lp-name">Gemini</div>
+            <div class="lp-sub">Google</div>
           </div>
         </div>
         <select id="launchProviderSelect" style="display:none">${providerSelectHtml}</select>
         <div id="launchProviderBadge" style="display:none"></div>
-        <div id="launchSetupDiagnostics" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:11px 14px">
-          <div onclick="toggleDiagPanel()" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none">
-            <div style="display:flex;align-items:center;gap:6px">
-              <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b">${_lang === 'ja' ? 'セットアップ診断' : 'Setup diagnostics'}</div>
-              <div id="launchDiagBadge" style="font-size:.58rem;font-weight:700;padding:1px 7px;border-radius:10px;background:#ecfdf5;color:#059669"></div>
+      </section>
+
+      <!-- 起動モード -->
+      <section class="launch-section">
+        <div class="launch-section-label">${_lang === 'ja' ? '起動モード' : 'Launch mode'}</div>
+        <div class="launch-modes">
+          <div id="launchOpt_auto" class="launch-mode-card recommended" onclick="selectLaunchMode('auto')">
+            <input type="radio" name="launchMode" value="auto" style="display:none">
+            <div id="launchOptTag_auto" class="launch-mode-tag">${_lang === 'ja' ? '推奨' : 'Recommended'}</div>
+            <div class="launch-mode-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 L3 14 H12 L11 22 L21 10 H12 Z"/></svg>
             </div>
-            <span id="launchDiagArrow" style="font-size:.7rem;color:#94a3b8;transition:transform .2s">▼</span>
+            <div id="launchOptTitle_auto" class="launch-mode-title">${_lang === 'ja' ? '推奨: 完全自動' : 'Recommended: Auto'}</div>
+            <div id="launchOptDesc_auto" class="launch-mode-desc">${_lang === 'ja' ? '最もスムーズに開始' : 'Start with smoothest flow'}</div>
+            <div id="launchCheck_auto" class="launch-mode-check"><span class="material-symbols-outlined">check</span></div>
           </div>
-          <div id="launchSetupDiagnosticsBody" style="font-size:.72rem;color:#475569;line-height:1.55;max-height:220px;overflow-y:auto;margin-top:6px">${_lang === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...'}</div>
-        </div>
-      </div>
-      <!-- 右カラム: モード + ポリシー -->
-      <div style="display:flex;flex-direction:column;gap:14px">
-        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px 14px">
-          <div style="font-size:.6rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:8px">${_t['launch.submitPolicy.title'] || (_lang === 'ja' ? '送信ポリシー' : 'Submission policy')}</div>
-          <div style="display:flex;flex-direction:column;gap:8px">
-            <select id="launchAutoSendSafeSelect" onchange="setLaunchAutoSendSafe(this.value === 'true')" style="width:100%">
-              <option value="false">${_t['launch.submitPolicy.approval'] || (_lang === 'ja' ? '確認待ちで止める（推奨）' : 'Stop for approval (recommended)')}</option>
-              <option value="true">${_t['launch.submitPolicy.autoSendSafe'] || (_lang === 'ja' ? '安全なフォームは自動送信する' : 'Auto-send safe forms')}</option>
-            </select>
-            <div id="launchAutoSendSafeHelp" style="font-size:.7rem;color:#64748b;line-height:1.6">${_t['launch.submitPolicy.help'] || (_lang === 'ja' ? 'CAPTCHA・手動確認・営業NG・判断が難しいフォームは自動送信しません。' : 'CAPTCHA, manual review, excluded forms, and uncertain cases will still stop for approval.')}</div>
+          <div id="launchOpt_bypassPermissions" class="launch-mode-card danger" onclick="selectLaunchMode('bypassPermissions')">
+            <input type="radio" name="launchMode" value="bypassPermissions" style="display:none">
+            <div id="launchOptTag_bypassPermissions" class="launch-mode-tag">${_lang === 'ja' ? '危険' : 'Danger'}</div>
+            <div class="launch-mode-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><polyline points="7 9 10 12 7 15"/><line x1="13" y1="15" x2="17" y2="15"/></svg>
+            </div>
+            <div id="launchOptTitle_bypassPermissions" class="launch-mode-title">${_lang === 'ja' ? '権限スキップ（危険）' : 'Skip permissions (danger)'}</div>
+            <div id="launchOptDesc_bypassPermissions" class="launch-mode-desc">${_lang === 'ja' ? '確認をスキップして起動' : 'Skip approvals on launch'}</div>
+            <div id="launchCheck_bypassPermissions" class="launch-mode-check"><span class="material-symbols-outlined">check</span></div>
           </div>
         </div>
-        <div id="launchModeOptions" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-          <!-- auto -->
-        <div id="launchOpt_auto" onclick="selectLaunchMode('auto')" style="border:2px solid #e2e8f0;border-radius:14px;padding:14px;cursor:pointer;transition:all .18s;position:relative;background:#fff" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 20px rgba(59,130,246,.12)'" onmouseout="this.style.transform='';this.style.boxShadow=''">
-          <input type="radio" name="launchMode" value="auto" style="display:none">
-          <div id="launchCheck_auto" style="display:none;position:absolute;top:10px;right:10px;background:#3b82f6;color:#fff;border-radius:50%;width:18px;height:18px;font-size:11px;align-items:center;justify-content:center">✓</div>
-          <div id="launchOptTag_auto" style="position:absolute;top:10px;left:10px;background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;font-size:.58rem;font-weight:800;padding:2px 7px;border-radius:20px;letter-spacing:.04em">推奨</div>
-          <div style="background:#fef3c7;border-radius:10px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;margin-top:16px">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#d97706" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-          </div>
-          <div id="launchOptTitle_auto" style="font-weight:700;font-size:.8rem;color:#1e293b;margin-bottom:4px">auto</div>
-          <div id="launchOptDesc_auto" style="font-size:.7rem;color:#64748b;line-height:1.5">ダッシュボード自動化向け。通常の許可待ちで止まりにくい推奨モードです。</div>
+      </section>
+
+      <!-- 送信ポリシー -->
+      <section class="launch-section">
+        <div class="launch-section-label">${_t['launch.submitPolicy.title'] || (_lang === 'ja' ? '送信ポリシー' : 'Submission policy')}</div>
+        <div class="launch-policy-select">
+          <select id="launchAutoSendSafeSelect" onchange="setLaunchAutoSendSafe(this.value === 'true')">
+            <option value="false">${_t['launch.submitPolicy.approval'] || (_lang === 'ja' ? '確認待ちで止める（推奨）' : 'Stop for approval (recommended)')}</option>
+            <option value="true">${_t['launch.submitPolicy.autoSendSafe'] || (_lang === 'ja' ? '安全なフォームは自動送信する' : 'Auto-send safe forms')}</option>
+          </select>
+          <span class="material-symbols-outlined launch-policy-arrow">expand_more</span>
         </div>
-        <!-- bypassPermissions -->
-        <div id="launchOpt_bypassPermissions" onclick="selectLaunchMode('bypassPermissions')" style="border:2px solid #e2e8f0;border-radius:14px;padding:14px;cursor:pointer;transition:all .18s;position:relative;background:#fff" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 20px rgba(239,68,68,.12)'" onmouseout="this.style.transform='';this.style.boxShadow=''">
-          <input type="radio" name="launchMode" value="bypassPermissions" style="display:none">
-          <div id="launchCheck_bypassPermissions" style="display:none;position:absolute;top:10px;right:10px;background:#ef4444;color:#fff;border-radius:50%;width:18px;height:18px;font-size:11px;align-items:center;justify-content:center">✓</div>
-          <div id="launchOptTag_bypassPermissions" style="position:absolute;top:10px;left:10px;background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;font-size:.58rem;font-weight:800;padding:2px 7px;border-radius:20px;letter-spacing:.04em">危険</div>
-          <div style="background:#fef2f2;border-radius:10px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;margin-top:16px">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>
-          </div>
-<div id="launchOptTitle_bypassPermissions" style="font-weight:700;font-size:.8rem;color:#1e293b;margin-bottom:4px">bypassPermissions</div>
-<div id="launchOptDesc_bypassPermissions" style="font-size:.7rem;color:#64748b;line-height:1.5">最も強い起動モードです。CLI の承認は大きく減りますが、プロバイダーによっては MCP / ブラウザ操作の確認が一度だけ残ることがあります。</div>
+        <div class="launch-policy-note">
+          <span class="material-symbols-outlined">verified_user</span>
+          <span id="launchAutoSendSafeHelp">${_t['launch.submitPolicy.help'] || (_lang === 'ja' ? '機密情報や個人情報を保護するための安全な設定です。' : 'Safe defaults to protect confidential and personal data.')}</span>
         </div>
-        </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;border:1px solid #e2e8f0;border-radius:12px;background:#fff">
-          <div>
-            <div style="font-size:.74rem;font-weight:700;color:#334155">${_lang === 'ja' ? '開発者向けモード' : 'Developer modes'}</div>
-            <div style="font-size:.68rem;color:#64748b;line-height:1.5">${_lang === 'ja' ? 'default / acceptEdits はログイン確認や手動デバッグ用です。通常の自動化では使いません。' : 'default / acceptEdits are only for login checks or manual debugging.'}</div>
-          </div>
-          <button id="launchAdvancedToggle" type="button" onclick="toggleLaunchAdvancedModes()" style="background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;padding:8px 12px;font-size:.72rem;font-weight:700;cursor:pointer;border-radius:10px;white-space:nowrap">${_lang === 'ja' ? '開く' : 'Show'}</button>
-        </div>
-        <div id="launchAdvancedModes" style="display:none">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-            <!-- default -->
-            <div id="launchOpt_default" onclick="selectLaunchMode('default')" style="border:2px solid #e2e8f0;border-radius:14px;padding:14px;cursor:pointer;transition:all .18s;position:relative;background:#fff" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 20px rgba(59,130,246,.12)'" onmouseout="this.style.transform='';this.style.boxShadow=''">
+      </section>
+
+      <!-- Advanced area -->
+      <div id="launchAdvancedModes" style="display:none">
+        <section class="launch-section">
+          <div class="launch-section-label">${_lang === 'ja' ? '開発者向けモード' : 'Developer modes'}</div>
+          <div class="launch-modes">
+            <div id="launchOpt_default" class="launch-mode-card dev" onclick="selectLaunchMode('default')">
               <input type="radio" name="launchMode" value="default" style="display:none">
-              <div id="launchCheck_default" style="display:none;position:absolute;top:10px;right:10px;background:#3b82f6;color:#fff;border-radius:50%;width:18px;height:18px;font-size:11px;align-items:center;justify-content:center">✓</div>
-              <div id="launchOptTag_default" style="position:absolute;top:10px;left:10px;background:linear-gradient(135deg,#64748b,#475569);color:#fff;font-size:.58rem;font-weight:800;padding:2px 7px;border-radius:20px;letter-spacing:.04em">${_lang === 'ja' ? '開発' : 'Dev'}</div>
-              <div style="background:#eff6ff;border-radius:10px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;margin-top:16px">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+              <div id="launchOptTag_default" class="launch-mode-tag">${_lang === 'ja' ? '開発' : 'Dev'}</div>
+              <div class="launch-mode-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
               </div>
-              <div id="launchOptTitle_default" style="font-weight:700;font-size:.8rem;color:#1e293b;margin-bottom:4px">default</div>
-              <div id="launchOptDesc_default" style="font-size:.7rem;color:#64748b;line-height:1.5">標準モード。許可プロンプトは AI のターミナルに出ます。放置すると自動化が止まります。</div>
+              <div id="launchOptTitle_default" class="launch-mode-title">default</div>
+              <div id="launchOptDesc_default" class="launch-mode-desc">${_lang === 'ja' ? '標準。CLIの許可プロンプトで止まることがあります' : 'Default. May stop on CLI permission prompts.'}</div>
+              <div id="launchCheck_default" class="launch-mode-check"><span class="material-symbols-outlined">check</span></div>
             </div>
-            <!-- acceptEdits -->
-            <div id="launchOpt_acceptEdits" onclick="selectLaunchMode('acceptEdits')" style="border:2px solid #e2e8f0;border-radius:14px;padding:14px;cursor:pointer;transition:all .18s;position:relative;background:#fff" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 20px rgba(59,130,246,.12)'" onmouseout="this.style.transform='';this.style.boxShadow=''">
+            <div id="launchOpt_acceptEdits" class="launch-mode-card dev" onclick="selectLaunchMode('acceptEdits')">
               <input type="radio" name="launchMode" value="acceptEdits" style="display:none">
-              <div id="launchCheck_acceptEdits" style="display:none;position:absolute;top:10px;right:10px;background:#3b82f6;color:#fff;border-radius:50%;width:18px;height:18px;font-size:11px;align-items:center;justify-content:center">✓</div>
-              <div id="launchOptTag_acceptEdits" style="position:absolute;top:10px;left:10px;background:linear-gradient(135deg,#64748b,#475569);color:#fff;font-size:.58rem;font-weight:800;padding:2px 7px;border-radius:20px;letter-spacing:.04em">${_lang === 'ja' ? '開発' : 'Dev'}</div>
-              <div style="background:#eff6ff;border-radius:10px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;margin-bottom:10px;margin-top:16px">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+              <div id="launchOptTag_acceptEdits" class="launch-mode-tag">${_lang === 'ja' ? '開発' : 'Dev'}</div>
+              <div class="launch-mode-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
               </div>
-              <div id="launchOptTitle_acceptEdits" style="font-weight:700;font-size:.8rem;color:#1e293b;margin-bottom:4px">acceptEdits</div>
-              <div id="launchOptDesc_acceptEdits" style="font-size:.7rem;color:#64748b;line-height:1.5">編集は通りやすいですが、コマンドやブラウザ操作は確認待ちで止まることがあります。</div>
+              <div id="launchOptTitle_acceptEdits" class="launch-mode-title">acceptEdits</div>
+              <div id="launchOptDesc_acceptEdits" class="launch-mode-desc">${_lang === 'ja' ? '編集は通り、コマンドやブラウザは確認待ちで止まることがあります' : 'Edits flow; commands/browser may still pause.'}</div>
+              <div id="launchCheck_acceptEdits" class="launch-mode-check"><span class="material-symbols-outlined">check</span></div>
             </div>
           </div>
-        </div>
+        </section>
+        <section class="launch-section">
+          <div id="launchSetupDiagnostics" class="launch-diag">
+            <div class="launch-diag-head" onclick="toggleDiagPanel()">
+              <div class="launch-diag-head-left">
+                <div class="launch-section-label" style="margin:0">${_lang === 'ja' ? 'セットアップ診断' : 'Setup diagnostics'}</div>
+                <div id="launchDiagBadge" class="launch-diag-badge"></div>
+              </div>
+              <span id="launchDiagArrow" class="launch-diag-arrow">▼</span>
+            </div>
+            <div id="launchSetupDiagnosticsBody" class="launch-diag-body">${_lang === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...'}</div>
+          </div>
+        </section>
       </div>
-      </div><!-- /右カラム -->
-      </div><!-- /grid -->
     </div>
-    <!-- フッター -->
-    <div style="padding:12px 20px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #f1f5f9">
-      <div id="launchSelectedLabel" style="display:none"></div>
-      <div style="display:flex;gap:8px">
-        <button onclick="closeLaunchModal()" style="background:#f1f5f9;border:none;padding:9px 20px;font-size:.78rem;font-weight:600;cursor:pointer;color:#64748b;border-radius:10px;transition:background .15s" onmouseover="this.style.background='#e2e8f0'" onmouseout="this.style.background='#f1f5f9'">${_lang === 'ja' ? 'キャンセル' : 'Cancel'}</button>
-        <button id="launchExternalBtn" onclick="confirmExternalLaunch()" style="background:#fff;border:1px solid #cbd5e1;color:#334155;padding:9px 16px;font-size:.76rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.03em;transition:all .15s" onmouseover="this.style.borderColor='#94a3b8';this.style.color='#334155'" onmouseout="this.style.borderColor='#cbd5e1';this.style.color='#334155'">${_lang === 'ja' ? '外部で開く' : 'Open External'}</button>
-        <button id="launchConfirmBtn" onclick="confirmLaunch()" style="background:linear-gradient(135deg,#CC785C,#E8935A);border:none;color:#fff;padding:9px 24px;font-size:.78rem;font-weight:700;cursor:pointer;border-radius:10px;letter-spacing:.04em;box-shadow:0 4px 14px rgba(204,120,92,.4);transition:all .15s" onmouseover="this.style.transform='translateY(-1px)'" onmouseout="this.style.transform=''">${_lang === 'ja' ? 'AI を起動' : 'Launch AI'}</button>
+
+    <!-- FOOT -->
+    <div class="launch-foot">
+      <button id="launchAdvancedToggle" class="launch-advanced-link" type="button" onclick="toggleLaunchAdvancedModes()">
+        <span class="material-symbols-outlined">settings</span>
+        ${_lang === 'ja' ? '詳細設定' : 'Advanced'}
+      </button>
+      <div class="launch-foot-actions">
+        <button class="launch-cancel" onclick="closeLaunchModal()">${_lang === 'ja' ? 'キャンセル' : 'Cancel'}</button>
+        <button id="launchExternalBtn" class="launch-external" onclick="confirmExternalLaunch()" style="display:none">${_lang === 'ja' ? '外部で開く' : 'Open External'}</button>
+        <button id="launchConfirmBtn" class="launch-confirm-btn" onclick="confirmLaunch()">
+          <span class="material-symbols-outlined">play_arrow</span>
+          ${_lang === 'ja' ? 'AI を起動' : 'Launch AI'}
+        </button>
       </div>
+      <div id="launchSelectedLabel" style="display:none"></div>
     </div>
   </div>
 </div>
@@ -5411,52 +5041,72 @@ contain-intrinsic-size:84px;
 <input type="file" id="settingsWorkbookImportInput" accept=".xlsx,.xls" style="display:none">
 
 <div id="companyFormModal" class="modal-shell">
-  <div class="modal-panel">
-    <div class="modal-head">
-      <h3 id="companyFormTitle">${_t['companyModal.title'] || 'Add Company'}</h3>
-      <button class="btn-close" onclick="closeCompanyFormModal()">&times;</button>
+  <div class="modal-panel hud-modal">
+    <span class="hud-corner hud-corner-tl"></span>
+    <span class="hud-corner hud-corner-tr"></span>
+    <span class="hud-corner hud-corner-bl"></span>
+    <span class="hud-corner hud-corner-br"></span>
+
+    <div class="modal-head hud-head">
+      <div class="hud-head-icon">
+        <svg viewBox="0 0 52 58" fill="none" aria-hidden="true">
+          <path d="M26 2 L48 14.5 V43.5 L26 56 L4 43.5 V14.5 Z" stroke="currentColor" stroke-width="1.3" fill="color-mix(in srgb, currentColor 6%, transparent)"/>
+        </svg>
+        <span class="material-symbols-outlined hud-head-sym">apartment</span>
+      </div>
+      <div class="hud-head-copy">
+        <h3 id="companyFormTitle">${_t['companyModal.title'] || 'Add Company'}</h3>
+        <span class="hud-head-sub" id="companyFormSub">ADD COMPANY</span>
+      </div>
+      <button class="hud-close" onclick="closeCompanyFormModal()" aria-label="Close">
+        <span class="material-symbols-outlined">close</span>
+      </button>
     </div>
-    <div class="modal-body">
+    <div class="hud-scanline"></div>
+
+    <div class="modal-body hud-body">
       <input type="hidden" id="companyFormMode" value="create">
       <input type="hidden" id="companyFormCompanyNo" value="">
       <div class="modal-grid">
-        <div class="settings-group">
-          <label>${_t['field.companyName']}</label>
+        <div class="settings-group hud-field">
+          <label><span class="material-symbols-outlined">apartment</span>${_t['field.companyName']}</label>
           <input type="text" id="new-companyName" placeholder="${_t['ph.companyName']}">
         </div>
-        <div class="settings-group">
-          <label>${_t['field.type'] || (_lang === 'ja' ? '種別' : 'Type')}</label>
+        <div class="settings-group hud-field">
+          <label><span class="material-symbols-outlined">category</span>${_t['field.type'] || (_lang === 'ja' ? '種別' : 'Type')}</label>
           <input type="text" id="new-type" placeholder="${_lang === 'ja' ? '例: SIer / SaaS / 製造' : 'e.g. SIer / SaaS / Manufacturing'}">
         </div>
-        <div class="settings-group">
-          <label>${_t['field.website']}</label>
+        <div class="settings-group hud-field">
+          <label><span class="material-symbols-outlined">language</span>${_t['field.website']}</label>
           <input type="text" id="new-url" placeholder="https://example.com">
         </div>
-        <div class="settings-group">
-          <label>${_t['field.colFormUrl']}</label>
+        <div class="settings-group hud-field">
+          <label><span class="material-symbols-outlined">link</span>${_t['field.colFormUrl']}</label>
           <input type="text" id="new-formUrl" placeholder="https://example.com/contact">
         </div>
-        <div class="settings-group">
-          <label>${_t['field.colStatus']}</label>
+        <div class="settings-group hud-field">
+          <label><span class="material-symbols-outlined">radio_button_unchecked</span>${_t['field.colStatus']}</label>
           <input type="text" id="new-status" placeholder="${_lang === 'ja' ? '例: ○ / 空欄' : 'e.g. target'}">
         </div>
-        <div class="settings-group">
-          <label>${_t['field.colProgress']}</label>
+        <div class="settings-group hud-field">
+          <label><span class="material-symbols-outlined">trending_up</span>${_t['field.colProgress']}</label>
           <input type="text" id="new-progress" placeholder="${_lang === 'ja' ? '任意' : 'Optional'}">
         </div>
-        <div class="settings-group modal-grid-full">
-          <label>${_t['field.colNotes']}</label>
+        <div class="settings-group hud-field modal-grid-full">
+          <label><span class="material-symbols-outlined">description</span>${_t['field.colNotes']}</label>
           <textarea id="new-notes" placeholder="${_lang === 'ja' ? '社内メモや補足' : 'Internal note'}"></textarea>
         </div>
       </div>
-      <label style="display:flex;align-items:center;gap:8px;font-size:.8rem;font-weight:600;color:var(--on-surface)">
-        <input type="checkbox" id="new-addTarget" checked style="width:16px;height:16px">
-        ${_t['companyModal.addToTarget'] || 'Add this company to outreach targets'}
+      <label class="hud-check">
+        <input type="checkbox" id="new-addTarget" checked>
+        <span class="hud-check-box"></span>
+        <span class="hud-check-text">${_t['companyModal.addToTarget'] || 'Add this company to outreach targets'}</span>
       </label>
     </div>
-    <div class="modal-actions">
+    <div class="hud-scanline hud-scanline-bottom"></div>
+    <div class="modal-actions hud-actions">
       <button class="btn btn-outline-secondary" onclick="closeCompanyFormModal()">${_t['companyModal.cancel'] || 'Cancel'}</button>
-      <button class="btn btn-primary" id="companyFormSubmitBtn" onclick="submitCompanyForm()">${_t['companyModal.submit'] || 'Add Company'}</button>
+      <button class="btn btn-primary hud-btn-primary" id="companyFormSubmitBtn" onclick="submitCompanyForm()">${_t['companyModal.submit'] || 'Add Company'}</button>
     </div>
   </div>
 </div>
@@ -5466,7 +5116,11 @@ contain-intrinsic-size:84px;
 
 <!-- Horizontal tab nav -->
 <div id="mainTabNav">
-  <button class="tab-btn active" data-tab="companies">
+  <button class="tab-btn active" data-tab="dashboard">
+    <span class="material-symbols-outlined tab-icon">dashboard</span>
+    ${_lang === 'ja' ? 'ダッシュボード' : 'Dashboard'}
+  </button>
+  <button class="tab-btn" data-tab="companies">
     <span class="material-symbols-outlined tab-icon">table_view</span>
     ${_t['tab.companies']}
   </button>
@@ -5494,66 +5148,196 @@ contain-intrinsic-size:84px;
   <!-- Main content column -->
   <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:12px">
 
-  <!-- Unified Analytics Panel -->
-  <div id="analyticsRow" class="chart-panel" style="padding:18px 20px;display:flex;flex-direction:column;margin-bottom:0">
-    <!-- Top: Percentage + Ratio + Live badge -->
-    <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:10px">
-      <div style="display:flex;align-items:baseline;gap:10px">
-        <div style="display:flex;align-items:baseline;gap:2px">
-          <span id="analyticsPercent" style="font-size:2.4rem;font-family:var(--font-mono);font-weight:600;letter-spacing:-.03em;color:var(--text-1);line-height:1">0</span>
-          <span style="font-size:1.1rem;color:var(--text-3);font-weight:600;font-family:var(--font-mono)">%</span>
+  <!-- Dashboard tab: analytics-only view -->
+  <div class="tab-content active" id="tab-dashboard">
+  <div id="analyticsRow" class="chart-panel" style="padding:20px 22px;display:flex;flex-direction:column;margin-bottom:0;gap:0">
+    <!-- HERO: donut + ratio + live badge -->
+    <div class="analytics-hero">
+      <div class="analytics-donut">
+        <svg viewBox="0 0 120 120" aria-hidden="true">
+          <defs>
+            <linearGradient id="donutGradient" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#3b82f6"/>
+              <stop offset="100%" stop-color="#818cf8"/>
+            </linearGradient>
+          </defs>
+          <circle class="donut-track" cx="60" cy="60" r="52"/>
+          <circle class="donut-fill" id="analyticsDonutFill" cx="60" cy="60" r="52" stroke-dasharray="326.7" stroke-dashoffset="326.7"/>
+        </svg>
+        <div class="analytics-donut-center">
+          <span class="analytics-donut-num" id="analyticsPercent">0</span>
+          <span class="analytics-donut-suffix">%</span>
+          <span class="analytics-donut-label">${_lang === 'ja' ? '完了率' : 'Complete'}</span>
         </div>
-        <div style="display:flex;align-items:baseline;gap:4px">
-          <span id="analyticsSubmittedNum" style="font-family:var(--font-mono);font-size:1rem;font-weight:700;color:var(--success);line-height:1">0</span>
-          <span id="analyticsRatio" style="font-size:.7rem;color:var(--text-3);font-family:var(--font-mono)">/ 0</span>
-          <span style="font-size:.65rem;font-weight:700;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;margin-left:2px">${_lang === 'ja' ? '送信済み' : 'Sent'}</span>
+      </div>
+      <div class="analytics-hero-main">
+        <div class="analytics-hero-title">
+          <span class="num" id="analyticsSubmittedNum">0</span>
+          <span class="ratio" id="analyticsRatio">/ 0</span>
+          <span class="lab">${_lang === 'ja' ? '送信済み' : 'Sent'}</span>
+        </div>
+        <div class="analytics-pipeline-bar" id="analyticsPipeline">
+          <span id="analyticsProgressBar" style="background:linear-gradient(90deg,#3b82f6,#6366f1);width:0%"></span>
         </div>
       </div>
-      <div style="display:flex;align-items:center;gap:5px;padding:3px 8px;background:var(--bg-surface);border:1px solid var(--border-default);border-radius:4px;font-size:.6rem;font-family:var(--font-mono);color:var(--text-3)">
-        <span style="width:5px;height:5px;border-radius:50%;background:var(--success);flex-shrink:0"></span>
-        Live
+      <div class="analytics-meta">
+        <div class="analytics-live"><span class="analytics-live-dot"></span>Live</div>
+        <div class="analytics-meta-sum" id="analyticsMetaSum">0 / 0 ${_lang === 'ja' ? '完了' : 'done'} (0%)</div>
       </div>
     </div>
-    <!-- Pipeline segment bar -->
-    <div style="display:flex;flex-direction:column;gap:3px;margin-bottom:12px">
-      <div style="height:6px;background:var(--bg-raised);border-radius:999px;overflow:hidden;border:1px solid var(--border-subtle)">
-        <div id="analyticsProgressBar" style="height:100%;background:linear-gradient(90deg,var(--primary),#6366f1);border-radius:999px;transition:width .6s;width:0%"></div>
+
+    <!-- STAT CARDS (7 icons + numbers) -->
+    <div class="stat-cards-row">
+      <div class="stat-card-v2" style="--_c:#6366f1">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">adjust</span></div>
+          <div class="stat-card-v2-label">${_t['stats.target'] || (_lang==='ja'?'対象':'Target')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-approachable">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'全体の件数':'Total'}</div>
       </div>
-      <div class="progress-pipeline" id="pipeline" style="border-radius:3px;overflow:hidden;gap:1px;height:4px">
-        <div class="pip-seg" style="background:var(--bg-raised);flex:1"></div>
+      <div class="stat-card-v2" style="--_c:#94a3b8">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">contact_page</span></div>
+          <div class="stat-card-v2-label">${_t['stats.hasForm'] || (_lang==='ja'?'フォーム有':'Has form')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-hasFormUrl">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'フォーム送信あり':'Submittable'}</div>
       </div>
-      <span id="progressLabel" style="font-family:var(--font-mono);font-size:.55rem;color:var(--text-3);text-align:right">-</span>
-    </div>
-    <!-- Stat pills row -->
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding-bottom:14px;border-bottom:1px solid var(--border-default)">
-      <div class="stat-pill" style="border-left-color:#6366f1"><span class="stat-pill-label">${_t['stats.target']}</span><span class="sn stat-pill-val" id="s-approachable" style="color:#6366f1">-</span></div>
-      <div class="stat-pill" style="border-left-color:#94a3b8"><span class="stat-pill-label">${_t['stats.hasForm']}</span><span class="sn stat-pill-val" id="s-hasFormUrl" style="color:#94a3b8">-</span></div>
-      <div class="stat-pill" style="border-left-color:#3b82f6"><span class="stat-pill-label">${_t['stats.filled']}</span><span class="sn stat-pill-val" id="s-formFill" style="color:#3b82f6">-</span></div>
-      <div class="stat-pill stat-pill-warn" style="border-left-color:#f59e0b"><span class="stat-pill-label" style="color:#f59e0b;font-weight:700">${_t['stats.awaiting']}</span><span class="sn stat-pill-val" id="s-awaitingApproval" style="color:#f59e0b">-</span></div>
-      <div class="stat-pill" style="border-left-color:#10b981"><span class="stat-pill-label">${_t['stats.sent']}</span><span class="sn stat-pill-val" id="s-submitted" style="color:#10b981">-</span></div>
-      <div class="stat-pill" style="border-left-color:#ef4444"><span class="stat-pill-label">${_t['stats.error']}</span><span class="sn stat-pill-val" id="s-error" style="color:#ef4444">-</span></div>
-      <div class="stat-pill" style="border-left-color:#64748b;opacity:.6"><span class="stat-pill-label">${_t['stats.excluded']}</span><span class="sn stat-pill-val" id="s-excluded" style="color:#64748b">-</span></div>
-    </div>
-    <!-- Trend chart (full width) -->
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;margin-bottom:6px">
-      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text-2)">${_lang === 'ja' ? '処理推移' : 'Trend'}</div>
-      <div style="display:flex;gap:12px;font-size:.58rem;color:var(--text-3)">
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:5px;height:5px;border-radius:50%;background:#10b981;flex-shrink:0"></span>${_lang === 'ja' ? '送信済' : 'Sent'}</span>
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:5px;height:5px;border-radius:50%;background:#f59e0b;flex-shrink:0"></span>${_lang === 'ja' ? '要対応' : 'Action'}</span>
-        <span style="display:flex;align-items:center;gap:3px"><span style="width:5px;height:2px;border-top:1.5px dashed #ef4444;flex-shrink:0"></span>${_lang === 'ja' ? 'エラー' : 'Error'}</span>
+      <div class="stat-card-v2" style="--_c:#10b981">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">mark_email_read</span></div>
+          <div class="stat-card-v2-label">${_t['stats.sent'] || (_lang==='ja'?'送信済み':'Sent')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-submitted">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'送信が完了した件数':'Completed'}</div>
+      </div>
+      <div class="stat-card-v2" style="--_c:#3b82f6">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">task_alt</span></div>
+          <div class="stat-card-v2-label">${_t['stats.filled'] || (_lang==='ja'?'要対応':'Action')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-formFill">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'対応が必要な件数':'Needs action'}</div>
+      </div>
+      <div class="stat-card-v2" style="--_c:#f59e0b">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">hourglass_empty</span></div>
+          <div class="stat-card-v2-label">${_t['stats.awaiting'] || (_lang==='ja'?'確認待ち':'Awaiting')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-awaitingApproval">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'確認待ちの件数':'Awaiting approval'}</div>
+      </div>
+      <div class="stat-card-v2" style="--_c:#ef4444">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">error_outline</span></div>
+          <div class="stat-card-v2-label">${_t['stats.error'] || (_lang==='ja'?'エラー':'Errors')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-error">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'エラーの件数':'Error count'}</div>
+      </div>
+      <div class="stat-card-v2" style="--_c:#64748b">
+        <div class="stat-card-v2-head">
+          <div class="stat-card-v2-icon"><span class="material-symbols-outlined">block</span></div>
+          <div class="stat-card-v2-label">${_t['stats.excluded'] || (_lang==='ja'?'除外':'Excluded')}</div>
+        </div>
+        <div class="stat-card-v2-num" id="s-excluded">0</div>
+        <div class="stat-card-v2-note">${_lang==='ja'?'対象外の件数':'Excluded'}</div>
       </div>
     </div>
-    <div style="height:170px;position:relative"><canvas id="trendAreaChart"></canvas></div>
-    <!-- Hidden donut (keeps JS reference intact) -->
-    <div style="display:none"><canvas id="statusDonutChart"></canvas></div>
+
+    <!-- TREND CHART -->
+    <div class="analytics-trend-panel">
+      <div class="analytics-trend-head">
+        <div class="analytics-trend-title">${_lang === 'ja' ? '処理推移' : 'Processing trend'}</div>
+        <div class="analytics-trend-legend">
+          <span class="lg"><span class="dot" style="background:#10b981"></span>${_lang === 'ja' ? '送信済み' : 'Sent'}</span>
+          <span class="lg"><span class="dot" style="background:#3b82f6"></span>${_lang === 'ja' ? '要対応' : 'Action'}</span>
+          <span class="lg" style="color:#ef4444"><span class="dash"></span>${_lang === 'ja' ? 'エラー' : 'Error'}</span>
+        </div>
+        <div class="analytics-trend-range"><span class="material-symbols-outlined">calendar_month</span>${_lang === 'ja' ? '7日間' : '7 days'}</div>
+      </div>
+      <div class="analytics-trend-body"><canvas id="trendAreaChart"></canvas></div>
+    </div>
+
+    <!-- 3-COLUMN GRID: breakdown donut + daily bars + recent errors -->
+    <div class="analytics-grid">
+      <div class="analytics-sub-card">
+        <div class="analytics-sub-title">${_lang === 'ja' ? 'ステータス内訳' : 'Status breakdown'}</div>
+        <div class="breakdown-row">
+          <div class="breakdown-donut-wrap">
+            <svg viewBox="0 0 120 120" id="breakdownDonutSvg" aria-hidden="true">
+              <circle cx="60" cy="60" r="46" fill="none" stroke="var(--bg-raised)" stroke-width="14"/>
+            </svg>
+            <div class="breakdown-donut-center">
+              <div class="breakdown-donut-total" id="breakdownTotal">0</div>
+              <div class="breakdown-donut-total-lab">${_lang === 'ja' ? '対象件数' : 'Total'}</div>
+            </div>
+          </div>
+          <div class="breakdown-legend" id="breakdownLegend"></div>
+        </div>
+      </div>
+      <div class="analytics-sub-card">
+        <div class="analytics-sub-title">${_lang === 'ja' ? '日別送信数' : 'Daily sent'}</div>
+        <div class="daily-bars"><canvas id="dailyBarsChart"></canvas></div>
+      </div>
+      <div class="analytics-sub-card">
+        <div class="analytics-sub-title">
+          <span>${_lang === 'ja' ? '最近のエラー' : 'Recent errors'}</span>
+          <button class="analytics-sub-action" onclick="showAllErrors()">${_lang === 'ja' ? 'すべて表示' : 'View all'}</button>
+        </div>
+        <div class="recent-errors" id="recentErrorsList">
+          <div class="recent-errors-empty">${_lang === 'ja' ? 'エラーはありません' : 'No errors'}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- INSIGHT CARD with wave deco -->
+    <div class="insight-card">
+      <div class="insight-icon"><span class="material-symbols-outlined">lightbulb</span></div>
+      <div class="insight-body">
+        <div class="insight-title">${_lang === 'ja' ? 'インサイト' : 'Insight'}</div>
+        <div class="insight-desc" id="insightDesc">${_lang === 'ja' ? '送信データを集計中...' : 'Aggregating data...'}</div>
+      </div>
+      <svg class="insight-wave" viewBox="0 0 500 120" preserveAspectRatio="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="waveGradient" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="#10b981" stop-opacity=".55"/>
+            <stop offset="50%" stop-color="#3b82f6" stop-opacity=".55"/>
+            <stop offset="100%" stop-color="#a78bfa" stop-opacity=".45"/>
+          </linearGradient>
+        </defs>
+        <path d="M0,60 Q100,20 200,60 T400,60 L500,60" fill="none" stroke="url(#waveGradient)" stroke-width="1.8"/>
+        <path d="M0,80 Q125,40 250,80 T500,80" fill="none" stroke="url(#waveGradient)" stroke-width="1.3" opacity=".75"/>
+        <path d="M0,40 Q75,90 150,40 T300,40 T450,40 L500,40" fill="none" stroke="url(#waveGradient)" stroke-width="1" opacity=".55"/>
+      </svg>
+    </div>
+
+    <!-- Legacy hidden refs (kept for backward JS compat) -->
+    <div style="display:none">
+      <canvas id="statusDonutChart"></canvas>
+      <span id="progressLabel"></span>
+      <div id="pipeline" class="progress-pipeline"></div>
+    </div>
+  </div>
   </div>
 
   <!-- Companies tab (inside main column) -->
-  <div class="tab-content active" id="tab-companies">
+  <div class="tab-content" id="tab-companies">
     <div class="company-toolbar" style="flex-direction:column;gap:0">
-      <!-- Row 1: Quick filter tabs + Action buttons -->
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">
+      <!-- Row 1: Bulk action buttons -->
+      <div class="bulk-toolbar" style="justify-content:flex-end">
+        <button class="btn btn-outline-primary btn-sm" onclick="triggerCompanyImport()">${_t['action.importTargets'] || 'Import Excel/CSV'}</button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="openCompanyFormModal()">${_t['action.addCompany'] || 'Add Company'}</button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="toggleAllCompanies()">${_t['action.selectAll']}</button>
+        <button class="btn btn-outline-danger btn-sm" onclick="bulkDeleteCompanies()">${_t['action.bulkDeleteCompanies'] || 'Delete Selected'}</button>
+        <button class="btn btn-outline-primary btn-sm" onclick="markSelectedTargets(true)">${_t['action.markTarget'] || 'Mark Target'}</button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="markSelectedTargets(false)">${_t['action.unmarkTarget'] || 'Unmark Target'}</button>
+        <button class="btn btn-primary btn-sm" onclick="prepareSelectedOutreach()">${_t['action.prepareOutreach'] || 'Prepare Outreach'}</button>
+      </div>
+      <!-- Row 2: Unified filter bar (pills + filter fields + search) -->
+      <div class="filter-bar filter-bar-unified">
+        <div class="filter-pills">
           <button class="fb active" data-f="all">${_t['filter.all']}</button>
           <button class="fb" data-f="approachable">${_t['filter.target']}</button>
           <button class="fb" data-f="targeted">${_t['filter.targeted'] || '営業対象'}</button>
@@ -5563,19 +5347,7 @@ contain-intrinsic-size:84px;
           <button class="fb" data-f="error">${_t['filter.error']}</button>
           <button class="fb" data-f="excluded">${_t['filter.excluded']}</button>
         </div>
-        <div class="bulk-toolbar">
-          <button class="btn btn-outline-primary btn-sm" onclick="triggerCompanyImport()">${_t['action.importTargets'] || 'Import Excel/CSV'}</button>
-          <button class="btn btn-outline-secondary btn-sm" onclick="openCompanyFormModal()">${_t['action.addCompany'] || 'Add Company'}</button>
-          <button class="btn btn-outline-secondary btn-sm" onclick="toggleAllCompanies()">${_t['action.selectAll']}</button>
-          <button class="btn btn-outline-danger btn-sm" onclick="bulkDeleteCompanies()">${_t['action.bulkDeleteCompanies'] || 'Delete Selected'}</button>
-          <button class="btn btn-outline-primary btn-sm" onclick="markSelectedTargets(true)">${_t['action.markTarget'] || 'Mark Target'}</button>
-          <button class="btn btn-outline-secondary btn-sm" onclick="markSelectedTargets(false)">${_t['action.unmarkTarget'] || 'Unmark Target'}</button>
-          <button class="btn btn-primary btn-sm" onclick="prepareSelectedOutreach()">${_t['action.prepareOutreach'] || 'Prepare Outreach'}</button>
-        </div>
-      </div>
-      <!-- Row 2: Filter bar -->
-      <div class="filter-bar">
-        <span class="material-symbols-outlined" style="font-size:16px;color:var(--text-3);flex-shrink:0">tune</span>
+        <span class="filter-bar-divider" aria-hidden="true"></span>
         <div class="filter-field">
           <span class="ms">category</span>
           <select id="companyTypeFilter">
@@ -5598,7 +5370,7 @@ contain-intrinsic-size:84px;
         </button>
       </div>
     </div>
-    <div style="background:#fff;border:1px solid var(--outline-variant);overflow-x:auto">
+    <div class="table-shell table-shell-scroll">
       <table class="main-table" id="mt">
 <colgroup><col style="width:36px"><col style="width:44px"><col><col style="width:110px"><col style="width:110px"><col style="width:52px"><col style="width:170px"><col style="width:180px"><col style="width:200px"></colgroup>
 <thead><tr><th class="checkbox-cell"><input type="checkbox" id="companySelectAll" class="form-check-input" onclick="toggleAllCompanies(this.checked)"></th><th onclick="sortTable('no')">${_t['th.no']} <span class="sort-icon" data-col="no"></span></th><th onclick="sortTable('name')">${_t['th.company']} <span class="sort-icon" data-col="name"></span></th><th onclick="sortTable('type')">${_t['th.type']} <span class="sort-icon" data-col="type"></span></th><th onclick="sortTable('progress')">${_t['th.progress']} <span class="sort-icon" data-col="progress"></span></th><th onclick="sortTable('sent')">${_t['th.sent']} <span class="sort-icon" data-col="sent"></span></th><th>${_t['th.formUrl']}</th><th>${_t['th.message']}</th><th class="action-cell">${_t['th.action']}</th></tr></thead>
@@ -5626,9 +5398,9 @@ contain-intrinsic-size:84px;
 
   <!-- Sent tab -->
   <div class="tab-content" id="tab-sent">
-    <div style="background:#fff;border:1px solid var(--outline-variant);border-bottom:2px solid #198038;padding:12px 16px;display:flex;align-items:center;flex-wrap:wrap;gap:10px">
+    <div style="background:#fff;border:1px solid var(--outline-variant);border-bottom:2px solid #059669;padding:12px 16px;display:flex;align-items:center;flex-wrap:wrap;gap:10px">
       <div style="display:flex;align-items:center;gap:8px;min-width:0">
-        <span class="material-symbols-outlined" style="font-size:16px;color:#198038">mark_email_read</span>
+        <span class="material-symbols-outlined" style="font-size:16px;color:#059669">mark_email_read</span>
         <div style="display:flex;flex-direction:column;gap:2px">
           <strong style="font-size:.76rem;color:var(--on-surface)">${_t['sent.panelTitle'] || (_lang === 'ja' ? '送信済みログ' : 'Sent log')}</strong>
           <span style="font-size:.66rem;color:var(--outline)">${_t['sent.panelHint'] || (_lang === 'ja' ? '企業名・種別・本文・フォームURLで絞り込みできます' : 'Filter by company, type, message body, or form URL.')}</span>
@@ -6352,8 +6124,8 @@ contain-intrinsic-size:84px;
 </div>
 
 <!-- Floating toggle button -->
-<button id="monitorFab" onclick="toggleMonitorPanel()" style="position:fixed;bottom:24px;right:24px;z-index:9991;width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#0f172a,#1e293b);color:#e2e8f0;border:none;cursor:pointer;box-shadow:var(--shadow-modal);display:flex;align-items:center;justify-content:center;transition:all .25s var(--ease-out-expo)" onmouseover="this.style.transform='scale(1.08)'" onmouseout="this.style.transform='scale(1)'">
-  <span id="monitorDot" style="position:absolute;top:10px;right:10px;width:10px;height:10px;border-radius:50%;background:#94a3b8;transition:background .3s;border:2px solid #0f172a"></span>
+<button id="monitorFab" onclick="toggleMonitorPanel()" style="position:fixed;bottom:24px;right:24px;z-index:9991;width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#1a1a1a,#1e293b);color:#eeefeb;border:none;cursor:pointer;box-shadow:var(--shadow-modal);display:flex;align-items:center;justify-content:center;transition:all .25s var(--ease-out-expo)" onmouseover="this.style.transform='scale(1.08)'" onmouseout="this.style.transform='scale(1)'">
+  <span id="monitorDot" style="position:absolute;top:10px;right:10px;width:10px;height:10px;border-radius:50%;background:#9a9a96;transition:background .3s;border:2px solid #1a1a1a"></span>
   <span id="monitorFabBadge" style="display:none;position:absolute;top:0;right:0;min-width:18px;height:18px;background:var(--error);color:#fff;font-size:.6rem;font-weight:800;border-radius:9px;padding:0 5px;line-height:18px;text-align:center;border:2px solid #fff;font-family:var(--font-mono)">0</span>
   <span class="material-symbols-outlined" style="font-size:22px">chat</span>
 </button>
@@ -6361,11 +6133,11 @@ contain-intrinsic-size:84px;
 <!-- Floating panel -->
 <div id="liveMonitorCard" style="position:fixed;bottom:84px;right:24px;z-index:9989;width:420px;max-height:min(600px,calc(100vh - 120px));background:var(--bg-card);border:1px solid var(--border-default);border-radius:16px;overflow:hidden;box-shadow:0 20px 60px rgba(15,23,42,.18),0 2px 8px rgba(15,23,42,.08);display:none;flex-direction:column;animation:monitorPanelIn .25s var(--ease-out-expo)">
   <!-- Header -->
-  <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);user-select:none;flex-shrink:0">
-    <span class="material-symbols-outlined" style="font-size:16px;color:#e2e8f0">monitoring</span>
-    <span style="font-size:.72rem;font-weight:700;color:#e2e8f0;flex:1">Live Activity</span>
-    <div id="monitorStatusChip" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.1);color:#94a3b8;font-size:.56rem;font-weight:700;padding:2px 8px;border-radius:4px;letter-spacing:.04em">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
-    <button id="liveMonitorToggleBtn" onclick="toggleMonitorPanel()" style="display:inline-flex;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#e2e8f0;font-size:14px;padding:3px;border-radius:6px;cursor:pointer;transition:all .15s;line-height:1" onmouseover="this.style.background='rgba(255,255,255,.2)'" onmouseout="this.style.background='rgba(255,255,255,.08)'">✕</button>
+  <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:linear-gradient(135deg,#1a1a1a 0%,#1e293b 100%);user-select:none;flex-shrink:0">
+    <span class="material-symbols-outlined" style="font-size:16px;color:#eeefeb">monitoring</span>
+    <span style="font-size:.72rem;font-weight:700;color:#eeefeb;flex:1">Live Activity</span>
+    <div id="monitorStatusChip" style="display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.1);color:#9a9a96;font-size:.56rem;font-weight:700;padding:2px 8px;border-radius:4px;letter-spacing:.04em">${_lang === 'ja' ? '待機中' : 'Idle'}</div>
+    <button id="liveMonitorToggleBtn" onclick="toggleMonitorPanel()" style="display:inline-flex;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);color:#eeefeb;font-size:14px;padding:3px;border-radius:6px;cursor:pointer;transition:all .15s;line-height:1" onmouseover="this.style.background='rgba(255,255,255,.2)'" onmouseout="this.style.background='rgba(255,255,255,.08)'">✕</button>
   </div>
 
   <!-- Body -->
@@ -6412,4328 +6184,164 @@ const DASHBOARD_SESSION_TOKEN = ${serializeForInlineScript(ensureDashboardSessio
 const DASHBOARD_SESSION_COOKIE_NAME = ${serializeForInlineScript(getDashboardSessionCookieName())};
 const NATIVE_DIRECTORY_PICKER_AVAILABLE = ${process.versions.electron ? 'true' : 'false'};
 const BUILD_SOURCE = ${serializeForInlineScript(APP_BUILD_SOURCE)};
-function t(key, params) {
-  let text = I18N[key] || key;
-  if (params) Object.entries(params).forEach(([k,v]) => { text = text.replace('{'+k+'}', v); });
-  return text;
-}
-const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-function withSessionQuery(urlLike) {
-  const url = new URL(urlLike, window.location.origin);
-  if (DASHBOARD_SESSION_TOKEN && !url.searchParams.has('session')) {
-    url.searchParams.set('session', DASHBOARD_SESSION_TOKEN);
-  }
-  return url.pathname + url.search + url.hash;
-}
-const nativeFetch = window.fetch.bind(window);
-window.fetch = function(input, init = {}) {
-  const headers = new Headers(init.headers || {});
-  if (DASHBOARD_SESSION_TOKEN && !headers.has('x-sales-claw-session')) {
-    headers.set('x-sales-claw-session', DASHBOARD_SESSION_TOKEN);
-  }
-  return nativeFetch(input, { ...init, credentials: 'same-origin', headers });
-};
-function createSessionEventSource(urlLike) {
-  return new EventSource(withSessionQuery(urlLike));
-}
-function createSessionWebSocket(pathname) {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const endpoint = new URL(proto + '//' + location.host + pathname);
-  if (DASHBOARD_SESSION_TOKEN && !endpoint.searchParams.has('session')) {
-    endpoint.searchParams.set('session', DASHBOARD_SESSION_TOKEN);
-  }
-  return new WebSocket(endpoint.toString());
-}
-const TARGET_COLUMN_FIELDS = ['no','status','companyName','type','url','formUrl','notes','captcha','progress'];
-const TARGET_COLUMN_LABELS = {
-  no: t('field.colNo'),
-  status: t('field.colStatus'),
-  companyName: t('field.colCompanyName'),
-  type: t('field.colType'),
-  url: t('field.colUrl'),
-  formUrl: t('field.colFormUrl'),
-  notes: t('field.colNotes'),
-  captcha: t('field.colCaptcha'),
-  progress: t('field.colProgress'),
-};
-
-// Docs modal
-function showDocsModal(){const m=document.getElementById('docsModal');m.style.display='flex';}
-function closeDocsModal(){document.getElementById('docsModal').style.display='none';}
-document.getElementById('docsModal').addEventListener('click',function(e){if(e.target===this)closeDocsModal();});
-
-// AI mode
-let _currentClaudeMode = 'auto';
-let _launchModalMode = 'auto';
-let _launchAdvancedModesOpen = false;
-let _tabTerm = null;
-let _drawerTerm = null;
-let _ptyWs = null;
-let _ptyWsRetryTimer = null;
-let _termDrawerOpen = false;
-let _currentAiProvider = 'claude';
-let _currentAiAutoSendSafe = false;
-let _launchAutoSendSafe = false;
-let _launchDiagnosticsToken = 0;
-function getAiProviderMeta(providerId) {
-  return AVAILABLE_AI_PROVIDERS.find((provider) => provider.id === providerId) || AVAILABLE_AI_PROVIDERS[0] || { id: 'claude', displayName: 'Claude' };
-}
-function getAiProviderLabel(providerId) {
-  const meta = getAiProviderMeta(providerId);
-  return t('provider.' + meta.id) !== ('provider.' + meta.id) ? t('provider.' + meta.id) : meta.displayName;
-}
-function getLaunchModeUi(providerId) {
-  const isJa = LANG === 'ja';
-  if (providerId === 'codex') {
-    return {
-      note: isJa
-        ? 'Codex のフォーム入力は managed セッション前提です。タブを残したいときはダッシュボードから起動したまま no-prompt auto 系で使ってください。なお Codex は bypass でも MCP の許可ダイアログが一度だけ出ることがあります。'
-        : 'Codex form fill now expects a managed dashboard session. Keep it launched from the dashboard when you need browser tabs to stay open.',
-      help: isJa
-        ? 'Codex の自動フォーム入力は <strong>managed セッション + no-prompt auto</strong> か <strong>managed セッション + danger bypass</strong> 前提です。<strong>on-request</strong> 系はログイン確認や手動デバッグ向けで、途中停止しやすくなります。なお <strong>danger bypass</strong> でも、Codex 本体の MCP 権限ルールが未保存だと Playwright 操作で一度だけ確認が出ることがあります。'
-        : 'Codex form fill expects a <strong>managed session + no-prompt auto</strong> or <strong>managed session + danger bypass</strong>. <strong>On-request</strong> modes are for login checks or manual debugging and may pause.',
-      modes: {
-        auto: {
-          label: isJa ? 'no-prompt auto（推奨）' : 'No-prompt auto (recommended)',
-          description: isJa
-            ? 'Codex の -a never / -s danger-full-access で起動します。通常の承認待ちはかなり減りますが、Playwright MCP の操作種別で Codex 側の確認が一度だけ出る場合があります。'
-            : 'Launches Codex with -a never / -s danger-full-access. Use this for queued runs when you do not want approval prompts.',
-          tag: isJa ? '推奨' : 'Recommended',
-          tagTone: 'recommend',
-        },
-        bypassPermissions: {
-          label: isJa ? 'danger bypass' : 'Danger bypass',
-          description: isJa
-            ? 'Codex の --dangerously-bypass-approvals-and-sandbox を使います。CLI の承認は最も減りますが、Codex 本体の MCP 許可ダイアログが一度だけ残る場合があります。'
-            : 'Uses Codex --dangerously-bypass-approvals-and-sandbox. Reserve this for fallback cases.',
-          tag: isJa ? '高権限' : 'High access',
-          tagTone: 'danger',
-        },
-        default: {
-          label: isJa ? 'on-request' : 'On-request',
-          description: isJa
-            ? 'Codex の -a on-request / -s workspace-write です。許可確認が出るので手動監視向けです。'
-            : 'Uses Codex -a on-request / -s workspace-write. Best when you want to supervise approvals.',
-          tag: isJa ? '手動' : 'Manual',
-          tagTone: 'dev',
-        },
-        acceptEdits: {
-          label: isJa ? 'on-request（編集支援）' : 'On-request (edit assist)',
-          description: isJa
-            ? 'Codex に acceptEdits 専用モードはないため、on-request で起動します。ログイン確認や軽い手動デバッグ向けです。'
-            : 'Codex has no dedicated acceptEdits mode, so this also uses on-request for login checks or light debugging.',
-          tag: isJa ? '手動' : 'Manual',
-          tagTone: 'dev',
-        },
-      },
-    };
-  }
-  if (providerId === 'gemini') {
-    return {
-      note: isJa
-        ? 'Gemini のフォーム入力は managed セッション前提です。タブを残したいときはダッシュボードから起動したまま auto_edit / yolo を使ってください。Gemini 側の browser / MCP 確認が残る場合もあります。'
-        : 'Gemini form fill now expects a managed dashboard session. Keep it launched from the dashboard when you need browser tabs to remain open.',
-      help: isJa
-        ? 'Gemini の自動フォーム入力は <strong>managed セッション + auto_edit</strong> か <strong>managed セッション + yolo</strong> 前提です。<strong>default approvals</strong> は確認待ちで止まりやすいため、ログイン確認向けです。'
-        : 'Gemini form fill expects a <strong>managed session + auto_edit</strong> or <strong>managed session + yolo</strong>. <strong>Default approvals</strong> is mainly for login checks and often pauses.',
-      modes: {
-        auto: {
-          label: isJa ? 'auto_edit（推奨）' : 'auto_edit (recommended)',
-          description: isJa
-            ? 'Gemini CLI の --approval-mode auto_edit で起動します。通常の自動化はこのモードです。'
-            : 'Launches Gemini CLI with --approval-mode auto_edit. This is the normal automation mode.',
-          tag: isJa ? '推奨' : 'Recommended',
-          tagTone: 'recommend',
-        },
-        bypassPermissions: {
-          label: 'yolo',
-          description: isJa
-            ? 'Gemini CLI の --approval-mode yolo を使います。最も強い approval-mode ですが、Gemini 側の browser / MCP 確認が残る場合があります。'
-            : 'Uses Gemini CLI --approval-mode yolo. Keep this as the fallback when auto_edit still pauses.',
-          tag: isJa ? '高権限' : 'High access',
-          tagTone: 'danger',
-        },
-        default: {
-          label: isJa ? 'default approvals' : 'Default approvals',
-          description: isJa
-            ? 'Gemini CLI の --approval-mode default です。許可待ちが出るので、ログイン確認向けです。'
-            : 'Uses Gemini CLI --approval-mode default. Best for login checks because it will ask before acting.',
-          tag: isJa ? '手動' : 'Manual',
-          tagTone: 'dev',
-        },
-        acceptEdits: {
-          label: isJa ? 'auto_edit（手動監視）' : 'auto_edit (manual)',
-          description: isJa
-            ? 'Gemini に acceptEdits 専用モードはないため、auto_edit で起動します。人が見守る前提の別名です。'
-            : 'Gemini has no dedicated acceptEdits mode, so this also uses auto_edit as a supervised variant.',
-          tag: isJa ? '手動' : 'Manual',
-          tagTone: 'dev',
-        },
-      },
-    };
-  }
-  return {
-    note: isJa
-      ? 'Claude もフォーム入力時は managed セッション前提です。通常は auto を使い、必要な場合だけ bypassPermissions に切り替えてください。'
-      : 'Claude form fill also expects a managed session. Use auto as the normal mode and switch to bypassPermissions only when needed.',
-    help: isJa
-      ? 'Claude の自動フォーム入力は <strong>auto</strong> または <strong>bypassPermissions</strong> 前提です。<strong>default</strong> / <strong>acceptEdits</strong> はログイン確認や手動監視には使えますが、承認待ちで止まることがあります。'
-      : 'Claude form fill expects <strong>auto</strong> or <strong>bypassPermissions</strong>. <strong>default</strong> / <strong>acceptEdits</strong> are mainly for login checks or manual monitoring.',
-    modes: {
-      auto: {
-        label: isJa ? '完全自動（推奨）' : 'Auto (recommended)',
-        description: isJa
-          ? 'ダッシュボード自動化向け。通常の許可待ちで止まりにくい推奨モードです。'
-          : 'Best for dashboard automation. It is less likely to stop on permission prompts.',
-        tag: isJa ? '推奨' : 'Recommended',
-        tagTone: 'recommend',
-      },
-      bypassPermissions: {
-        label: isJa ? '権限スキップ（危険）' : 'Bypass permissions (danger)',
-        description: isJa
-          ? '最も強いモードです。Claude CLI 側の権限確認をほぼ飛ばします。通常は auto を優先してください。'
-          : 'The strongest mode. It skips most permission prompts, so prefer auto when possible.',
-        tag: isJa ? '危険' : 'Danger',
-        tagTone: 'danger',
-      },
-      default: {
-        label: isJa ? '標準モード' : 'Default',
-        description: isJa
-          ? '標準モード。許可プロンプトは AI のターミナルに出ます。放置すると自動化が止まります。'
-          : 'Standard mode. Prompts appear in the AI terminal and may pause automation until you respond.',
-        tag: isJa ? '開発' : 'Dev',
-        tagTone: 'dev',
-      },
-      acceptEdits: {
-        label: isJa ? '編集支援' : 'Assist edits',
-        description: isJa
-          ? '編集は通りやすいですが、コマンドやブラウザ操作は確認待ちで止まることがあります。'
-          : 'Edits are easier to allow, but commands and browser actions can still pause for confirmation.',
-        tag: isJa ? '開発' : 'Dev',
-        tagTone: 'dev',
-      },
-    },
-  };
-}
-function getLaunchModeLabels(providerId) {
-  const ui = getLaunchModeUi(providerId);
-  return Object.fromEntries(Object.entries(ui.modes || {}).map(([mode, meta]) => [mode, meta.label || mode]));
-}
-function getProviderLaunchNote(providerId) {
-  return getLaunchModeUi(providerId).note;
-}
-function getLaunchModeDisplayLabel(providerId, mode) {
-  const labels = getLaunchModeLabels(providerId);
-  if (labels[mode]) return labels[mode];
-  if (providerId === 'codex' && mode === 'danger-full-access') return labels.bypassPermissions || 'danger bypass';
-  if (providerId === 'gemini' && (mode === 'yolo' || mode === 'headless-yolo')) return labels.bypassPermissions || 'yolo';
-  if (providerId === 'gemini' && mode === 'auto_edit') return labels.auto || 'auto_edit';
-  return mode || '';
-}
-function getLaunchAutoSendPolicyLabel(enabled) {
-  return enabled
-    ? (LANG === 'ja' ? '安全なフォームは自動送信' : 'Auto-send safe forms')
-    : (LANG === 'ja' ? '確認待ちで停止' : 'Stop for approval');
-}
-function getAutoSendPolicyLabel(enabled) {
-  return getLaunchAutoSendPolicyLabel(enabled);
-}
-function renderLaunchSelectedLabel() {
-  const lbl = document.getElementById('launchSelectedLabel');
-  if (!lbl) return;
-  const providerLabel = getAiProviderLabel(_currentAiProvider);
-  const labels = getLaunchModeLabels(_currentAiProvider);
-  const currentMode = _launchModalMode || _currentClaudeMode || 'auto';
-  const policy = getLaunchAutoSendPolicyLabel(_launchAutoSendSafe);
-  lbl.textContent = (LANG === 'ja' ? '選択中: ' : 'Selected: ')
-    + providerLabel
-    + ' / '
-    + (labels[currentMode] || currentMode)
-    + ' / '
-    + policy;
-}
-function renderLaunchDiagnosticRow(tone, title, detail) {
-  const palette = tone === 'ok'
-    ? { bg: '#ecfdf5', fg: '#065f46', border: 'rgba(16,185,129,.18)' }
-    : tone === 'warn'
-      ? { bg: '#fffbeb', fg: '#92400e', border: 'rgba(245,158,11,.22)' }
-      : { bg: '#fef2f2', fg: '#991b1b', border: 'rgba(239,68,68,.2)' };
-  return '<div style="display:flex;align-items:flex-start;gap:6px;padding:5px 8px;border:1px solid ' + palette.border + ';background:' + palette.bg + ';border-radius:8px">'
-    + '<span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:999px;background:#fff;font-size:.6rem;font-weight:900;color:' + palette.fg + ';flex-shrink:0;margin-top:1px">'
-    + (tone === 'ok' ? '✓' : tone === 'warn' ? '!' : '×')
-    + '</span>'
-    + '<div style="min-width:0"><div style="font-weight:700;color:' + palette.fg + ';font-size:.68rem;line-height:1.3">' + esc(title) + '</div><div style="font-size:.64rem;color:#64748b;line-height:1.4;margin-top:1px;word-break:break-all">' + esc(detail || '') + '</div></div>'
-    + '</div>';
-}
-function renderLaunchSetupDiagnostics(data) {
-  const body = document.getElementById('launchSetupDiagnosticsBody');
-  if (!body) return;
-  if (!data) {
-    body.textContent = LANG === 'ja' ? '診断情報を取得できませんでした。' : 'Could not load setup diagnostics.';
-    return;
-  }
-  const rows = [];
-  rows.push(renderLaunchDiagnosticRow(data.cliInstalled ? 'ok' : 'error',
-    LANG === 'ja' ? 'CLI インストール' : 'CLI installation',
-    data.cliInstalled
-      ? ((LANG === 'ja' ? '実行可能です。' : 'Detected and callable.') + (data.installCommand ? ' ' + data.installCommand : ''))
-      : ((LANG === 'ja' ? '未導入です。' : 'Not installed.') + ' ' + (data.installCommand || ''))));
-  rows.push(renderLaunchDiagnosticRow(data.cliLoggedIn ? 'ok' : 'warn',
-    LANG === 'ja' ? 'ログイン状態' : 'Login status',
-    data.cliLoggedIn
-      ? (LANG === 'ja' ? '認証済みです。' : 'Authenticated.')
-      : (data.cliAuthError || (LANG === 'ja' ? 'ログインが必要です。' : 'Authentication is required.'))));
-  rows.push(renderLaunchDiagnosticRow(data.npm && data.npm.available ? 'ok' : 'warn',
-    'npm',
-    data.npm && data.npm.available
-      ? ((LANG === 'ja' ? '自動インストールに使えます。' : 'Available for automatic installs.') + (data.npm.version ? ' v' + data.npm.version : ''))
-      : ((data.npm && data.npm.error) || (LANG === 'ja' ? 'npm が見つからないため自動インストールは使えません。' : 'npm is unavailable, so automatic install cannot run.'))));
-  rows.push(renderLaunchDiagnosticRow(data.playwrightPackage && data.playwrightPackage.available ? 'ok' : 'warn',
-    LANG === 'ja' ? 'Playwright MCP パッケージ' : 'Playwright MCP package',
-    data.playwrightPackage && data.playwrightPackage.available
-      ? (LANG === 'ja' ? 'npm exec で起動できます。' : 'Available via npm exec.')
-      : ((data.playwrightPackage && data.playwrightPackage.error) || (LANG === 'ja' ? 'Playwright MCP を起動できません。' : 'Playwright MCP bootstrap failed.'))));
-  if (data.providerPlaywright && data.providerPlaywright.configured !== null) {
-    rows.push(renderLaunchDiagnosticRow(data.providerPlaywright.configured ? 'ok' : 'warn',
-      LANG === 'ja' ? 'CLI 側の MCP 登録' : 'CLI MCP registration',
-      data.providerPlaywright.configured
-        ? (LANG === 'ja' ? 'Playwright MCP がこの CLI に登録済みです。' : 'Playwright MCP is registered in this CLI.')
-        : ((data.providerPlaywright && data.providerPlaywright.error) || (LANG === 'ja' ? 'Playwright MCP が未登録です。起動時に自動設定を試みます。' : 'Playwright MCP is not registered yet. Launch will try to configure it.'))));
-  }
-  if (data.workspaceTrusted) {
-    rows.push(renderLaunchDiagnosticRow(data.workspaceTrusted.configured ? 'ok' : 'warn',
-      LANG === 'ja' ? 'Workspace trust' : 'Workspace trust',
-      data.workspaceTrusted.configured
-        ? (LANG === 'ja' ? 'このプロジェクトは信頼済みです。' : 'This project is trusted.')
-        : ((data.workspaceTrusted && data.workspaceTrusted.note) || (LANG === 'ja' ? '初回起動時に trust 設定が必要です。' : 'Trust must be granted before the first automation run.'))));
-  }
-  if (data.launchExamples) {
-    const parts = [];
-    if (data.launchExamples.auto) parts.push('auto: ' + data.launchExamples.auto);
-    if (data.launchExamples.bypassPermissions) parts.push('bypass: ' + data.launchExamples.bypassPermissions);
-    if (parts.length) {
-      rows.push(renderLaunchDiagnosticRow('ok',
-        LANG === 'ja' ? '実際の起動フラグ' : 'Effective launch flags',
-        parts.join(' / ')));
-    }
-  }
-  if (data.approvalCaveat) {
-    rows.push(renderLaunchDiagnosticRow(data.approvalCaveat.tone || 'warn',
-      LANG === 'ja' ? '承認まわりの注意' : 'Approval caveat',
-      LANG === 'ja'
-        ? (data.approvalCaveat.ja || data.approvalCaveat.message || '')
-        : (data.approvalCaveat.en || data.approvalCaveat.message || '')));
-  }
-  rows.push(renderLaunchDiagnosticRow('warn',
-    LANG === 'ja' ? '確認待ちタブの保持' : 'Awaiting tab retention',
-    data.tabRetentionNote || (LANG === 'ja' ? 'AIフォーム入力は managed セッション前提です。' : 'Form fill expects a managed session.')));
-  body.innerHTML = '<div style="display:flex;flex-direction:column;gap:4px">' + rows.join('') + '</div>';
-  const badge = document.getElementById('launchDiagBadge');
-  if (badge) {
-    const ok = rows.filter(r => r.includes('#059669')).length;
-    const warn = rows.filter(r => r.includes('#d97706') || r.includes('#ef4444')).length;
-    badge.textContent = warn > 0 ? (ok + '/' + (ok + warn)) : (ok + ' OK');
-    badge.style.background = warn > 0 ? '#fef3c7' : '#ecfdf5';
-    badge.style.color = warn > 0 ? '#92400e' : '#059669';
-  }
-}
-async function loadLaunchSetupDiagnostics(providerId = _currentAiProvider) {
-  const body = document.getElementById('launchSetupDiagnosticsBody');
-  if (!body) return;
-  const token = ++_launchDiagnosticsToken;
-  body.textContent = LANG === 'ja' ? '診断を読み込み中...' : 'Loading diagnostics...';
-  try {
-    const res = await fetch('/api/ai/setup-diagnostics?provider=' + encodeURIComponent(providerId));
-    const data = await res.json();
-    if (token !== _launchDiagnosticsToken) return;
-    if (!res.ok || data.ok === false) {
-      renderLaunchSetupDiagnostics(null);
-      return;
-    }
-    renderLaunchSetupDiagnostics(data);
-  } catch (_) {
-    if (token !== _launchDiagnosticsToken) return;
-    renderLaunchSetupDiagnostics(null);
-  }
-}
-function updateLaunchProviderUi(providerId) {
-  const meta = getAiProviderMeta(providerId || _currentAiProvider);
-  const providerLabel = getAiProviderLabel(meta.id);
-  const modeUi = getLaunchModeUi(meta.id);
-  _currentAiProvider = meta.id;
-  const title = document.getElementById('launchProviderTitle');
-  if (title) {
-    title.textContent = LANG === 'ja'
-      ? 'AI を起動'
-      : 'Launch AI';
-  }
-  const subtitle = document.getElementById('launchProviderSubtitle');
-  if (subtitle) {
-    subtitle.textContent = LANG === 'ja'
-      ? '起動する AI とモードを選択してください'
-      : 'Choose the AI provider and startup mode';
-  }
-  const providerSelect = document.getElementById('launchProviderSelect');
-  if (providerSelect && providerSelect.value !== meta.id) {
-    providerSelect.value = meta.id;
-  }
-  const badge = document.getElementById('launchProviderBadge');
-  if (badge) badge.textContent = providerLabel;
-  const note = document.getElementById('launchProviderNote');
-  if (note) note.textContent = getProviderLaunchNote(meta.id);
-  const help = document.getElementById('launchModeHelpNote');
-  if (help) {
-    help.innerHTML = modeUi.help;
-  }
-  const submissionSelect = document.getElementById('launchAutoSendSafeSelect');
-  if (submissionSelect) {
-    submissionSelect.value = _launchAutoSendSafe ? 'true' : 'false';
-  }
-  ['default', 'acceptEdits', 'auto', 'bypassPermissions'].forEach((mode) => {
-    const metaUi = (modeUi.modes || {})[mode] || {};
-    const titleEl = document.getElementById('launchOptTitle_' + mode);
-    if (titleEl) titleEl.textContent = metaUi.label || mode;
-    const descEl = document.getElementById('launchOptDesc_' + mode);
-    if (descEl) descEl.textContent = metaUi.description || '';
-    const tagEl = document.getElementById('launchOptTag_' + mode);
-    if (tagEl) {
-      tagEl.textContent = metaUi.tag || '';
-      tagEl.style.display = metaUi.tag ? '' : 'none';
-      if (metaUi.tagTone === 'danger') {
-        tagEl.style.background = 'linear-gradient(135deg,#ef4444,#dc2626)';
-      } else if (metaUi.tagTone === 'recommend') {
-        tagEl.style.background = 'linear-gradient(135deg,#f59e0b,#d97706)';
-      } else {
-        tagEl.style.background = 'linear-gradient(135deg,#64748b,#475569)';
-      }
-    }
-  });
-  // プロバイダーカード選択状態を更新
-  ['claude', 'codex', 'gemini'].forEach((id) => {
-    const card = document.getElementById('launchProviderCard_' + id);
-    if (card) {
-      if (id === meta.id) card.classList.add('selected');
-      else card.classList.remove('selected');
-    }
-  });
-  // ヘッダーグラデーションをプロバイダー色に変更
-  const _providerTheme = {
-    claude: { grad: 'linear-gradient(135deg,#CC785C,#E8935A)', shadow: 'rgba(204,120,92,.4)',
-      icon: '<img src="https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/claude-code/default.svg" width="30" height="30" alt="Claude Code">' },
-    codex: { grad: 'linear-gradient(135deg,#10a37f,#0d8a6a)', shadow: 'rgba(16,163,127,.4)',
-      icon: '<img src="https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/codex-openai/default.svg" width="30" height="30" alt="Codex">' },
-    gemini: { grad: 'linear-gradient(135deg,#4285F4,#1a6fe0)', shadow: 'rgba(66,133,244,.4)',
-      icon: '<img src="https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/gemini-cli/default.svg" width="30" height="30" alt="Gemini CLI">' },
-  };
-  const _theme = _providerTheme[meta.id] || _providerTheme.claude;
-  const headerEl = document.getElementById('launchModalHeader');
-  if (headerEl) headerEl.style.background = _theme.grad;
-  const iconEl = document.getElementById('launchModalHeaderIcon');
-  if (iconEl) iconEl.innerHTML = _theme.icon;
-  const externalBtn = document.getElementById('launchExternalBtn');
-  if (externalBtn) {
-    externalBtn.textContent = LANG === 'ja'
-      ? (providerLabel + ' の作業画面を外部で開く')
-      : ('Open ' + providerLabel + ' work session externally');
-  }
-  const confirmBtn = document.getElementById('launchConfirmBtn');
-  if (confirmBtn) {
-    confirmBtn.textContent = LANG === 'ja'
-      ? (providerLabel + ' を起動')
-      : ('Launch ' + providerLabel);
-    confirmBtn.style.background = _theme.grad;
-    confirmBtn.style.boxShadow = '0 4px 14px ' + _theme.shadow;
-  }
-  const selectedLabel = document.getElementById('launchSelectedLabel');
-  if (selectedLabel) renderLaunchSelectedLabel();
-  const modal = document.getElementById('launchModal');
-  if (modal && modal.style.display === 'flex') {
-    loadLaunchSetupDiagnostics(meta.id);
-  }
-}
-function setClaudeMode(mode) {
-  _currentClaudeMode = mode;
-  const lbl = document.getElementById('termModeLabel');
-  if (lbl) lbl.textContent = getLaunchModeDisplayLabel(_currentAiProvider, mode);
-  const dml = document.getElementById('termDrawerModeLabel');
-  if (dml) dml.textContent = getLaunchModeDisplayLabel(_currentAiProvider, mode);
-  updateLaunchModalSelection(mode);
-}
-
-function setLaunchAutoSendSafe(enabled, options = {}) {
-  _launchAutoSendSafe = !!enabled;
-  if (options.commitCurrent) {
-    _currentAiAutoSendSafe = _launchAutoSendSafe;
-  }
-  const select = document.getElementById('launchAutoSendSafeSelect');
-  if (select) select.value = _launchAutoSendSafe ? 'true' : 'false';
-  renderLaunchSelectedLabel();
-}
-
-  function setLaunchAdvancedModesOpen(open) {
-    _launchAdvancedModesOpen = !!open;
-    const panel = document.getElementById('launchAdvancedModes');
-    const btn = document.getElementById('launchAdvancedToggle');
-    if (panel) panel.style.display = _launchAdvancedModesOpen ? 'block' : 'none';
-    if (btn) btn.textContent = _launchAdvancedModesOpen
-      ? (LANG === 'ja' ? '閉じる' : 'Hide')
-      : (LANG === 'ja' ? '開く' : 'Show');
-  }
-
-  function toggleLaunchAdvancedModes() {
-    setLaunchAdvancedModesOpen(!_launchAdvancedModesOpen);
-  }
-
-  let _diagPanelOpen = true;
-  function toggleDiagPanel() {
-    _diagPanelOpen = !_diagPanelOpen;
-    const body = document.getElementById('launchSetupDiagnosticsBody');
-    const arrow = document.getElementById('launchDiagArrow');
-    if (body) body.style.display = _diagPanelOpen ? '' : 'none';
-    if (arrow) arrow.style.transform = _diagPanelOpen ? '' : 'rotate(-90deg)';
-  }
-
-function updateLaunchModalSelection(mode) {
-    const current = mode || 'auto';
-    _launchModalMode = current;
-    const shouldOpenAdvanced = ['default', 'acceptEdits'].includes(current);
-    if (shouldOpenAdvanced) setLaunchAdvancedModesOpen(true);
-    document.querySelectorAll('input[name="launchMode"]').forEach((input) => {
-      input.checked = input.value === current;
-    });
-  const modes = ['default', 'acceptEdits', 'auto', 'bypassPermissions'];
-  const isDanger = current === 'bypassPermissions';
-  modes.forEach((value) => {
-    const card = document.getElementById('launchOpt_' + value);
-    const check = document.getElementById('launchCheck_' + value);
-    if (!card) return;
-    const isSelected = value === current;
-    const borderColor = isSelected ? (isDanger && value === 'bypassPermissions' ? '#ef4444' : '#3b82f6') : '#e2e8f0';
-    const bgColor = isSelected ? (isDanger && value === 'bypassPermissions' ? '#fef2f2' : '#eff6ff') : '#fff';
-    card.style.borderColor = borderColor;
-    card.style.background = bgColor;
-    if (check) check.style.display = isSelected ? 'flex' : 'none';
-  });
-  renderLaunchSelectedLabel();
-}
-
-  function openLaunchModal(mode) {
-    setLaunchAutoSendSafe(_currentAiAutoSendSafe);
-    updateLaunchProviderUi(_currentAiProvider);
-    setLaunchAdvancedModesOpen(['default', 'acceptEdits'].includes(mode || _currentClaudeMode));
-    updateLaunchModalSelection(mode || _currentClaudeMode || 'auto');
-    const modal = document.getElementById('launchModal');
-    if (modal) modal.style.display = 'flex';
-    loadLaunchSetupDiagnostics(_currentAiProvider);
-  }
-
-function closeLaunchModal() {
-  const modal = document.getElementById('launchModal');
-  if (modal) modal.style.display = 'none';
-}
-
-function selectLaunchProvider(providerId) {
-  updateLaunchProviderUi(providerId);
-}
-
-function selectLaunchMode(mode) {
-  updateLaunchModalSelection(mode);
-}
-
-async function confirmLaunch() {
-  const mode = _launchModalMode || _currentClaudeMode || 'auto';
-  _currentClaudeMode = mode;
-  _currentAiAutoSendSafe = _launchAutoSendSafe;
-  closeLaunchModal();
-  await launchClaude(mode, _currentAiProvider, _launchAutoSendSafe);
-}
-
-async function confirmExternalLaunch() {
-  const mode = _launchModalMode || _currentClaudeMode || 'auto';
-  _currentClaudeMode = mode;
-  _currentAiAutoSendSafe = _launchAutoSendSafe;
-  closeLaunchModal();
-  await launchClaudeExternal(mode, _currentAiProvider, _launchAutoSendSafe);
-}
-
-// Launch AI (in-process spawn via API)
-async function launchClaude(mode = _currentClaudeMode, providerId = _currentAiProvider, autoSendSafe = _launchAutoSendSafe) {
-  const providerLabel = getAiProviderLabel(providerId);
-  try {
-    const res = await safeFetch('/api/launch-ai', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ mode, provider: providerId, autoSendSafe: !!autoSendSafe })
-    }, providerLabel + ' を起動中...');
-    const data = await res.json();
-    if (data.ok) {
-      _currentAiProvider = data.provider || providerId;
-      _currentAiAutoSendSafe = !!(data.autoSendSafe ?? autoSendSafe);
-      showToast(t('app.launchAi.success', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, mode) + ' / ' + getAutoSendPolicyLabel(_currentAiAutoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']', 'success');
-      document.querySelector('.tab-btn[data-tab="logs"]')?.click();
-      setTimeout(() => { pollClaudeStatus(); }, 800);
-    } else {
-      showToast(t('app.launchAi.error', { provider: providerLabel }) + ': ' + (data.error || ''), 'error');
-    }
-  } catch (e) {
-    showToast(t('app.launchAi.error', { provider: providerLabel }) + ': ' + e.message, 'error');
-  }
-}
-
-async function launchClaudeExternal(mode = _currentClaudeMode, providerId = _currentAiProvider, autoSendSafe = _launchAutoSendSafe) {
-  const providerLabel = getAiProviderLabel(providerId);
-  try {
-    const res = await safeFetch('/api/launch-ai-external', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ mode, provider: providerId, autoSendSafe: !!autoSendSafe })
-    }, providerLabel + ' の作業画面を外部で開いています...');
-    const data = await res.json();
-    if (data.ok) {
-      _currentAiProvider = data.provider || providerId;
-      _currentAiAutoSendSafe = !!(data.autoSendSafe ?? autoSendSafe);
-      showToast(t('app.launchAi.external', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, mode) + ' / ' + getAutoSendPolicyLabel(_currentAiAutoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']', 'success');
-      setTimeout(() => { pollClaudeStatus(); }, 800);
-    } else {
-      showToast(t('app.launchAi.error', { provider: providerLabel }) + ': ' + (data.error || ''), 'error');
-    }
-  } catch (e) {
-    showToast(t('app.launchAi.error', { provider: providerLabel }) + ': ' + e.message, 'error');
-  }
-}
-
-async function stopClaude() {
-  try {
-    const providerLabel = getAiProviderLabel(_currentAiProvider);
-    await fetch('/api/stop-ai', { method: 'POST' });
-    showToast(t('app.stopAi.success', { provider: providerLabel }), 'info');
-    setTimeout(pollClaudeStatus, 800);
-  } catch(e) {}
-}
-
-
-// AI CLI status polling
-let _claudeStatusTimer = null;
-async function pollClaudeStatus() {
-  if (document.hidden) return;
-  try {
-    const res = await fetch('/api/ai/status');
-    const data = await res.json();
-    const dot = document.getElementById('claudeStatusDot');
-    const label = document.getElementById('claudeStatusLabel');
-    const btn = document.getElementById('claudeActionBtn');
-    const stopBtn = document.getElementById('claudeStopBtn');
-    const launchModal = document.getElementById('launchModal');
-    const launchModalOpen = !!(launchModal && launchModal.style.display === 'flex');
-    if (!dot) return;
-    const providerId = data.provider || data.selectedProvider || _currentAiProvider;
-    const providerLabel = data.providerLabel || getAiProviderLabel(providerId);
-    _currentAiAutoSendSafe = !!data.autoSendSafe;
-    if (!launchModalOpen) {
-      _currentAiProvider = providerId;
-      updateLaunchProviderUi(data.selectedProvider || providerId);
-    }
-    if (data.installState === 'installing') {
-      dot.className = 'live-dot warn';
-      label.textContent = t('ai.status.installing', { provider: providerLabel });
-      btn.textContent = t('ai.status.installing', { provider: providerLabel });
-      btn.style.display = '';
-      btn._action = 'install';
-      btn.disabled = true;
-      if (stopBtn) stopBtn.style.display = 'none';
-      return;
-    }
-    btn.disabled = false;
-    if (data.managed) {
-      // ダッシュボードが起動・管理中 → green
-      dot.className = 'live-dot on';
-      label.textContent = t('ai.status.connected', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, data.mode || 'default') + ' / ' + getAutoSendPolicyLabel(!!data.autoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']';
-      btn.style.display = 'none';
-      if (stopBtn) stopBtn.style.display = '';
-      const dml = document.getElementById('termDrawerModeLabel');
-      if (dml) { dml.textContent = getLaunchModeDisplayLabel(providerId, data.mode || 'default'); dml.style.display = ''; }
-      const tml = document.getElementById('termModeLabel');
-      if (tml) tml.textContent = getLaunchModeDisplayLabel(providerId, data.mode || 'default');
-    } else if (data.headless && data.running) {
-      dot.className = 'live-dot on';
-      label.textContent = t('ai.status.connected', { provider: providerLabel }) + ' [' + getLaunchModeDisplayLabel(providerId, data.mode || 'headless') + ' / ' + getAutoSendPolicyLabel(!!data.autoSendSafe, LANG === 'ja' ? 'ja' : 'en') + ']';
-      btn.style.display = 'none';
-      if (stopBtn) stopBtn.style.display = '';
-      const dml = document.getElementById('termDrawerModeLabel');
-      if (dml) { dml.textContent = getLaunchModeDisplayLabel(providerId, data.mode || 'headless'); dml.style.display = ''; }
-      const tml = document.getElementById('termModeLabel');
-      if (tml) tml.textContent = getLaunchModeDisplayLabel(providerId, data.mode || 'headless');
-    } else if (data.running) {
-      dot.className = 'live-dot warn';
-      label.textContent = t('ai.status.externalRunning', { provider: providerLabel });
-      btn.textContent = LANG === 'ja' ? 'AI を起動' : 'Launch AI';
-      btn.style.display = '';
-      btn._action = 'launch';
-      if (stopBtn) stopBtn.style.display = 'none';
-      if (!launchModalOpen) updateLaunchModalSelection(_currentClaudeMode);
-    } else if (data.installed) {
-      dot.className = 'live-dot warn';
-      label.textContent = t('ai.status.notRunning', { provider: providerLabel });
-      btn.textContent = LANG === 'ja' ? 'AI を起動' : 'Launch AI';
-      btn.style.display = '';
-      btn._action = 'launch';
-      if (stopBtn) stopBtn.style.display = 'none';
-      if (!launchModalOpen) updateLaunchModalSelection(_currentClaudeMode);
-    } else {
-      dot.className = 'live-dot off';
-      label.textContent = t('ai.status.notInstalled', { provider: providerLabel });
-      btn.textContent = LANG === 'ja' ? 'AI CLI を準備' : 'Prepare AI CLI';
-      btn.style.display = '';
-      btn._action = 'install';
-      if (stopBtn) stopBtn.style.display = 'none';
-      if (!launchModalOpen) updateLaunchModalSelection(_currentClaudeMode);
-    }
-  } catch (e) {
-    // network error — leave as-is
-  }
-}
-function claudeAction() {
-  const btn = document.getElementById('claudeActionBtn');
-  if (!btn) return;
-  if (btn._action === 'launch') {
-    openLaunchModal(_currentClaudeMode);
-  } else if (btn._action === 'install') {
-    installClaudeCli();
-  }
-}
-
-async function installClaudeCli() {
-  const btn = document.getElementById('claudeActionBtn');
-  if (btn) btn.disabled = true;
-  const providerLabel = getAiProviderLabel(_currentAiProvider);
-  try {
-    showToast(t('ai.install.started', { provider: providerLabel }), 'info');
-    const res = await fetch('/api/install-ai-cli', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ provider: _currentAiProvider }),
-    });
-    const data = await res.json();
-    if (res.status === 401 || isDashboardSessionErrorMessage(data.error || data.message || '')) {
-      handleDashboardSessionExpired();
-      return;
-    }
-    if (data.ok) {
-      showToast(t('ai.install.success', { provider: providerLabel }), 'success');
-      setTimeout(pollClaudeStatus, 500);
-      loadLaunchSetupDiagnostics(_currentAiProvider);
-    } else {
-      showToast(t('ai.install.failed', { provider: providerLabel }) + ': ' + (data.error || ''), 'error');
-      setTimeout(pollClaudeStatus, 500);
-      loadLaunchSetupDiagnostics(_currentAiProvider);
-    }
-  } catch (e) {
-    showToast(t('ai.install.failed', { provider: providerLabel }) + ': ' + e.message, 'error');
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-updateLaunchProviderUi(_currentAiProvider);
-
-const launchProviderSelectEl = document.getElementById('launchProviderSelect');
-if (launchProviderSelectEl) {
-  launchProviderSelectEl.addEventListener('change', (event) => {
-    updateLaunchProviderUi(event && event.target ? event.target.value : _currentAiProvider);
-  });
-}
-
-const statusBadge=s=>{
-  const m={'':'secondary">'+t('status.unclassified'),'\\u3007':'success">'+t('status.priority'),'\\u00d7':'danger">'+t('status.excluded'),'web\\u00d7':'warning text-dark">'+t('status.webNg')};
-  return '<span class="badge bg-'+(m[s]||'secondary">'+esc(s))+'</span>';
-};
-
-const actionBadge=a=>{
-  if(!a)return'<span class="text-muted">-</span>';
-  const m={form_analysis:'info text-dark">'+t('status.analyzed'),form_fill:'primary">'+t('status.filled'),confirm_reached:'warning text-dark">'+t('status.confirmScreen'),awaiting_approval:'warning text-dark">'+t('status.awaitingApproval'),submitted:'success">'+t('status.sent'),skipped:'secondary">'+t('status.skipped'),error:'danger">'+t('status.error')};
-  return'<span class="badge bg-'+(m[a]||'secondary">'+esc(a))+'</span>';
-};
-
-let currentFilter='all';
-let prevStats={};
-let _activeMainTab = 'companies';
-let _currentLiveMonitorState = null;
-let _monitorCliFeed = [];
-let _ptyProgressBuffer = '';
-let _lastPtyProgressNotice = { text: '', at: 0 };
-const _sectionRenderState = {
-  liveMonitor: { signature: '', rendered: false },
-  companies: { signature: '', rendered: false },
-  logs: { signature: '', rendered: false },
-  awaiting: { signature: '', rendered: false },
-  sent: { signature: '', rendered: false },
-};
-
-function getActiveMainTab() {
-  const active = document.querySelector('.tab-btn.active');
-  return (active && active.dataset && active.dataset.tab) || _activeMainTab || 'companies';
-}
-
-function shouldRenderSection(section, signature, forceSection) {
-  const state = _sectionRenderState[section] || { signature: '', rendered: false };
-  if (forceSection && forceSection === section) return true;
-  return !state.rendered || state.signature !== signature;
-}
-
-function markSectionRendered(section, signature) {
-  if (!_sectionRenderState[section]) {
-    _sectionRenderState[section] = { signature: '', rendered: false };
-  }
-  _sectionRenderState[section].signature = signature;
-  _sectionRenderState[section].rendered = true;
-}
-
-function compactSignatureValue(value) {
-  if (value === null || value === undefined) return '';
-  return String(value).replace(/[|:\\n\\r]/g, ' ').slice(0, 200);
-}
-
-function buildCompanySectionSignature(companies) {
-  return (companies || []).map((company) => [
-    company.no,
-    compactSignatureValue(company.name),
-    compactSignatureValue(company.type),
-    compactSignatureValue(company.lastAction),
-    compactSignatureValue(company.lastActionAt),
-    compactSignatureValue(company.formUrl),
-    compactSignatureValue(company.sentMessage),
-    compactSignatureValue(company.contactCount),
-    compactSignatureValue(company.isApproachable),
-    compactSignatureValue(company.isOutreachTarget),
-    compactSignatureValue(company.isDetachedFromTargetList),
-    compactSignatureValue(company.outreachStatus),
-    compactSignatureValue(company.outreachDetail),
-    compactSignatureValue(company.lastErrorDetail),
-    compactSignatureValue(company.screenshotAuditState),
-    compactSignatureValue(company.readyForManualApproval),
-    compactSignatureValue(company.manualReviewReason),
-  ].join('|')).join('\\n');
-}
-
-function buildLogSectionSignature(recentLogs) {
-  return (recentLogs || []).map((log) => [
-    compactSignatureValue(log.timestamp),
-    compactSignatureValue(log.companyNo),
-    compactSignatureValue(log.companyName),
-    compactSignatureValue(log.action),
-    compactSignatureValue(typeof log.details === 'object' ? JSON.stringify(log.details) : log.details),
-  ].join('|')).join('\\n');
-}
-
-function buildAwaitingSectionSignature(companies) {
-  return (companies || []).map((company) => [
-    company.no,
-    compactSignatureValue(company.awaitingAt),
-    compactSignatureValue(company.lastAction),
-    compactSignatureValue(company.sentMessage),
-    compactSignatureValue(company.screenshotAuditState),
-    compactSignatureValue(company.inputScreenshotName),
-    compactSignatureValue(company.confirmScreenshotName),
-    compactSignatureValue(company.manualReviewReason),
-    compactSignatureValue(company.manualReviewDetail),
-    compactSignatureValue(company.formUrl),
-  ].join('|')).join('\\n');
-}
-
-function buildSentSectionSignature(companies) {
-  return (companies || []).map((company) => [
-    company.no,
-    compactSignatureValue(company.name),
-    compactSignatureValue(company.type),
-    compactSignatureValue(company.sentAt),
-    compactSignatureValue(company.sentMessage),
-    compactSignatureValue(company.formUrl),
-    compactSignatureValue(company.contactCount),
-    compactSignatureValue(company.inputScreenshotName),
-    compactSignatureValue(company.confirmScreenshotName),
-    compactSignatureValue(company.sentScreenshotName),
-    compactSignatureValue(company.contactHistory ? JSON.stringify(company.contactHistory) : ''),
-  ].join('|')).join('\\n');
-}
-
-function formatCompactDateTime(value) {
-  if (!value) return '';
-  const ms = Date.parse(value);
-  if (!Number.isFinite(ms)) return '';
-  return new Date(ms).toLocaleString(LANG === 'ja' ? 'ja-JP' : undefined, {
-    timeZone: PREF_TZ,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-}
-
-function stripAnsiText(value) {
-  return String(value || '').replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-}
-
-function extractTerminalProgressText(line) {
-  const cleaned = stripAnsiText(line).replace(/\\s+/g, ' ').trim();
-  if (!cleaned) return '';
-  if (/^(─+|❯|◼|◻|n______n|\\(.*\\)|sent \\d+ chars|5h\\[|7d\\[)/i.test(cleaned)) return '';
-  if (/^\\[[A-Z]+\\]/.test(cleaned)) return '';
-  if (/^Did \\d+ search/i.test(cleaned)) return '';
-  const normalized = cleaned.replace(/^●\\s+/, '');
-  if (!/(phase|フォーム|問い合わせ|メッセージ|送信|確認待ち|検索|探索|分析|スクショ|screenshot|search|navigate|fill|submit|captcha|thanks|queued|running|site|message|draft|approval)/i.test(normalized)) {
-    return '';
-  }
-  return truncateUiTextClient(normalized, 180);
-}
-
-function ingestPtyProgress(text) {
-  if (!text) return;
-  _ptyProgressBuffer += stripAnsiText(text).replace(/\\r/g, '\\n');
-  const parts = _ptyProgressBuffer.split('\\n');
-  _ptyProgressBuffer = parts.pop() || '';
-  parts.forEach((line) => {
-    const summary = extractTerminalProgressText(line);
-    if (!summary) return;
-    pushMonitorCliEvent(summary, 'step', new Date().toISOString());
-  });
-}
-
-function buildLiveMonitorSectionSignature(monitor) {
-  if (!monitor) return '';
-  const events = Array.isArray(monitor.events) ? monitor.events : [];
-  return [
-    compactSignatureValue(monitor.companyNo),
-    compactSignatureValue(monitor.companyName),
-    compactSignatureValue(monitor.latestStep),
-    compactSignatureValue(monitor.currentUrl),
-    compactSignatureValue(monitor.latestScreenshotName),
-    compactSignatureValue(monitor.updatedAt),
-    events.slice(0, 14).map((event) => [
-      compactSignatureValue(event.companyNo),
-      compactSignatureValue(event.companyName),
-      compactSignatureValue(event.status),
-      compactSignatureValue(event.step),
-      compactSignatureValue(event.updatedAt),
-    ].join('|')).join('\\n'),
-  ].join('\\n');
-}
-let _lastDashboardDataCacheKey = '';
-const _renderSectionKeys = {
-  companyTable: '',
-  recentLogs: '',
-  awaitingList: '',
-  sentList: '',
-  liveMonitor: '',
-};
-
-function updateStat(id,val){
-  const el=document.getElementById(id);
-  if(el.textContent!==String(val)){
-    el.textContent=val;
-    el.classList.add('changed');
-    setTimeout(()=>el.classList.remove('changed'),500);
-  }
-}
-
-// Toast notification
-function showToast(message, type) {
-  const container = document.getElementById('toastContainer');
-  const toast = document.createElement('div');
-  toast.className = 'toast-msg ' + type;
-  toast.textContent = message;
-  container.appendChild(toast);
-  setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity .3s'; setTimeout(() => toast.remove(), 300); }, 3000);
-}
-
-// Loading overlay
-function showLoading(message) {
-  let overlay = document.getElementById('loadingOverlay');
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.id = 'loadingOverlay';
-    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.3);z-index:99999;display:flex;align-items:center;justify-content:center';
-    const box = document.createElement('div');
-    box.style.cssText = 'background:#fff;border-radius:12px;padding:24px 32px;display:flex;align-items:center;gap:12px;box-shadow:0 8px 32px rgba(0,0,0,.2)';
-    box.innerHTML = '<span class="spin" style="border-top-color:var(--primary)"></span>';
-    const txt = document.createElement('span');
-    txt.id = 'loadingText';
-    txt.style.cssText = 'font-size:.85rem;color:var(--text-1);font-weight:500';
-    txt.textContent = message || '処理中...';
-    box.appendChild(txt);
-    overlay.appendChild(box);
-    document.body.appendChild(overlay);
-  } else {
-    const txt = document.getElementById('loadingText');
-    if (txt) txt.textContent = message || '処理中...';
-    overlay.style.display = 'flex';
-  }
-}
-function hideLoading() {
-  const overlay = document.getElementById('loadingOverlay');
-  if (overlay) overlay.style.display = 'none';
-}
-
-// Safe fetch wrapper with loading + error toast
-async function safeFetch(url, options, loadingMessage) {
-  if (loadingMessage) showLoading(loadingMessage);
-  try {
-    const res = await fetch(url, options);
-    if (res.status === 401) {
-      hideLoading();
-      handleDashboardSessionExpired();
-      throw createDashboardSessionError('Session expired');
-    }
-    if (!res.ok) {
-      const errData = await res.json().catch(function(){return {};});
-      const errMsg = errData.error || errData.message || ('HTTP ' + res.status);
-      if (isDashboardSessionErrorMessage(errMsg)) {
-        hideLoading();
-        handleDashboardSessionExpired();
-        throw createDashboardSessionError('Session expired');
-      }
-      hideLoading();
-      showToast(errMsg, 'error');
-      var sfErr = new Error(errMsg);
-      sfErr.code = 'SAFE_FETCH_ERROR';
-      throw sfErr;
-    }
-    hideLoading();
-    return res;
-  } catch (e) {
-    hideLoading();
-    if (e.code !== 'DASHBOARD_SESSION_EXPIRED' && e.code !== 'SAFE_FETCH_ERROR') {
-      showToast(e.message || '通信エラーが発生しました', 'error');
-    }
-    throw e;
-  }
-}
-
-let selectedCompanyNos = new Set();
-let _settingsLoaded = false;
-let _settingsDirty = false;
-
-function rowMatchesCurrentFilter(tr) {
-  if (currentFilter === 'all') return true;
-  if (currentFilter === 'approachable') return tr.dataset.f !== 'excluded';
-  if (currentFilter === 'targeted') return tr.dataset.targeted === '1';
-  return tr.dataset.f === currentFilter;
-}
-
-function buildCompanySearchTextClient(company) {
-  const action = String((company && company.lastAction) || '').trim();
-  const actionAliases = {
-    awaiting_approval: '確認待ち awaiting approval',
-    confirm_reached: '確認画面 confirm ready',
-    form_fill: '入力済み 要対応 form fill',
-    submitted: '送信済み sent submitted',
-    error: 'エラー error failed',
-    skipped: 'スキップ skipped',
-  };
-  const values = [
-    company && company.name,
-    company && company.type,
-    company && company.lastAction,
-    actionAliases[action] || '',
-    company && company.progress,
-    company && company.formUrl,
-    company && company.url,
-    company && company.sentMessage,
-    company && company.manualReviewReason,
-    company && company.lastErrorDetail,
-    company && company.lastActionDetail,
-  ];
-  return values
-    .map((value) => String(value || '').trim().toLowerCase())
-    .filter(Boolean)
-    .join(' ');
-}
-
-function truncateUiTextClient(value, maxLength = 120) {
-  const text = String(value || '').trim();
-  if (!text) return '';
-  return text.length > maxLength ? text.slice(0, maxLength - 1) + '…' : text;
-}
-
-var _progressLabels = {
-  '': LANG === 'ja' ? '未アプローチ' : 'Not approached',
-  'site_analysis': LANG === 'ja' ? 'サイト分析済み' : 'Site analyzed',
-  'message_draft': LANG === 'ja' ? 'メッセージ生成済み' : 'Message drafted',
-  'form_fill': LANG === 'ja' ? 'フォーム入力済み' : 'Form filled',
-  'confirm_reached': LANG === 'ja' ? '確認画面到達' : 'Confirm reached',
-  'awaiting_approval': LANG === 'ja' ? '確認待ち' : 'Awaiting approval',
-  'submitted': LANG === 'ja' ? '送信済み' : 'Submitted',
-  'skipped': LANG === 'ja' ? 'スキップ済み' : 'Skipped',
-  'error': LANG === 'ja' ? 'エラー' : 'Error',
-};
-function getProgressLabel(action) {
-  return _progressLabels[action] || action;
-}
-
-function populateCompanyFilterOptions(companies) {
-  const typeSelect = document.getElementById('companyTypeFilter');
-  const progressSelect = document.getElementById('companyProgressFilter');
-  if (!typeSelect || !progressSelect) return;
-
-  const currentType = typeSelect.value || '';
-  const currentProgress = progressSelect.value || '';
-  const typeOptions = Array.from(new Set((companies || []).map((company) => String(company.type || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ja'));
-
-  // 進捗オプション: 実データ + 「未アプローチ」を追加
-  var progressSet = new Set();
-  var hasNoAction = false;
-  (companies || []).forEach(function(company) {
-    var action = String(company.lastAction || '').trim();
-    if (action) { progressSet.add(action); } else { hasNoAction = true; }
-  });
-  // 定義順でソート
-  var progressOrder = ['','site_analysis','message_draft','form_fill','confirm_reached','awaiting_approval','submitted','skipped','error'];
-  var progressOptions = progressOrder.filter(function(key) {
-    if (key === '') return hasNoAction;
-    return progressSet.has(key);
-  });
-  // progressOrderに含まれないカスタムアクションも追加
-  progressSet.forEach(function(action) { if (progressOrder.indexOf(action) === -1) progressOptions.push(action); });
-
-  typeSelect.innerHTML = '<option value="">' + (LANG === 'ja' ? '種別: すべて' : 'Type: All') + '</option>'
-    + typeOptions.map(function(value) { return '<option value="' + esc(value.toLowerCase()) + '">' + esc(value) + '</option>'; }).join('');
-  progressSelect.innerHTML = '<option value="">' + (LANG === 'ja' ? '進捗: すべて' : 'Progress: All') + '</option>'
-    + progressOptions.map(function(key) { return '<option value="' + esc(key === '' ? '__none__' : key.toLowerCase()) + '">' + esc(getProgressLabel(key)) + '</option>'; }).join('');
-
-  if (currentType && Array.from(typeSelect.options).some(function(option) { return option.value === currentType; })) typeSelect.value = currentType;
-  if (currentProgress && Array.from(progressSelect.options).some(function(option) { return option.value === currentProgress; })) progressSelect.value = currentProgress;
-}
-
-function populateSentTypeFilterOptions(companies) {
-  const typeSelect = document.getElementById('sentTypeFilter');
-  if (!typeSelect) return;
-  const currentType = String(typeSelect.value || '').trim().toLowerCase();
-  const typeOptions = Array.from(new Set((companies || []).map((company) => String(company.type || '').trim()).filter(Boolean)))
-    .sort((a, b) => a.localeCompare(b, LANG === 'ja' ? 'ja' : undefined));
-  typeSelect.innerHTML = '<option value="">' + (LANG === 'ja' ? '種別: すべて' : 'Type: All') + '</option>'
-    + typeOptions.map((value) => '<option value="' + esc(value.toLowerCase()) + '">' + esc(value) + '</option>').join('');
-  if (currentType && Array.from(typeSelect.options).some((option) => option.value === currentType)) {
-    typeSelect.value = currentType;
-  }
-}
-
-function applyCompanyFilters() {
-  const q = (document.getElementById('q').value || '').toLowerCase();
-  const typeFilter = (document.getElementById('companyTypeFilter')?.value || '').toLowerCase();
-  const progressFilter = (document.getElementById('companyProgressFilter')?.value || '').toLowerCase();
-  // リセットボタンの表示制御
-  const clearBtn = document.getElementById('clearFiltersBtn');
-  if (clearBtn) {
-    const hasFilter = q || typeFilter || progressFilter || currentFilter !== 'all';
-    clearBtn.classList.toggle('visible', !!hasFilter);
-  }
-  const visibleCompanyNos = new Set();
-  document.querySelectorAll('#mt tbody tr').forEach((tr) => {
-    const matchQ = !q || (tr.dataset.search || '').includes(q);
-    const matchType = !typeFilter || (tr.dataset.typeExact || '') === typeFilter;
-    const matchProgress = !progressFilter || (progressFilter === '__none__' ? !(tr.dataset.progressExact || '') : (tr.dataset.progressExact || '') === progressFilter);
-    const visible = matchQ && matchType && matchProgress && rowMatchesCurrentFilter(tr);
-    tr.style.display = visible ? '' : 'none';
-    if (visible) visibleCompanyNos.add(String(tr.dataset.no));
-  });
-  selectedCompanyNos = new Set(Array.from(selectedCompanyNos).filter((companyNo) => visibleCompanyNos.has(String(companyNo))));
-  syncCompanySelectionUi();
-}
-
-function clearAllFilters() {
-  document.getElementById('q').value = '';
-  const tf = document.getElementById('companyTypeFilter');
-  if (tf) tf.value = '';
-  const pf = document.getElementById('companyProgressFilter');
-  if (pf) pf.value = '';
-  currentFilter = 'all';
-  document.querySelectorAll('#tab-companies .fb').forEach(b => b.classList.remove('active'));
-  document.querySelector('#tab-companies .fb[data-f="all"]')?.classList.add('active');
-  applyCompanyFilters();
-}
-
-function syncCompanySelectionUi() {
-  document.querySelectorAll('.company-select').forEach((checkbox) => {
-    checkbox.checked = selectedCompanyNos.has(String(checkbox.dataset.no));
-  });
-
-  const visibleCheckboxes = Array.from(document.querySelectorAll('.company-select')).filter((checkbox) => {
-    const row = checkbox.closest('tr');
-    return row && row.style.display !== 'none';
-  });
-  const allVisibleChecked = visibleCheckboxes.length > 0 && visibleCheckboxes.every((checkbox) => selectedCompanyNos.has(String(checkbox.dataset.no)));
-  const master = document.getElementById('companySelectAll');
-  if (master) master.checked = allVisibleChecked;
-}
-
-function toggleCompanySelection(companyNo, checked) {
-  const key = String(companyNo);
-  if (checked) selectedCompanyNos.add(key);
-  else selectedCompanyNos.delete(key);
-  syncCompanySelectionUi();
-}
-
-function toggleAllCompanies(forceChecked) {
-  const visibleCheckboxes = Array.from(document.querySelectorAll('.company-select')).filter((checkbox) => {
-    const row = checkbox.closest('tr');
-    return row && row.style.display !== 'none' && !checkbox.disabled;
-  });
-  const nextChecked = typeof forceChecked === 'boolean'
-    ? forceChecked
-    : !(visibleCheckboxes.length > 0 && visibleCheckboxes.every((checkbox) => checkbox.checked));
-  visibleCheckboxes.forEach((checkbox) => {
-    const key = String(checkbox.dataset.no);
-    if (nextChecked) selectedCompanyNos.add(key);
-    else selectedCompanyNos.delete(key);
-  });
-  syncCompanySelectionUi();
-}
-
-function getSelectedCompanyNos() {
-  return Array.from(selectedCompanyNos).map((value) => {
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? numeric : value;
-  });
-}
-
-function openCompanyFormModal() {
-  document.getElementById('companyFormMode').value = 'create';
-  document.getElementById('companyFormCompanyNo').value = '';
-  document.getElementById('companyFormTitle').textContent = t('companyModal.title') || 'Add Company';
-  document.getElementById('companyFormSubmitBtn').textContent = t('companyModal.submit') || 'Add Company';
-  ['companyName', 'type', 'url', 'formUrl', 'status', 'progress', 'notes'].forEach((field) => {
-    const input = document.getElementById('new-' + field);
-    if (input) input.value = '';
-  });
-  const addTarget = document.getElementById('new-addTarget');
-  if (addTarget) addTarget.checked = true;
-  document.getElementById('companyFormModal').classList.add('open');
-}
-
-function closeCompanyFormModal() {
-  document.getElementById('companyFormModal').classList.remove('open');
-}
-
-function openCompanyEditModal(companyNo) {
-  const company = _allCompanies.find((entry) => String(entry.no) === String(companyNo));
-  if (!company) {
-    showToast(t('companyModal.loadFailed') || 'Could not load company data.', 'error');
-    return;
-  }
-
-  document.getElementById('companyFormMode').value = 'edit';
-  document.getElementById('companyFormCompanyNo').value = String(company.no);
-  document.getElementById('companyFormTitle').textContent = t('companyModal.editTitle') || 'Edit Company';
-  document.getElementById('companyFormSubmitBtn').textContent = t('companyModal.update') || 'Save Changes';
-  document.getElementById('new-companyName').value = company.name || '';
-  document.getElementById('new-type').value = company.type || '';
-  document.getElementById('new-url').value = company.url || '';
-  document.getElementById('new-formUrl').value = company.formUrl || '';
-  document.getElementById('new-status').value = company.status || '';
-  document.getElementById('new-progress').value = company.progress || '';
-  document.getElementById('new-notes').value = company.notes || '';
-  const addTarget = document.getElementById('new-addTarget');
-  if (addTarget) addTarget.checked = !!company.isOutreachTarget;
-  document.getElementById('companyFormModal').classList.add('open');
-}
-
-function handleCompanyRowClick(companyNo, event) {
-  const target = event && event.target ? event.target : null;
-  if (target && target.closest('a,button,input,textarea,select,label')) return;
-  const company = _allCompanies.find((entry) => String(entry.no) === String(companyNo));
-  if (!company) return;
-  if (company.canManageInTargetList) {
-    openCompanyEditModal(companyNo);
-    return;
-  }
-  showCompanyDetail(companyNo, event);
-}
-
-document.getElementById('companyFormModal').addEventListener('click', function (event) {
-  if (event.target === this) closeCompanyFormModal();
-});
-
-async function submitCompanyForm() {
-  const companyName = (document.getElementById('new-companyName').value || '').trim();
-  const mode = document.getElementById('companyFormMode').value || 'create';
-  const companyNo = document.getElementById('companyFormCompanyNo').value || '';
-  if (!companyName) {
-    showToast(t('companyModal.companyRequired') || 'Company name is required.', 'error');
-    return;
-  }
-
-  try {
-    const res = await fetch(mode === 'edit' ? ('/api/companies/' + encodeURIComponent(companyNo)) : '/api/companies', {
-      method: mode === 'edit' ? 'PUT' : 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        companyName,
-        type: document.getElementById('new-type').value,
-        url: document.getElementById('new-url').value,
-        formUrl: document.getElementById('new-formUrl').value,
-        status: document.getElementById('new-status').value,
-        progress: document.getElementById('new-progress').value,
-        notes: document.getElementById('new-notes').value,
-        addToTarget: document.getElementById('new-addTarget').checked,
-      }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || (mode === 'edit' ? 'Failed to update company.' : 'Failed to add company.'));
-
-    closeCompanyFormModal();
-    showToast(mode === 'edit' ? (t('companyModal.updated') || 'Company updated.') : (t('companyModal.added') || 'Company added.'), 'success');
-    refreshData();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-async function deleteCompanyRow(companyNo) {
-  const company = _allCompanies.find((entry) => String(entry.no) === String(companyNo));
-  if (!company) {
-    showToast(t('companyModal.loadFailed') || 'Could not load company data.', 'error');
-    return;
-  }
-
-  if (!confirm(t('companyModal.deleteConfirm', { company: company.name || String(companyNo) }))) return;
-
-  try {
-    const res = await fetch('/api/companies/' + encodeURIComponent(companyNo), {
-      method: 'DELETE',
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to delete company.');
-    selectedCompanyNos.delete(String(companyNo));
-    showToast(t('companyModal.deleted') || 'Company deleted.', 'success');
-    removeAwaitingCardFromUi(companyNo);
-    removeCompanyRowFromUi(companyNo);
-    refreshAfterMutation();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-async function bulkDeleteCompanies() {
-  const companyNos = getSelectedCompanyNos();
-  if (companyNos.length === 0) {
-    alert(t('alert.selectCompanies'));
-    return;
-  }
-
-  if (!confirm(t('confirm.bulkDeleteCompanies', { count: companyNos.length }))) return;
-
-  try {
-    const res = await fetch('/api/companies/bulk-delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ companyNos }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to delete selected companies.');
-    selectedCompanyNos = new Set();
-    showToast(t('companyModal.bulkDeleted', { count: result.deletedCount || companyNos.length }) || 'Selected companies deleted.', 'success');
-    if (result.skippedCount > 0) {
-      showToast((LANG === 'ja' ? '一部の行は削除対象外のためスキップしました。' : 'Some rows were skipped because they are not deletable.'), 'info');
-    }
-    companyNos.forEach((companyNo) => {
-      removeAwaitingCardFromUi(companyNo);
-      removeCompanyRowFromUi(companyNo);
-    });
-    refreshAfterMutation();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-function triggerCompanyImport() {
-  const input = document.getElementById('companyImportInput');
-  input.value = '';
-  input.click();
-}
-
-function downloadSettingsWorkbook(mode) {
-  const selectedMode = mode === 'template' ? 'template' : 'current';
-  const link = document.createElement('a');
-  link.href = withSessionQuery('/api/settings/excel/export?mode=' + encodeURIComponent(selectedMode));
-  link.rel = 'noopener';
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
-
-function triggerSettingsWorkbookImport() {
-  const input = document.getElementById('settingsWorkbookImportInput');
-  if (!input) return;
-  input.value = '';
-  input.click();
-}
-
-function describeImportedSettingsSections(sectionKeys) {
-  const labels = {
-    companyProfile: t('settings.companyProfile') || 'Company Profile',
-    valuePropositions: t('settings.valuePropositions') || 'Value Propositions',
-  };
-  return (sectionKeys || []).map((key) => labels[key] || key).join(' / ');
-}
-
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
-document.getElementById('companyImportInput').addEventListener('change', async (event) => {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
-
-  try {
-    showToast((t('action.importTargets') || 'Importing') + ': ' + file.name, 'info');
-    const contentBase64 = arrayBufferToBase64(await file.arrayBuffer());
-    const res = await fetch('/api/target-list/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: file.name, contentBase64 }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Import failed.');
-
-    showToast((t('companyImport.success') || 'Imported') + ': ' + (result.companyCount || 0), 'success');
-    refreshData();
-    loadTargetPreview().catch(() => {});
-  } catch (e) {
-    showToast((t('companyImport.failed') || 'Import failed') + ': ' + e.message, 'error');
-  } finally {
-    event.target.value = '';
-  }
-});
-
-document.getElementById('settingsWorkbookImportInput').addEventListener('change', async (event) => {
-  const file = event.target.files && event.target.files[0];
-  if (!file) return;
-
-  try {
-    showToast((t('settings.excel.importing') || 'Importing Excel') + ': ' + file.name, 'info');
-    const contentBase64 = arrayBufferToBase64(await file.arrayBuffer());
-    const res = await fetch('/api/settings/excel/import', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: file.name, contentBase64 }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Import failed.');
-
-    await loadSettings({ force: true });
-    showToast((t('settings.excel.importSuccess') || 'Imported settings') + ': ' + describeImportedSettingsSections(result.applied), 'success');
-  } catch (e) {
-    showToast((t('settings.excel.importFailed') || 'Import failed') + ': ' + e.message, 'error');
-  } finally {
-    event.target.value = '';
-  }
-});
-
-async function markSelectedTargets(active) {
-  const companyNos = getSelectedCompanyNos();
-  if (companyNos.length === 0) {
-    alert(t('alert.selectCompanies'));
-    return;
-  }
-
-  try {
-    const res = await fetch('/api/outreach-targets', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ companyNos, active }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to update targets.');
-    showToast(active ? (t('target.updatedOn') || 'Outreach targets updated.') : (t('target.updatedOff') || 'Outreach targets removed.'), 'success');
-    refreshData();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-async function prepareSelectedOutreach() {
-  const companyNos = getSelectedCompanyNos();
-  if (companyNos.length === 0) { alert(t('alert.selectCompanies')); return; }
-  const providerId = _currentAiProvider;
-  const providerLabel = getAiProviderLabel(providerId);
-  if (!confirm(t('outreach.prepareConfirm', { company: companyNos.length + '社' }))) return;
-  try {
-    const res = await fetch('/api/ai-form-fill', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ companyNos, provider: providerId }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to start');
-    showToast(t('outreach.queueStarted', { count: companyNos.length }) + ' (' + providerLabel + ')', 'success');
-    refreshData();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-async function prepareOutreach(companyNo, companyName) {
-  if (!confirm(t('outreach.prepareConfirm', { company: companyName }))) return;
-  const providerId = _currentAiProvider;
-  const providerLabel = getAiProviderLabel(providerId);
-  selectedCompanyNos.add(String(companyNo));
-  syncCompanySelectionUi();
-  try {
-    const res = await fetch('/api/ai-form-fill', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ companyNos: [companyNo], provider: providerId }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to start');
-    showToast(t('outreach.singleQueued', { company: companyName }) + ' (' + providerLabel + ')', 'success');
-    refreshData();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-function outreachStatusBadge(status, detail) {
-  if (!status) return '';
-  const label = status === 'pending' ? (t('outreach.status.pending') || 'Queued')
-    : status === 'processing' ? (t('outreach.status.processing') || 'Processing')
-    : status === 'awaiting_approval' ? (t('outreach.status.awaiting') || 'Awaiting')
-    : status === 'error' ? (t('outreach.status.error') || 'Error')
-    : esc(status);
-  const className = status === 'error' ? 'chip chip-error'
-    : status === 'awaiting_approval' ? 'chip chip-warning'
-    : status === 'processing' ? 'chip chip-info'
-    : 'chip chip-primary';
-  return '<span class="' + className + '" title="' + esc(detail || label) + '">' + label + '</span>';
-}
-
-let renderVersion = 0;
-let lastScreenshotRenderSignature = '';
-let refreshInFlight = false;
-let pendingRefresh = false;
-let refreshStartedAt = 0;
-let refreshAbortController = null;
-let mutationRefreshTimer = null;
-let mutationRefreshFollowupTimer = null;
-let scheduledRefreshTimer = null;
-let scheduledRefreshForce = false;
-let _latestDashboardData = null;
-let analyticsInitScheduled = false;
-let analyticsInitialized = false;
-let es = null;
-let reconnectTimer = null;
-let offlinePollTimer = null;
-let hiddenRefreshPending = false;
-let hiddenCliLogBuffer = [];
-
-function screenshotUrl(fileName) {
-  return withSessionQuery('/screenshots/' + encodeURIComponent(fileName) + '?v=' + renderVersion);
-}
-
-function monitorScreenshotUrl(monitor) {
-  const fileName = monitor && monitor.latestScreenshotName ? monitor.latestScreenshotName : '';
-  return fileName ? screenshotUrl(fileName) : '';
-}
-
-function buildScreenshotRenderSignature(data) {
-  const liveMonitor = data && data.liveMonitor ? data.liveMonitor : {};
-  const companies = Array.isArray(data && data.companies) ? data.companies : [];
-  const parts = companies
-    .filter((company) => company && (company.inputScreenshotName || company.confirmScreenshotName || company.lastAction === 'awaiting_approval' || company.lastAction === 'confirm_reached'))
-    .map((company) => [
-      company.no,
-      company.inputScreenshotName || '',
-      company.confirmScreenshotName || '',
-      company.screenshotAuditState || '',
-      company.lastAction || '',
-      company.lastActionAt || '',
-    ].join(':'));
-  parts.push(liveMonitor.latestScreenshotName || '', liveMonitor.updatedAt || '', liveMonitor.companyNo || '');
-  return parts.join('|');
-}
-
-function syncScreenshotRenderVersion(data) {
-  const signature = buildScreenshotRenderSignature(data);
-  if (signature !== lastScreenshotRenderSignature) {
-    lastScreenshotRenderSignature = signature;
-    renderVersion += 1;
-  }
-}
-
-function buildCompanyTableRenderKey(companies) {
-  return JSON.stringify((companies || []).map((company) => [
-    company.no,
-    company.name || '',
-    company.type || '',
-    company.url || '',
-    company.formUrl || '',
-    company.lastAction || '',
-    company.lastActionAt || '',
-    company.outreachStatus || '',
-    company.outreachDetail || '',
-    company.contactCount || 0,
-    company.isApproachable ? 1 : 0,
-    company.isOutreachTarget ? 1 : 0,
-    company.isDetachedFromTargetList ? 1 : 0,
-    company.canManageInTargetList ? 1 : 0,
-    company.sentAt || '',
-    company.awaitingAt || '',
-    company.lastErrorDetail || '',
-    company.manualReviewReason || '',
-    company.readyForApproval ? 1 : 0,
-    company.readyForManualApproval ? 1 : 0,
-    company.directSubmitDetected ? 1 : 0,
-    company.sentMessage ? company.sentMessage.slice(0, 120) : '',
-    company.inputScreenshotName || '',
-    company.confirmScreenshotName || '',
-    company.screenshotAuditState || '',
-  ]));
-}
-
-function buildRecentLogsRenderKey(recentLogs) {
-  return JSON.stringify((recentLogs || []).map((log) => [
-    log.timestamp || '',
-    log.companyNo || '',
-    log.companyName || '',
-    log.action || '',
-    typeof log.details === 'object' ? JSON.stringify(log.details) : (log.details || ''),
-  ]));
-}
-
-function buildAwaitingListRenderKey(companies) {
-  return JSON.stringify((companies || [])
-    .filter((company) => company && (company.lastAction === 'awaiting_approval' || (company.lastAction === 'confirm_reached' && !company.sentAt)))
-    .map((company) => [
-      company.no,
-      company.name || '',
-      company.type || '',
-      company.lastAction || '',
-      company.awaitingAt || '',
-      company.sentMessage || '',
-      company.formUrl || '',
-      company.inputScreenshotName || '',
-      company.confirmScreenshotName || '',
-      company.screenshotAuditState || '',
-      company.readyForApproval ? 1 : 0,
-      company.readyForManualApproval ? 1 : 0,
-      company.manualReviewReason || '',
-      company.manualReviewDetail || '',
-      company.directSubmitDetected ? 1 : 0,
-    ]));
-}
-
-function buildSentListRenderKey(companies) {
-  return JSON.stringify((companies || [])
-    .filter((company) => company && company.sentAt)
-    .map((company) => [
-      company.no,
-      company.name || '',
-      company.type || '',
-      company.sentAt || '',
-      company.formUrl || '',
-      company.contactCount || 0,
-      company.sentMessage || '',
-      company.inputScreenshotName || '',
-      company.confirmScreenshotName || '',
-      JSON.stringify(company.contactHistory || []),
-    ]));
-}
-
-function buildLiveMonitorRenderKey(monitor) {
-  if (!monitor) return '';
-  return JSON.stringify({
-    status: monitor.status || '',
-    updatedAt: monitor.updatedAt || '',
-    activeCount: monitor.activeCount || 0,
-    companyNo: monitor.companyNo || '',
-    companyName: monitor.companyName || '',
-    step: monitor.step || '',
-    currentUrl: monitor.currentUrl || '',
-    latestScreenshotName: monitor.latestScreenshotName || '',
-    events: (monitor.events || []).map((event) => [
-      event.companyNo || '',
-      event.companyName || '',
-      event.status || '',
-      event.step || '',
-      event.updatedAt || '',
-      event.currentUrl || '',
-      event.latestScreenshotName || '',
-    ]),
-  });
-}
-
-function applyPerformanceMode(companies) {
-  const companyCount = Array.isArray(companies) ? companies.length : 0;
-  const shouldEnable = BUILD_SOURCE === 'installed' || companyCount >= 150;
-  document.body.classList.toggle('perf-mode', shouldEnable);
-}
-
-function ensureAnalyticsInitialized() {
-  if (analyticsInitialized || analyticsInitScheduled) return;
-  analyticsInitScheduled = true;
-  const trigger = () => {
-    ensureChartAssets()
-      .then(() => {
-        initCharts();
-        analyticsInitialized = true;
-        if (typeof _latestDashboardData !== 'undefined' && _latestDashboardData) updateCharts(_latestDashboardData);
-      })
-      .catch(() => {})
-      .finally(() => {
-        analyticsInitScheduled = false;
-      });
-  };
-  if (typeof requestIdleCallback === 'function') {
-    requestIdleCallback(trigger, { timeout: BUILD_SOURCE === 'installed' ? 4500 : 1500 });
-  } else {
-    setTimeout(trigger, BUILD_SOURCE === 'installed' ? 2800 : 800);
-  }
-}
-
-function requestDashboardRefresh(options = {}) {
-  if (document.hidden && !options.force) return;
-  const delay = Number.isFinite(Number(options.delay)) ? Math.max(0, Number(options.delay)) : 120;
-  if (options.force) scheduledRefreshForce = true;
-  if (scheduledRefreshTimer) return;
-  scheduledRefreshTimer = setTimeout(() => {
-    const shouldForce = scheduledRefreshForce;
-    scheduledRefreshTimer = null;
-    scheduledRefreshForce = false;
-    refreshData({ force: shouldForce, toastOnError: !!options.toastOnError });
-  }, delay);
-}
-
-function getMonitorStatusMeta(status) {
-  const normalizedStatus = status || 'idle';
-  const labels = {
-    idle: LANG === 'ja' ? '待機中' : 'Idle',
-    queued: LANG === 'ja' ? 'キュー投入済み' : 'Queued',
-    processing: LANG === 'ja' ? '処理中' : 'Processing',
-    awaiting_approval: LANG === 'ja' ? '確認待ち' : 'Awaiting Approval',
-    completed: LANG === 'ja' ? '完了' : 'Completed',
-    submitted: LANG === 'ja' ? '送信済み' : 'Submitted',
-    skipped: LANG === 'ja' ? 'スキップ' : 'Skipped',
-    user_required: LANG === 'ja' ? '要対応' : 'User Required',
-    error: LANG === 'ja' ? 'エラー' : 'Error',
-  };
-  const styles = {
-    idle: { bg: 'var(--surface-low)', fg: 'var(--on-surface-variant)' },
-    queued: { bg: 'var(--surface-container)', fg: 'var(--primary)' },
-    processing: { bg: 'var(--info-container)', fg: 'var(--info)' },
-    awaiting_approval: { bg: 'var(--warning-container)', fg: 'var(--warning)' },
-    completed: { bg: 'var(--success-container)', fg: 'var(--success)' },
-    submitted: { bg: 'var(--success-container)', fg: 'var(--success)' },
-    skipped: { bg: 'var(--surface-low)', fg: 'var(--on-surface-variant)' },
-    user_required: { bg: 'var(--warning-container)', fg: 'var(--warning)' },
-    error: { bg: 'var(--error-container)', fg: 'var(--error)' },
-  };
-  const dotColors = {
-    processing: '#3b82f6',
-    awaiting_approval: '#f59e0b',
-    user_required: '#f59e0b',
-    error: '#ef4444',
-    submitted: '#10b981',
-    completed: '#10b981',
-    queued: '#6366f1',
-    skipped: '#94a3b8',
-    idle: '#94a3b8',
-  };
-  return {
-    status: normalizedStatus,
-    label: labels[normalizedStatus] || normalizedStatus,
-    tone: styles[normalizedStatus] || styles.idle,
-    dotColor: dotColors[normalizedStatus] || '#94a3b8',
-  };
-}
-
-function buildMonitorActivityFeed(monitor) {
-  const monitorEvents = monitor && Array.isArray(monitor.events)
-    ? monitor.events
-        .filter(Boolean)
-        .map((event) => ({ ...event, sourceType: 'monitor' }))
-    : [];
-  const cliEvents = Array.isArray(_monitorCliFeed)
-    ? _monitorCliFeed.map((event) => ({ ...event, sourceType: 'cli' }))
-    : [];
-  return [...cliEvents, ...monitorEvents]
-    .sort((a, b) => new Date(b.updatedAt || b.time || 0).getTime() - new Date(a.updatedAt || a.time || 0).getTime())
-    .slice(0, 30);
-}
-
-function pushMonitorCliEvent(message, type, time) {
-  const normalizedType = String(type || 'info').toLowerCase();
-  const status = normalizedType === 'error'
-    ? 'error'
-    : normalizedType === 'warn' || normalizedType === 'warning'
-      ? 'user_required'
-      : normalizedType === 'thinking' || normalizedType === 'step'
-        ? 'processing'
-        : normalizedType === 'action'
-          ? 'queued'
-          : 'idle';
-  const step = String(message || '').trim();
-  if (!step) return;
-  const now = Date.now();
-  if (_lastPtyProgressNotice.text === step && (now - _lastPtyProgressNotice.at) < 1200) return;
-  _lastPtyProgressNotice = { text: step, at: now };
-  const entry = {
-    companyName: LANG === 'ja' ? 'CLI通知' : 'CLI Activity',
-    companyNo: null,
-    step,
-    status,
-    updatedAt: time || new Date().toISOString(),
-  };
-  _monitorCliFeed = [entry, ..._monitorCliFeed]
-    .filter((event, index, list) => index === list.findIndex((candidate) =>
-      candidate.step === event.step && candidate.status === event.status && candidate.updatedAt === event.updatedAt))
-    .slice(0, 20);
-  if (!_liveMonitorOpen) {
-    _monitorUnreadCount += 1;
-    updateMonitorBadge();
-    showMonitorToast(entry.companyName, step, status);
-  }
-  if (_latestDashboardData && _latestDashboardData.liveMonitor) {
-    renderLiveMonitor(_latestDashboardData.liveMonitor);
-  }
-}
-
-function renderLiveMonitor(monitor) {
-  _currentLiveMonitorState = monitor || null;
-  const statusEl = document.getElementById('monitorStatusChip');
-  const updatedAtEl = document.getElementById('monitorUpdatedAt');
-  const activeSummaryEl = document.getElementById('monitorActiveSummary');
-  const eventListEl = document.getElementById('monitorEventList');
-  const companyEl = document.getElementById('monitorCompany');
-  const stepEl = document.getElementById('monitorStep');
-  const urlEl = document.getElementById('monitorCurrentUrl');
-  const screenshotWrap = document.getElementById('monitorScreenshotWrap');
-  const screenshotLink = document.getElementById('monitorScreenshotLink');
-  if (!statusEl || !updatedAtEl || !activeSummaryEl || !eventListEl || !companyEl || !stepEl || !urlEl || !screenshotWrap || !screenshotLink) return;
-
-  const status = monitor && monitor.status ? monitor.status : 'idle';
-  const locale = LANG === 'ja' ? 'ja-JP' : undefined;
-  const statusMeta = getMonitorStatusMeta(status);
-  const rawMonitorEvents = monitor && Array.isArray(monitor.events) ? monitor.events : [];
-  const events = buildMonitorActivityFeed(monitor);
-  const activeCount = monitor && Number.isFinite(Number(monitor.activeCount)) ? Number(monitor.activeCount) : 0;
-  _monitorBaseStatus = statusMeta.status;
-  statusEl.textContent = statusMeta.label;
-  statusEl.style.background = statusMeta.tone.bg;
-  statusEl.style.color = statusMeta.tone.fg;
-  const dot = document.getElementById('monitorDot');
-  if (dot) {
-    dot.style.background = statusMeta.dotColor;
-    dot.className = status === 'processing' ? 'monitor-dot-active' : '';
-  }
-  updatedAtEl.textContent = monitor && monitor.updatedAt ? new Date(monitor.updatedAt).toLocaleString(locale) : '-';
-  activeSummaryEl.textContent = activeCount > 0
-    ? (LANG === 'ja'
-        ? (activeCount + '件進行中 / 最新: ' + statusMeta.label)
-        : (activeCount + ' active / latest: ' + statusMeta.label))
-    : (events.length > 0
-        ? (LANG === 'ja' ? '直近の処理履歴を表示しています' : 'Showing recent activity')
-        : (LANG === 'ja' ? '待機中' : 'Idle'));
-  companyEl.textContent = monitor && monitor.companyName ? ((monitor.companyNo ? '#' + monitor.companyNo + ' ' : '') + monitor.companyName) : (LANG === 'ja' ? '実行待ち' : 'Waiting');
-  stepEl.textContent = monitor && monitor.step ? monitor.step : (LANG === 'ja' ? 'まだ処理は開始されていません' : 'No active step');
-
-  if (events.length === 0) {
-    eventListEl.innerHTML = '<div style="padding:18px 14px;color:var(--outline);font-size:.78rem">' + (LANG === 'ja' ? 'まだ進行状況ログはありません。' : 'No progress log yet.') + '</div>';
-  } else {
-    eventListEl.innerHTML = events.slice(0, 20).map((event, index) => {
-      const eventStatus = event && event.status ? event.status : 'idle';
-      const eventMeta = getMonitorStatusMeta(eventStatus);
-      const dotColor = eventMeta.dotColor;
-      const companyLabel = event && event.companyName
-        ? ((event.companyNo ? '#' + event.companyNo + ' ' : '') + event.companyName)
-        : (LANG === 'ja' ? '対象未設定' : 'Unknown target');
-      const stepLabel = event && event.step ? event.step : '';
-      const timeLabel = event && event.updatedAt ? new Date(event.updatedAt).toLocaleTimeString(locale, { hour:'2-digit', minute:'2-digit' }) : '--:--';
-      return ''
-        + '<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 14px' + (index === 0 ? ';background:rgba(59,130,246,.03)' : '') + '">'
-        +   '<span style="width:8px;height:8px;border-radius:50%;background:' + dotColor + ';flex-shrink:0;margin-top:4px"></span>'
-        +   '<div style="min-width:0;flex:1">'
-        +     '<div style="display:flex;align-items:baseline;gap:6px">'
-        +       '<span style="font-size:.72rem;font-weight:700;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(companyLabel) + '</span>'
-        +       '<span style="font-size:.56rem;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0">' + esc(timeLabel) + '</span>'
-        +     '</div>'
-        +     (stepLabel ? '<div style="font-size:.66rem;color:var(--text-2);margin-top:1px;line-height:1.35">' + esc(stepLabel) + '</div>' : '')
-        +   '</div>'
-        +   '<span style="font-size:.54rem;font-weight:700;padding:1px 6px;border-radius:999px;background:' + eventMeta.tone.bg + ';color:' + eventMeta.tone.fg + ';flex-shrink:0;white-space:nowrap;margin-top:2px">' + esc(eventMeta.label) + '</span>'
-        + '</div>';
-    }).join('');
-  }
-
-  if (monitor && monitor.currentUrl) {
-    urlEl.textContent = monitor.currentUrl;
-    urlEl.href = monitor.currentUrl;
-    urlEl.style.pointerEvents = 'auto';
-    urlEl.style.color = 'var(--primary)';
-  } else {
-    urlEl.textContent = '-';
-    urlEl.href = '#';
-    urlEl.style.pointerEvents = 'none';
-    urlEl.style.color = 'var(--outline)';
-  }
-
-  const screenshotHref = monitorScreenshotUrl(monitor);
-  if (screenshotHref) {
-    screenshotLink.href = screenshotHref;
-    screenshotLink.style.display = 'inline';
-    screenshotWrap.innerHTML = ''
-      + '<img src="' + screenshotHref + '"'
-      + ' alt="Latest screenshot"'
-      + ' style="width:100%;min-width:100%;height:auto;display:block;flex:0 0 auto;border:1px solid var(--outline-variant);cursor:pointer;background:#fff"'
-      + ' onclick="window.open(this.src)"'
-      + ' onerror="this.parentElement.innerHTML=(LANG===\\'ja\\'?\\'スクリーンショット待機中\\':\\'Waiting for screenshot\\')">';
-  } else {
-    screenshotLink.href = '#';
-    screenshotLink.style.display = 'none';
-    screenshotWrap.innerHTML = LANG === 'ja' ? 'スクリーンショット待機中' : 'Waiting for screenshot';
-  }
-
-  // Chat-bot style notification when panel is closed
-  if (typeof _lastMonitorEventCount !== 'undefined' && rawMonitorEvents.length > _lastMonitorEventCount && _lastMonitorEventCount > 0) {
-    const newCount = rawMonitorEvents.length - _lastMonitorEventCount;
-    if (!_liveMonitorOpen) {
-      _monitorUnreadCount += newCount;
-      updateMonitorBadge();
-      const latest = rawMonitorEvents[0];
-      if (latest) {
-        const cLabel = latest.companyName ? ((latest.companyNo ? '#' + latest.companyNo + ' ' : '') + latest.companyName) : '-';
-        showMonitorToast(cLabel, latest.step || '-', latest.status || 'idle');
-      }
-    }
-  }
-  _lastMonitorEventCount = rawMonitorEvents.length;
-}
-
-function renderStatusBanner(data) {
-  const btn = document.getElementById('memoBtn');
-  const panel = document.getElementById('memoPanel');
-  const badge = document.getElementById('memoBadge');
-  const issues = Array.isArray(data.issues) ? data.issues.filter(Boolean) : [];
-  if (issues.length === 0) {
-    btn.classList.remove('has-issues');
-    panel.classList.remove('open');
-    panel.innerHTML = '';
-    return;
-  }
-
-  const runtime = data.runtime || null;
-  const runtimeMeta = runtime && runtime.url
-    ? '<div class="status-meta">Runtime: <a href="' + esc(runtime.url) + '" target="_blank">' + esc(runtime.url) + '</a></div>'
-    : '';
-
-  badge.textContent = issues.length;
-  btn.classList.add('has-issues');
-  panel.innerHTML =
-    '<strong>' + (LANG === 'ja' ? '運用メモ' : 'Operational Notice') + '</strong>' +
-    '<ul>' + issues.map(issue => '<li>' + esc(issue) + '</li>').join('') + '</ul>' +
-    runtimeMeta;
-}
-
-function toggleMemoPanel() {
-  const panel = document.getElementById('memoPanel');
-  panel.classList.toggle('open');
-}
-
-// Close memo panel on outside click
-document.addEventListener('click', function(e) {
-  const panel = document.getElementById('memoPanel');
-  const btn = document.getElementById('memoBtn');
-  if (panel && btn && !panel.contains(e.target) && !btn.contains(e.target)) {
-    panel.classList.remove('open');
-  }
-});
-
-async function refreshData(options = {}) {
-  if (document.hidden && !options.force) return;
-  const isForce = !!options.force;
-  const now = Date.now();
-  if (refreshInFlight) {
-    if (isForce || (refreshStartedAt && (now - refreshStartedAt) > 8000)) {
-      try { if (refreshAbortController) refreshAbortController.abort(); } catch (_) {}
-      refreshInFlight = false;
-      refreshStartedAt = 0;
-      refreshAbortController = null;
-      pendingRefresh = false;
-    } else {
-      pendingRefresh = true;
-      return;
-    }
-  }
-
-  refreshInFlight = true;
-  refreshStartedAt = Date.now();
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  refreshAbortController = controller;
-  const timeoutId = setTimeout(() => {
-    try {
-      if (refreshAbortController === controller && controller) controller.abort();
-    } catch (_) {}
-  }, 8000);
-
-  try {
-    const res = await fetch('/api/data', { cache: 'no-store', signal: controller ? controller.signal : undefined });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to load dashboard data.');
-    if (!isForce && data && data.cacheKey && data.cacheKey === _lastDashboardDataCacheKey) {
-      return;
-    }
-    render(data);
-    _lastDashboardDataCacheKey = data && data.cacheKey ? data.cacheKey : '';
-  } catch (e) {
-    const isAbort = !!(e && (e.name === 'AbortError' || /aborted|abort/i.test(String(e.message || ''))));
-    if (!isAbort) {
-      renderStatusBanner({ issues: [e.message] });
-      if (options.toastOnError) showToast((LANG === 'ja' ? '読込失敗: ' : 'Load failed: ') + e.message, 'error');
-    } else if (options.toastOnError) {
-      showToast((LANG === 'ja' ? '読込がタイムアウトしました。再試行します。' : 'Dashboard refresh timed out. Retrying.'), 'warning');
-    }
-  } finally {
-    clearTimeout(timeoutId);
-    if (refreshAbortController === controller) refreshAbortController = null;
-    refreshInFlight = false;
-    refreshStartedAt = 0;
-    if (pendingRefresh) {
-      pendingRefresh = false;
-      refreshData();
-    }
-  }
-}
-
-function render(data){
-  syncScreenshotRenderVersion(data);
-  _latestDashboardData = data;
-  renderStatusBanner(data);
-  const{companies,stats,recentLogs,liveMonitor}=data;
-  const activeTab = getActiveMainTab();
-  _allCompanies=companies;
-  applyPerformanceMode(companies);
-  const liveMonitorKey = buildLiveMonitorRenderKey(liveMonitor);
-  if (_renderSectionKeys.liveMonitor !== liveMonitorKey) {
-    renderLiveMonitor(liveMonitor);
-    _renderSectionKeys.liveMonitor = liveMonitorKey;
-    markSectionRendered('liveMonitor', liveMonitorKey);
-  }
-
-  // Stats
-  updateStat('s-approachable', stats.approachable);
-  updateStat('s-hasFormUrl', stats.hasFormUrl);
-  updateStat('s-formFill', stats.actionNeeded);
-  updateStat('s-awaitingApproval', stats.awaitingApproval);
-  updateStat('s-submitted', stats.submitted);
-  updateStat('s-error', stats.error);
-  updateStat('s-excluded', stats.excluded);
-  if (activeTab === 'companies') ensureAnalyticsInitialized();
-
-  // Company table
-  const companyTableKey = buildCompanyTableRenderKey(companies);
-  const validCompanyNos = new Set(companies.filter((company) => company.canManageInTargetList).map((company) => String(company.no)));
-  selectedCompanyNos = new Set(Array.from(selectedCompanyNos).filter((companyNo) => validCompanyNos.has(companyNo)));
-  const shouldRenderCompaniesNow = activeTab === 'companies' && shouldRenderSection('companies', companyTableKey);
-  if (shouldRenderCompaniesNow) {
-    const body=document.getElementById('companyBody');
-    const oldRows={};
-    body.querySelectorAll('tr').forEach(tr=>oldRows[tr.dataset.no]=tr.dataset.la);
-
-    let html='';
-    companies.forEach(c=>{
-    const f=!c.isApproachable?'excluded':c.lastAction==='submitted'?'submitted':c.lastAction==='error'?'error':c.formUrl?'has-form':'no-form';
-    const excl=c.isApproachable?'':'excluded';
-    const isNew=oldRows[c.no]!==undefined&&oldRows[c.no]!==(c.lastAction||'');
-    const upd=isNew?' updated':'';
-
-    const display=currentFilter==='all'?'':currentFilter==='approachable'?(f!=='excluded'?'':'none'):currentFilter==='targeted'?(c.isOutreachTarget?'':'none'):(f===currentFilter?'':'none');
-
-    const cnt=c.contactCount||0;
-    const cntHtml=cnt===0?'<span class="text-muted">-</span>':cnt===1?'<span class="badge bg-success">1x</span>':'<span class="badge bg-info">'+cnt+'x</span>';
-    const sentDateLabel=c.sentAt?new Date(c.sentAt).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'';
-    const sentCellHtml=c.sentAt
-      ? '<div style="display:flex;flex-direction:column;gap:2px;align-items:center"><span style="font-size:.72rem;font-family:var(--font-mono);color:#198754;font-weight:700">'+esc(sentDateLabel)+'</span>'+(cnt>0?'<span style="font-size:.62rem;color:var(--outline)">'+cnt+'x</span>':'')+'</div>'
-      : cntHtml;
-
-    let msgHtml='<span class="text-muted" style="font-size:.72rem">' + esc(t('message.notLogged') || '-') + '</span>';
-    if(c.sentMessage){
-      const preview=esc(c.sentMessage).substring(0,50);
-      msgHtml='<span class="text-muted" style="font-size:.75rem;cursor:pointer" title="Click to view full message" onclick="showMsg('+c.no+')">'+preview+'...</span>';
-    }
-
-    const targetBadge=c.isOutreachTarget?'<span class="chip chip-primary">'+(t('target.badge')||'Target')+'</span>':'';
-    const detachedBadge=c.isDetachedFromTargetList?'<span class="chip">'+(LANG==='ja'?'履歴のみ':'History only')+'</span>':'';
-    const queueBadge=outreachStatusBadge(c.outreachStatus,c.outreachDetail);
-    const companyUrlHtml=c.url?'<a href="'+esc(c.url)+'" target="_blank">'+esc(c.name)+'</a>':'<span>'+esc(c.name)+'</span>';
-    const manualBadge=(c.readyForManualApproval&&['awaiting_approval','confirm_reached'].includes(c.lastAction||''))?'<span class="chip chip-warning" title="'+esc(c.manualReviewDetail||c.manualReviewReason||'')+'">'+esc(truncateUiTextClient(c.manualReviewReason || (LANG==='ja'?'手動送信待ち':'Manual action required'), 40))+'</span>':'';
-    const directSubmitBadge=(c.directSubmitDetected&&['awaiting_approval','confirm_reached'].includes(c.lastAction||''))?'<span class="chip chip-warning" title="'+esc(c.manualReviewDetail||c.manualReviewReason||'')+'">'+(LANG==='ja'?'直接送信型の可能性':'Direct-submit form')+'</span>':'';
-    const errorBadge=(c.lastAction==='error'&&c.lastErrorDetail)?'<span class="chip chip-error" title="'+esc(c.lastErrorDetail)+'">'+esc(truncateUiTextClient(c.lastErrorDetail, 48))+'</span>':'';
-    const progressMeta=[queueBadge, manualBadge, directSubmitBadge, errorBadge].filter(Boolean).join('');
-    const progressHtml=(c.lastAction?actionBadge(c.lastAction):'<span class="text-muted">-</span>')+(progressMeta?'<div class="company-meta">'+progressMeta+'</div>':'');
-    const searchText=buildCompanySearchTextClient(c);
-
-    let actionHtml='';
-    const cname=esc(c.name).replace(/'/g,"\\'");
-    if(c.lastAction==='awaiting_approval'||c.lastAction==='confirm_reached'){
-      const reviewBtnLabel = LANG==='ja' ? 'フォーム確認' : 'Review Form';
-      actionHtml='<div class="company-action-grid">'
-        +'<button class="btn btn-primary btn-sm company-action-btn" onclick="openFormReview('+c.no+')">'+reviewBtnLabel+'</button>'
-        +'<button class="btn btn-success btn-sm company-action-btn" onclick="approveCompany('+c.no+',\\x27'+cname+'\\x27,\\x27sent\\x27)">'+t('action.markSent')+'</button>'
-        +'<button class="btn btn-outline-secondary btn-sm company-action-btn" onclick="skipWithFeedback('+c.no+',\\x27'+cname+'\\x27)">'+t('action.skip')+'</button>'
-        +(c.canManageInTargetList
-          ? '<button class="btn btn-outline-secondary btn-sm company-action-btn" onclick="openCompanyEditModal('+c.no+')">'+(t('action.editCompany')||'Edit')+'</button>'
-            +'<button class="btn btn-outline-danger btn-sm company-action-btn" onclick="deleteCompanyRow('+c.no+')">'+(t('action.deleteCompany')||'Delete')+'</button>'
-          : '<span class="company-action-btn text-muted" style="border:1px dashed var(--border-default);background:var(--bg-surface)">'+(LANG==='ja'?'履歴のみ':'History only')+'</span>'
-            +'<button class="btn btn-outline-danger btn-sm company-action-btn" onclick="deleteCompanyRow('+c.no+')">'+(t('action.deleteCompany')||'Delete')+'</button>')
-        +'</div>';
-    }else if(c.lastAction==='submitted'){
-      actionHtml='<span style="font-size:.7rem;color:#198754">'+t('action.done')+'</span>';
-    }else if(c.outreachStatus==='pending'||c.outreachStatus==='processing'){
-      actionHtml='<small class="text-muted">'+esc(c.outreachDetail||'Processing')+'</small>';
-    }else if(c.isApproachable){
-      actionHtml='<button class="btn btn-outline-primary btn-sm" onclick="prepareOutreach('+c.no+',\\x27'+cname+'\\x27)">'+(t('action.prepareOutreach')||'Prepare')+'</button>';
-    }
-
-    const manageHtml=c.canManageInTargetList
-      ? '<div class="company-action-grid single-row">'
-        +'<button class="btn btn-outline-secondary btn-sm company-action-btn" onclick="openCompanyEditModal('+c.no+')">'+(t('action.editCompany')||'Edit')+'</button>'
-        +'<button class="btn btn-outline-danger btn-sm company-action-btn" onclick="deleteCompanyRow('+c.no+')">'+(t('action.deleteCompany')||'Delete')+'</button>'
-        +'</div>'
-      : '<div class="company-action-grid single-row">'
-        +'<span class="company-action-btn text-muted" style="border:1px dashed var(--border-default);background:var(--bg-surface)">'+(LANG==='ja'?'履歴のみ':'History only')+'</span>'
-        +'<button class="btn btn-outline-danger btn-sm company-action-btn" onclick="deleteCompanyRow('+c.no+')">'+(t('action.deleteCompany')||'Delete')+'</button>'
-        +'</div>';
-    actionHtml = actionHtml ? actionHtml : manageHtml;
-    const selectTitle = c.canManageInTargetList
-      ? (LANG==='ja'?'この行を選択':'Select this row')
-      : (LANG==='ja'?'履歴のみの行も削除対象として選択できます':'History-only rows can also be selected for deletion');
-    const selectCellHtml = '<input type="checkbox" class="form-check-input company-select" data-manageable="'+(c.canManageInTargetList?'1':'0')+'" data-no="'+c.no+'" title="'+selectTitle+'" onchange="toggleCompanySelection('+c.no+', this.checked)">';
-
-    html+='<tr class="'+excl+upd+'" data-f="'+f+'" data-targeted="'+(c.isOutreachTarget?'1':'0')+'" data-n="'+esc(c.name).toLowerCase()+'" data-no="'+c.no+'" data-la="'+(c.lastAction||'')+'" data-type="'+esc(c.type).toLowerCase()+'" data-type-exact="'+esc((c.type||'').trim().toLowerCase())+'" data-cnt="'+cnt+'" data-sent-at="'+(c.sentAt?new Date(c.sentAt).getTime():0)+'" data-progress="'+(c.lastAction||'')+'" data-progress-exact="'+esc((c.lastAction||'').trim().toLowerCase())+'" data-search="'+esc(searchText)+'" style="display:'+display+'" onclick="handleCompanyRowClick('+c.no+',event)">'
-      +'<td class="checkbox-cell" onclick="event.stopPropagation()">'+selectCellHtml+'</td>'
-      +'<td>'+c.no+'</td>'
-      +'<td title="'+esc(c.name)+(c.isOutreachTarget?' [営業対象]':'')+(c.isDetachedFromTargetList?' [履歴のみ]':'')+'">'+companyUrlHtml+((targetBadge||detachedBadge)?'<div class="company-meta">'+targetBadge+detachedBadge+'</div>':'')+'</td>'
-      +'<td title="'+esc(c.type)+'"><small>'+esc(c.type)+'</small></td>'
-      +'<td title="'+esc(c.lastAction||'-')+(c.lastErrorDetail?' | '+esc(c.lastErrorDetail):'')+'">'+progressHtml+'</td>'
-      +'<td class="text-center">'+sentCellHtml+'</td>'
-      +'<td title="'+esc(c.formUrl||'-')+'">'+(c.formUrl?'<a href="'+esc(c.formUrl)+'" target="_blank" onclick="event.stopPropagation()" title="'+esc(c.formUrl)+'">'+esc(c.formUrl).substring(0,30)+'…</a>':'-')+'</td>'
-      +'<td title="'+(c.sentMessage?esc(c.sentMessage).substring(0,100):'')+'">'+msgHtml+'</td>'
-      +'<td class="action-cell" onclick="event.stopPropagation()">'+actionHtml+'</td>'
-      +'</tr>';
-    });
-    body.innerHTML=html;
-    populateCompanyFilterOptions(companies);
-    syncCompanySelectionUi();
-    applyCompanyFilters();
-    _renderSectionKeys.companyTable = companyTableKey;
-    markSectionRendered('companies', companyTableKey);
-  }
-
-  // Log table
-  const recentLogsKey = buildRecentLogsRenderKey(recentLogs);
-  const logCountEl = document.getElementById('logCount');
-  if (logCountEl) logCountEl.textContent = recentLogs.length + ' items';
-  const shouldRenderLogsNow = activeTab === 'logs' && shouldRenderSection('logs', recentLogsKey);
-  if (shouldRenderLogsNow) {
-    const lbody=document.getElementById('logBody');
-    lbody.innerHTML=recentLogs.map(l=>{
-      const t=new Date(l.timestamp).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
-      const actionBg={error:'#da1e28',submitted:'#198038',confirm_reached:'#f59e0b',analyzing:'#0043ce',form_fill:'#6929c4',skip:'#6f6f6f'};
-      const bg=actionBg[l.action]||'#393939';
-      const fgDark=['confirm_reached'];
-      const fg=fgDark.includes(l.action)?'#000':'#fff';
-      const d=typeof l.details==='object'?JSON.stringify(l.details):l.details||'';
-      return'<tr><td class="ts">'+t+'</td><td>'+l.companyNo+'</td><td>'+esc(l.companyName)+'</td>'
-        +'<td><span style="background:'+bg+';color:'+fg+';font-size:.62rem;font-weight:700;padding:1px 8px;letter-spacing:.04em;white-space:nowrap">'+esc(l.action)+'</span></td>'
-        +'<td><small style="color:var(--on-surface-variant)">'+esc(d).substring(0,120)+'</small></td></tr>';
-    }).join('');
-    _renderSectionKeys.recentLogs = recentLogsKey;
-    markSectionRendered('logs', recentLogsKey);
-  }
-
-  // Awaiting list
-  const awaitingCompanies=companies.filter(c=>
-    c.lastAction==='awaiting_approval'||
-    (c.lastAction==='confirm_reached'&&!c.sentAt)
-  );
-  document.getElementById('awaitingCount').textContent=awaitingCompanies.length||'';
-  const awaitingListKey = buildAwaitingListRenderKey(companies);
-  const shouldRenderAwaitingNow = activeTab === 'awaiting' && shouldRenderSection('awaiting', awaitingListKey);
-  if (shouldRenderAwaitingNow) {
-    const awEl=document.getElementById('awaitingList');
-    if(awaitingCompanies.length===0){
-      awEl.innerHTML='<div class="text-center text-muted py-4">'+t('awaiting.empty')+'</div>';
-    }else{
-      awEl.innerHTML=awaitingCompanies.map(c=>{
-      const date=c.awaitingAt?new Date(c.awaitingAt).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ}):'-';
-      const msgBody=c.sentMessage
-        ? esc(c.sentMessage).split(String.fromCharCode(10)).join('<br>')
-        : '<span style="color:var(--error);font-weight:700">' + t('message.missingDraft') + '</span>';
-      const screenshotState=c.screenshotAuditState||'missing';
-      const inputScreenshotSrc=c.inputScreenshotName?screenshotUrl(c.inputScreenshotName):'';
-      const confirmScreenshotSrc=c.confirmScreenshotName?screenshotUrl(c.confirmScreenshotName):'';
-      const primaryScreenshotSrc=confirmScreenshotSrc||inputScreenshotSrc;
-      const manualReason=esc(c.manualReviewReason || (LANG==='ja' ? 'ブラウザで手動送信してください。' : 'Complete the final submission manually in the browser.'));
-      const manualDetail=esc(c.manualReviewDetail || c.manualReviewReason || '');
-      const manualBanner=(screenshotState==='manual-send-pending'||screenshotState==='direct-submit')
-        ? '<div style="background:var(--warning-container);color:var(--warning);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+manualReason+(manualDetail?'<div style="margin-top:6px;font-weight:600;color:var(--on-surface-variant)">'+manualDetail+'</div>':'')+'</div>'
-        : '';
-      const inputOnlyBanner=screenshotState==='input-only'
-        ? '<div style="background:var(--warning-container);color:var(--warning);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+t('awaiting.auditInputOnly')+'</div>'
-        : '';
-      const ssConfirm=screenshotState==='confirm'
-        ?'<img src="'+confirmScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Confirm screenshot">'
-        : (screenshotState==='manual-send-pending'||screenshotState==='direct-submit')
-          ?'<div style="display:flex;flex-direction:column;gap:6px">'+(primaryScreenshotSrc?'<img src="'+primaryScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Input screenshot">':'')+'<div style="background:var(--warning-container);color:var(--warning);font-size:.68rem;font-weight:700;padding:8px 10px;line-height:1.6">'+manualReason+'</div></div>'
-        : screenshotState==='input-only'
-          ?'<div style="display:flex;flex-direction:column;gap:6px"><img src="'+inputScreenshotSrc+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" alt="Input screenshot"><div style="background:var(--warning-container);color:var(--warning);font-size:.68rem;font-weight:700;padding:8px 10px;line-height:1.6">'+t('awaiting.auditPartial')+'</div></div>'
-          :'<div style="background:var(--error-container);color:var(--error);font-size:.72rem;font-weight:700;padding:12px;line-height:1.7;border:1px solid var(--error);min-height:140px;display:flex;align-items:center;justify-content:center;text-align:center">'+t('awaiting.auditMissingScreenshot')+'</div>';
-      const auditBadge=screenshotState==='confirm'
-        ?'<span style="background:var(--success-container);color:var(--success);font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('awaiting.auditReady')+'</span>'
-        : screenshotState==='direct-submit'
-          ?'<span style="background:var(--warning-container);color:var(--warning);font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+(LANG==='ja'?'直接送信型':'Direct-submit')+'</span>'
-        : screenshotState==='manual-send-pending'
-          ?'<span style="background:var(--warning-container);color:var(--warning);font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+(LANG==='ja'?'手動送信待ち':'Manual send required')+'</span>'
-        : screenshotState==='input-only'
-          ?'<span style="background:var(--warning-container);color:var(--warning);font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('awaiting.auditPartial')+'</span>'
-          :'<span style="background:var(--error-container);color:var(--error);font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('awaiting.auditMissingScreenshot')+'</span>';
-      const cname=esc(c.name).replace(/'/g,"\\'");
-      return'<div class="awaiting-card" data-no="'+c.no+'" data-name="'+cname+'" data-state="'+esc(c.lastAction||'')+'" data-has-input="'+(c.hasInputScreenshot?'1':'0')+'" data-has-confirm="'+(c.hasConfirmScreenshot?'1':'0')+'" data-has-any="'+(c.hasAnyScreenshot?'1':'0')+'" data-ready-approval="'+(c.readyForApproval?'1':'0')+'" data-manual-approval="'+(c.readyForManualApproval?'1':'0')+'" data-screenshot-state="'+esc(screenshotState)+'" style="background:#fff;border:1px solid var(--outline-variant);border-left:3px solid var(--primary);margin-bottom:12px">'
-        +'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant);background:var(--surface-low)">'
-        +'<div style="display:flex;align-items:center;gap:10px">'
-        +'<input type="checkbox" class="form-check-input awaiting-check" data-no="'+c.no+'" style="width:16px;height:16px;cursor:pointer">'
-        +'<span style="background:#f59e0b;color:#000;font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('awaiting.badge')+'</span>'
-        +auditBadge
-        +'<strong style="font-size:.88rem">'+esc(c.name)+'</strong>'
-        +'<span style="font-size:.72rem;color:var(--on-surface-variant);background:var(--surface-container);padding:2px 8px">'+esc(c.type)+'</span>'
-        +'</div>'
-        +'<span style="font-size:.7rem;color:var(--on-surface-variant);font-family:var(--font-mono)">'+date+'</span>'
-        +'</div>'
-        +'<div style="display:flex">'
-        +'<div style="width:200px;min-width:200px;border-right:1px solid var(--outline-variant);overflow-y:auto;max-height:400px;padding:10px;background:var(--surface-lowest)">'
-        +ssConfirm
-        +'</div>'
-        +'<div style="flex:1;padding:14px 16px;display:flex;flex-direction:column;gap:12px">'
-        +((screenshotState==='manual-send-pending'||screenshotState==='direct-submit')?manualBanner:(screenshotState==='input-only'?inputOnlyBanner:(screenshotState!=='confirm'?'<div style="background:var(--error-container);color:var(--error);padding:10px 12px;font-size:.72rem;font-weight:700;line-height:1.6">'+t('awaiting.auditBlocked')+'</div>':'')))
-        +'<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">'
-        +'<div style="font-size:.62rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--outline)">'+t('awaiting.messageTitle')+'</div>'
-        +(c.sentMessage?'<button class="btn btn-outline-secondary btn-sm py-0 px-1" style="font-size:.68rem" onclick="showMsg('+c.no+')">'+t('message.openFull')+'</button>':'')
-        +'</div>'
-        +'<div style="font-size:.82rem;background:var(--surface-low);padding:12px;white-space:pre-wrap;line-height:1.7;max-height:300px;overflow-y:auto;border:1px solid var(--outline-variant)">'+msgBody+'</div>'
-        +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--outline-variant)">'
-        +'<button class="btn btn-success btn-sm" onclick="approveCompany('+c.no+',\\x27'+cname+'\\x27,\\x27sent\\x27)">'+t('action.markSent')+'</button>'
-        +'<button class="btn btn-outline-danger btn-sm" onclick="skipWithFeedback('+c.no+',\\x27'+cname+'\\x27)">'+t('action.skip')+'</button>'
-        +'<button class="btn btn-outline-danger btn-sm" onclick="deleteCompanyRow('+c.no+')">'+(t('action.deleteCompany')||'Delete')+'</button>'
-        +'<small style="margin-left:auto;font-size:.7rem;color:var(--outline)">'+(c.formUrl?'<a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a>':(LANG==='ja'?'フォームURL未記録':'No form URL recorded'))+'</small>'
-        +'</div>'
-        +'</div>'
-        +'</div>'
-        +'</div>';
-    }).join('');
-  }
-    markSectionRendered('awaiting', awaitingListKey);
-    _renderSectionKeys.awaitingList = awaitingListKey;
-  }
-
-  // Sent list
-  const sentCompanies=companies.filter(c=>c.sentAt).sort((a,b)=>new Date(b.sentAt)-new Date(a.sentAt));
-  document.getElementById('sentCount').textContent=sentCompanies.length+' '+(LANG==='ja'?'件':'items');
-  const sentListKey = buildSentListRenderKey(companies);
-  const shouldRenderSentNow = activeTab === 'sent' && shouldRenderSection('sent', sentListKey);
-  if (shouldRenderSentNow) {
-    const sentEl=document.getElementById('sentList');
-    populateSentTypeFilterOptions(sentCompanies);
-    if(sentCompanies.length===0){
-      sentEl.innerHTML='<div class="text-center text-muted py-4">'+t('sent.empty')+'</div>';
-    }else{
-      sentEl.innerHTML=sentCompanies.map(c=>{
-      const count=c.contactCount||1;
-      const countBadge=count>=2?'<span style="background:#0052dd;color:#fff;font-size:.62rem;font-weight:700;padding:1px 8px;margin-left:4px">'+count+'x</span>':'<span style="background:#6f6f6f;color:#fff;font-size:.62rem;font-weight:700;padding:1px 8px;margin-left:4px">1st</span>';
-      let historyHtml='';
-      if(c.contactHistory&&c.contactHistory.length>0){
-        historyHtml='<div style="margin-top:12px;border-top:1px solid var(--outline-variant);padding-top:10px">'
-          +'<div style="font-size:.65rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--on-surface-variant);margin-bottom:8px">'+t('sent.contactHistory')+'</div>'
-          +'<div style="position:relative;padding-left:20px">'
-          +'<div style="position:absolute;left:6px;top:4px;bottom:4px;width:1px;background:var(--outline-variant)"></div>';
-        historyHtml+=c.contactHistory.map((h,i)=>{
-          const d=new Date(h.date).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
-          let respBg='#6f6f6f',respText=t('sent.replyWaiting');
-          if(h.response==='replied'||h.response==='\u8fd4\u4fe1\u3042\u308a'){respBg='#198038';respText=h.response;}
-          else if(h.response==='meeting'||h.response==='\u5546\u8ac7\u8a2d\u5b9a'){respBg='#0052dd';respText=h.response;}
-          else if(h.response){respBg='#8a3800';respText=h.response;}
-          const resp='<span style="background:'+respBg+';color:#fff;font-size:.6rem;font-weight:700;padding:1px 7px;letter-spacing:.04em">'+esc(respText)+'</span>';
-          return'<div style="position:relative;margin-bottom:8px;background:var(--surface-low);border:1px solid var(--outline-variant);padding:8px 12px">'
-            +'<div style="position:absolute;left:-17px;top:50%;transform:translateY(-50%);width:8px;height:8px;background:var(--primary)"></div>'
-            +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
-            +'<span style="font-size:.72rem;font-family:var(--font-mono);font-weight:700;color:var(--on-surface)">#'+(i+1)+'</span>'
-            +'<div style="display:flex;align-items:center;gap:8px">'+resp+'<span style="font-size:.65rem;color:var(--on-surface-variant);font-family:var(--font-mono)">'+d+'</span></div>'
-            +'</div>'
-            +'<div style="font-size:.75rem;color:var(--on-surface-variant);cursor:pointer" onclick="var n=this.nextElementSibling;n.style.display=n.style.display===\\x27none\\x27?\\x27block\\x27:\\x27none\\x27">'+esc(h.message||'').substring(0,80)+'... <span style="color:var(--primary)">'+t('sent.showFull')+'</span></div>'
-            +'<div style="display:none;white-space:pre-wrap;background:#fff;padding:8px;border:1px solid var(--outline-variant);margin-top:6px;font-size:.78rem;max-height:180px;overflow-y:auto">'+esc(h.message||'').split(String.fromCharCode(10)).join('<br>')+'</div>'
-            +(h.notes?'<div style="margin-top:4px;font-size:.7rem;color:var(--on-surface-variant)">Note: '+esc(h.notes)+'</div>':'')
-            +'</div>';
-        }).join('');
-        historyHtml+='</div></div>';
-      }
-      const date=new Date(c.sentAt).toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
-      const msg=esc(c.sentMessage||'').split(String.fromCharCode(10)).join('<br>');
-      const ssSent=c.sentScreenshotName?'<img src="'+screenshotUrl(c.sentScreenshotName)+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant);margin-bottom:6px" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Sent screenshot">':'';
-      const ssInput=c.inputScreenshotName?'<img src="'+screenshotUrl(c.inputScreenshotName)+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant);margin-bottom:6px" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Input screenshot">':'';
-      const ssConfirm=c.confirmScreenshotName?'<img src="'+screenshotUrl(c.confirmScreenshotName)+'" style="width:100%;height:auto;display:block;cursor:pointer;border:1px solid var(--outline-variant)" onclick="window.open(this.src)" onerror="this.style.display=\\x27none\\x27" title="Confirm screenshot">':'';
-      return'<div class="sent-card" data-sn="'+esc((c.name+' '+c.type+' '+(c.sentMessage||'')+' '+(c.formUrl||'')).toLowerCase())+'" data-sc="'+count+'" data-type-exact="'+esc(String(c.type || '').trim().toLowerCase())+'" style="background:#fff;border:1px solid var(--outline-variant);border-left:3px solid #198038;margin-bottom:12px">'
-        +'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--outline-variant);background:var(--surface-low)">'
-        +'<div style="display:flex;align-items:center;gap:6px">'
-        +'<span style="background:#198038;color:#fff;font-size:.62rem;font-weight:700;padding:2px 8px;letter-spacing:.05em">'+t('sent.badge')+'</span>'
-        +countBadge
-        +'<strong style="font-size:.88rem;margin-left:4px">'+esc(c.name)+'</strong>'
-        +'<span style="font-size:.72rem;color:var(--on-surface-variant);background:var(--surface-container);padding:2px 8px">'+esc(c.type)+'</span>'
-        +'</div>'
-        +'<span style="font-size:.7rem;color:var(--on-surface-variant);font-family:var(--font-mono)">'+(LANG==='ja'?'送信日時: ':'Sent: ')+date+'</span>'
-        +'</div>'
-        +'<div style="display:flex">'
-        +'<div style="flex:1;padding:14px 16px">'
-        +'<div style="font-size:.82rem;background:var(--surface-low);padding:12px;white-space:pre-wrap;line-height:1.7;max-height:240px;overflow-y:auto;border:1px solid var(--outline-variant)">'+msg+'</div>'
-        +historyHtml
-        +(c.formUrl?'<div style="margin-top:8px;font-size:.7rem;color:var(--outline)"><a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></div>':'<div style="margin-top:8px;font-size:.7rem;color:var(--outline)">'+(LANG==='ja'?'フォームURL未記録':'Form URL not recorded')+'</div>')
-        +'</div>'
-        +'<div style="width:160px;min-width:160px;border-left:1px solid var(--outline-variant);padding:10px;background:var(--surface-lowest);overflow-y:auto;max-height:400px">'
-        +ssSent+ssInput+ssConfirm
-        +'</div>'
-        +'</div>'
-        +'</div>';
-    }).join('');
-  }
-    applySentFilter();
-    markSectionRendered('sent', sentListKey);
-    _renderSectionKeys.sentList = sentListKey;
-  }
-
-  const _ts = new Date().toLocaleString(LANG==='ja'?'ja-JP':undefined,{timeZone:PREF_TZ});
-  document.getElementById('lastUpdate').textContent=t('app.lastUpdate')+': '+_ts;
-  const _sl=document.getElementById('sidebarLastUpdate');if(_sl)_sl.textContent=_ts;
-  const _hl=document.getElementById('headerLastUpdate');if(_hl)_hl.textContent=_ts;
-  updatePipeline(stats);
-  if (typeof _analyticsOpen !== 'undefined' && _analyticsOpen && analyticsInitialized) updateCharts(data);
-}
-
-// Approve / Skip
-function getAwaitingCardMeta(companyNo) {
-  const card = document.querySelector('.awaiting-card[data-no="' + companyNo + '"]');
-  if (!card) return null;
-  return {
-    state: card.dataset.state || '',
-    hasInput: card.dataset.hasInput === '1',
-    hasConfirm: card.dataset.hasConfirm === '1',
-    hasAny: card.dataset.hasAny === '1',
-    readyForApproval: card.dataset.readyApproval === '1',
-    manualApproval: card.dataset.manualApproval === '1',
-    screenshotState: card.dataset.screenshotState || 'missing',
-  };
-}
-
-function getAwaitingDecisionBlockReason(companyNo, decision) {
-  if (decision === 'skip') {
-    return '';
-  }
-  const cardMeta = getAwaitingCardMeta(companyNo);
-  if (cardMeta && !['awaiting_approval', 'confirm_reached'].includes(cardMeta.state)) {
-    return t('audit.blockedInvalidState',{state:cardMeta.state||'-'});
-  }
-  if (decision === 'sent' && cardMeta && !cardMeta.readyForApproval) {
-    return t('audit.blockedMissingScreenshot');
-  }
-  return '';
-}
-
-function isDashboardSessionErrorMessage(message) {
-  return /dashboard session token|session token|認証|セッション/i.test(String(message || ''));
-}
-
-function createDashboardSessionError(message) {
-  const error = new Error(message || 'Dashboard session expired.');
-  error.code = 'DASHBOARD_SESSION_EXPIRED';
-  return error;
-}
-
-function handleDashboardSessionExpired() {
-  const message = LANG === 'ja'
-    ? 'ダッシュボードの認証が切れました。画面を再読み込みします。'
-    : 'Dashboard session expired. Reloading the page.';
-  try { showToast(message, 'warning'); } catch (_) {}
-  setTimeout(() => {
-    try { window.location.reload(); } catch (_) {}
-  }, 400);
-}
-
-async function submitApprovalDecision(companyNo, companyName, decision, feedback) {
-  const res = await fetch('/api/approve', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ companyNo, companyName, decision, feedback: feedback || '' }),
-  });
-  const d = await res.json().catch(() => ({}));
-  if (res.status === 401 || isDashboardSessionErrorMessage(d.error || d.message || '')) {
-    throw createDashboardSessionError(d.error || d.message || 'Dashboard session expired.');
-  }
-  if (!res.ok || !d.ok) {
-    throw new Error(d.error || 'Unknown');
-  }
-  return d;
-}
-
-function updateAwaitingListUiState() {
-  const list = document.getElementById('awaitingList');
-  const count = list ? list.querySelectorAll('.awaiting-card').length : 0;
-  const badge = document.getElementById('awaitingCount');
-  if (badge) badge.textContent = count || '';
-  if (list && count === 0) {
-    list.innerHTML = '<div class="text-center text-muted py-4">' + t('awaiting.empty') + '</div>';
-  }
-}
-
-function removeAwaitingCardFromUi(companyNo) {
-  const cards = Array.from(document.querySelectorAll('.awaiting-card[data-no="' + String(companyNo) + '"]'));
-  cards.forEach((card) => card.remove());
-  updateAwaitingListUiState();
-  return cards.length;
-}
-
-function removeCompanyRowFromUi(companyNo) {
-  const row = document.querySelector('#companyBody tr[data-no="' + String(companyNo) + '"]');
-  if (!row) return false;
-  row.remove();
-  return true;
-}
-
-function refreshAfterMutation() {
-  if (mutationRefreshTimer) clearTimeout(mutationRefreshTimer);
-  if (mutationRefreshFollowupTimer) clearTimeout(mutationRefreshFollowupTimer);
-  mutationRefreshTimer = setTimeout(() => {
-    mutationRefreshTimer = null;
-    requestDashboardRefresh({ force: true, delay: 0 });
-  }, 250);
-  mutationRefreshFollowupTimer = setTimeout(() => {
-    mutationRefreshFollowupTimer = null;
-    requestDashboardRefresh({ force: true, delay: 0 });
-  }, 900);
-}
-
-// ── Form Review (WebContentsView) ──────────────────────────────────────
-let _formReviewOverlayEl = null;
-
-async function openFormReview(companyNo) {
-  try {
-    const sessRes = await fetch('/api/form-session', { headers: { 'x-dashboard-token': DASHBOARD_SESSION_TOKEN } });
-    if (!sessRes.ok) {
-      showToast(LANG === 'ja' ? 'Electronモード以外では利用できません' : 'Only available in Electron mode', 'warn');
-      return;
-    }
-    const sessions = await sessRes.json();
-    const session = (sessions.sessions || []).find(s => String(s.companyNo) === String(companyNo));
-    if (!session) {
-      showToast(LANG === 'ja' ? 'フォームセッションが見つかりません。先にAIを実行してください。' : 'No form session found. Run AI first.', 'warn');
-      return;
-    }
-    await fetch('/api/form-session/' + session.id + '/show', { method: 'POST', headers: { 'x-dashboard-token': DASHBOARD_SESSION_TOKEN } });
-    _showFormReviewOverlay();
-  } catch (e) {
-    console.error('[openFormReview]', e);
-  }
-}
-
-function _showFormReviewOverlay() {
-  if (_formReviewOverlayEl) return;
-  const el = document.createElement('div');
-  el.id = 'formReviewOverlay';
-  el.style.cssText = 'position:fixed;top:0;right:0;width:55%;height:100%;pointer-events:none;z-index:9999;';
-  el.innerHTML = '<button onclick="closeFormReview()" style="position:absolute;top:8px;right:8px;z-index:10000;pointer-events:auto;background:#1e293b;color:#fff;border:none;border-radius:6px;padding:4px 12px;font-size:.8rem;cursor:pointer;">' + (LANG === 'ja' ? '✕ 閉じる' : '✕ Close') + '</button>';
-  document.body.appendChild(el);
-  _formReviewOverlayEl = el;
-}
-
-async function closeFormReview() {
-  try {
-    await fetch('/api/form-session/active/hide', { method: 'POST', headers: { 'x-dashboard-token': DASHBOARD_SESSION_TOKEN } }).catch(() => {});
-  } catch (_) {}
-  if (_formReviewOverlayEl) { _formReviewOverlayEl.remove(); _formReviewOverlayEl = null; }
-}
-
-async function approveCompany(companyNo,companyName,decision){
-  const blockedReason = getAwaitingDecisionBlockReason(companyNo, decision);
-  if (blockedReason) {
-    alert(blockedReason);
-    return;
-  }
-  if(!confirm(decision==='sent'?t('confirm.markSent',{company:companyName}):t('confirm.skip',{company:companyName})))return;
-  try{
-    await submitApprovalDecision(companyNo, companyName, decision, '');
-    removeAwaitingCardFromUi(companyNo);
-    refreshAfterMutation();
-  }catch(e){
-    if (e && e.code === 'DASHBOARD_SESSION_EXPIRED') {
-      handleDashboardSessionExpired();
-      return;
-    }
-    alert(t('alert.commError')+': '+e.message);
-  }
-}
-
-// Show full message
-let _allCompanies=[];
-function showCompanyDetail(no, event) {
-  if (event && event.target.tagName === 'A') return;
-  const c = _allCompanies.find(x => x.no === no);
-  if (!c) return;
-  const e2 = esc; // esc() includes &, <, >, ", ' escaping
-  const cnt = c.contactCount || 0;
-  const sc = {error:'#ef4444',submitted:'#10b981',awaiting_approval:'#f59e0b',confirm_reached:'#f59e0b',form_fill:'#6366f1',analyzing:'#3b82f6',site_analysis:'#3b82f6',skipped:'#94a3b8'}[c.lastAction] || '#94a3b8';
-  const overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.45);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';
-  overlay.onclick = () => overlay.remove();
-  const box = document.createElement('div');
-  box.style.cssText = 'background:#fff;border-radius:14px;padding:0;max-width:640px;width:100%;max-height:85vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.25)';
-  box.onclick = e => e.stopPropagation();
-  const chips = (c.type ? '<span style="font-size:.7rem;color:#64748b;background:#f1f5f9;padding:1px 8px;border-radius:4px">'+e2(c.type)+'</span>' : '')
-    + (c.isOutreachTarget ? '<span style="font-size:.68rem;color:#2563eb;background:#eff6ff;padding:1px 8px;border-radius:4px;font-weight:600">営業対象</span>' : '')
-    + (c.isDetachedFromTargetList ? '<span style="font-size:.68rem;color:#94a3b8;background:#f8fafc;padding:1px 8px;border-radius:4px">履歴のみ</span>' : '')
-    + (cnt > 0 ? '<span style="font-size:.68rem;color:#fff;background:#10b981;padding:1px 8px;border-radius:4px;font-weight:600">'+cnt+'回送信済</span>' : '');
-  const formUrlHtml = c.formUrl
-    ? '<a href="'+e2(c.formUrl)+'" target="_blank" style="font-size:.75rem;color:#2563eb;word-break:break-all">'+e2(c.formUrl)+'</a>'
-    : '<div style="font-size:.8rem;color:#94a3b8">-</div>';
-  const errorHtml = (c.lastErrorDetail || c.manualReviewReason)
-    ? '<div style="padding:10px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px"><div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#ef4444;margin-bottom:4px">詳細 / エラー</div><div style="font-size:.78rem;color:#7f1d1d;line-height:1.5">'+e2(c.lastErrorDetail || c.manualReviewReason)+'</div></div>'
-    : '';
-  const urlHtml = c.url
-    ? '<div style="padding:8px 12px;background:#f8fafc;border-radius:8px"><div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:3px">企業URL</div><a href="'+e2(c.url)+'" target="_blank" style="font-size:.78rem;color:#2563eb">'+e2(c.url)+'</a></div>'
-    : '';
-  const msgHtml2 = c.sentMessage
-    ? '<div><div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:6px">送信メッセージ</div><div style="white-space:pre-wrap;font-size:.82rem;line-height:1.7;background:#f8fafc;padding:14px;border-radius:8px;border:1px solid #e2e8f0;color:#1e293b">'+e2(c.sentMessage)+'</div></div>'
-    : '<div style="padding:10px 12px;background:#f8fafc;border-radius:8px;font-size:.8rem;color:#94a3b8">送信メッセージなし</div>';
-  window._cdClose = () => overlay.remove();
-  const closeBtn = document.createElement('button');
-  closeBtn.textContent = '\u2715';
-  closeBtn.style.cssText = 'background:none;border:none;font-size:1.2rem;color:#94a3b8;cursor:pointer;padding:0;line-height:1;flex-shrink:0';
-  closeBtn.onclick = () => overlay.remove();
-  box.innerHTML =
-    '<div id="cd-header" style="padding:16px 20px;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'
-    + '<div><div style="font-size:1rem;font-weight:700;color:#0f172a;margin-bottom:3px">'+e2(c.name)+'</div>'
-    + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'+chips+'</div></div>'
-    + '</div>'
-    + '<div style="overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:12px">'
-    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">'
-    + '<div style="padding:10px 12px;background:#f8fafc;border-radius:8px"><div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:4px">進捗</div>'
-    + '<div style="font-size:.82rem;font-weight:600;color:'+sc+'">'+e2(c.lastAction || '-')+'</div></div>'
-    + '<div style="padding:10px 12px;background:#f8fafc;border-radius:8px"><div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:4px">フォームURL</div>'+formUrlHtml+'</div>'
-    + '</div>'
-    + errorHtml + urlHtml + msgHtml2
-    + '</div>';
-  box.querySelector('#cd-header').appendChild(closeBtn);
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-}
-
-function showMsg(no){
-  const c=_allCompanies.find(x=>x.no===no);
-  if(!c||!c.sentMessage)return;
-  const overlay=document.createElement('div');
-  overlay.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center';
-  overlay.onclick=()=>overlay.remove();
-  const box=document.createElement('div');
-  box.style.cssText='background:#fff;border-radius:12px;padding:24px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.2)';
-  box.onclick=e=>e.stopPropagation();
-  const cnt=c.contactCount||0;
-  box.innerHTML='<div class="d-flex justify-content-between align-items-center mb-3"><div><strong>'+esc(c.name)+'</strong> <small class="text-muted">'+esc(c.type)+'</small>'
-    +(cnt>0?' <span class="badge bg-'+(cnt>=2?'info':'success')+'">'+cnt+'x sent</span>':'')
-    +'</div><button class="btn-close" onclick="this.closest(\\x27div[style]\\x27).remove()"></button></div>'
-    +'<div style="white-space:pre-wrap;font-size:.85rem;line-height:1.7;background:#f8f9fa;padding:16px;border-radius:8px">'+esc(c.sentMessage)+'</div>'
-    +(c.formUrl?'<div class="mt-2" style="font-size:.75rem;color:#888">Target: <a href="'+esc(c.formUrl)+'" target="_blank">'+esc(c.formUrl)+'</a></div>':'');
-  overlay.appendChild(box);
-  document.body.appendChild(overlay);
-}
-
-// Skip with feedback
-async function skipWithFeedback(companyNo, companyName) {
-  const blockedReason = getAwaitingDecisionBlockReason(companyNo, 'skip');
-  if (blockedReason) {
-    alert(blockedReason);
-    return;
-  }
-  const feedback = prompt(t('confirm.skipReason', {company: companyName}));
-  if (feedback === null) return;
-  try {
-    await submitApprovalDecision(companyNo, companyName, 'skip', feedback || '');
-    removeAwaitingCardFromUi(companyNo);
-    refreshAfterMutation();
-  } catch (e) {
-    if (e && e.code === 'DASHBOARD_SESSION_EXPIRED') {
-      handleDashboardSessionExpired();
-      return;
-    }
-    alert(t('alert.error') + ': ' + e.message);
-  }
-}
-
-// Bulk awaiting operations
-function toggleAllAwaiting(){
-  const cbs=document.querySelectorAll('.awaiting-check');
-  const allChecked=Array.from(cbs).every(c=>c.checked);
-  cbs.forEach(c=>c.checked=!allChecked);
-}
-
-async function bulkApprove(decision){
-  const checked=document.querySelectorAll('.awaiting-check:checked');
-  if(checked.length===0){alert(t('alert.selectCompanies'));return;}
-  if(!confirm(decision==='sent'?t('confirm.bulkSent',{count:checked.length}):t('confirm.bulkSkip',{count:checked.length})))return;
-  let ok=0,fail=0;
-  const errors=[];
-  const succeededNos = [];
-  for(const cb of checked){
-    const card=cb.closest('.awaiting-card');
-    const no=parseInt(card.dataset.no);
-    const name=card.dataset.name;
-    try{
-      const blockedReason = getAwaitingDecisionBlockReason(no, decision);
-      if (blockedReason) throw new Error(blockedReason);
-      await submitApprovalDecision(no, name, decision, '');
-      ok++;
-      succeededNos.push(no);
-    }catch(e){
-      if (e && e.code === 'DASHBOARD_SESSION_EXPIRED') {
-        handleDashboardSessionExpired();
-        return;
-      }
-      fail++;
-      errors.push(name + ': ' + e.message);
-    }
-  }
-  if(fail>0){
-    alert(t('alert.success',{ok:ok})+t('alert.failure',{fail:fail})+(errors.length?'\\n\\n'+errors.slice(0,3).join('\\n'):'')); 
-  }
-  succeededNos.forEach((companyNo) => removeAwaitingCardFromUi(companyNo));
-  refreshAfterMutation();
-}
-
-async function bulkSkipWithFeedback(){
-  const checked=document.querySelectorAll('.awaiting-check:checked');
-  if(checked.length===0){alert(t('alert.selectCompanies'));return;}
-  const feedback=prompt(t('confirm.bulkSkipReason',{count:checked.length}));
-  if(feedback===null)return;
-  let ok=0,fail=0;
-  const errors=[];
-  const succeededNos = [];
-  for(const cb of checked){
-    const card=cb.closest('.awaiting-card');
-    try{
-      const no = parseInt(card.dataset.no);
-      const name = card.dataset.name;
-      const blockedReason = getAwaitingDecisionBlockReason(no, 'skip');
-      if (blockedReason) throw new Error(blockedReason);
-      await submitApprovalDecision(no, name, 'skip', feedback||'');
-      ok++;
-      succeededNos.push(no);
-    }catch(e){
-      if (e && e.code === 'DASHBOARD_SESSION_EXPIRED') {
-        handleDashboardSessionExpired();
-        return;
-      }
-      fail++;
-      errors.push((card && card.dataset && card.dataset.name ? card.dataset.name : 'Unknown') + ': ' + e.message);
-    }
-  }
-  if(fail>0){
-    alert(t('alert.success',{ok:ok})+t('alert.failure',{fail:fail})+(errors.length?'\\n\\n'+errors.slice(0,3).join('\\n'):'')); 
-  }
-  succeededNos.forEach((companyNo) => removeAwaitingCardFromUi(companyNo));
-  refreshAfterMutation();
-}
-
-async function bulkDeleteAwaiting() {
-  const checked = document.querySelectorAll('.awaiting-check:checked');
-  if (checked.length === 0) {
-    alert(t('alert.selectCompanies'));
-    return;
-  }
-  const companyNos = Array.from(checked)
-    .map((cb) => {
-      const card = cb.closest('.awaiting-card');
-      return card ? parseInt(card.dataset.no, 10) : null;
-    })
-    .filter((value) => Number.isFinite(value));
-  if (companyNos.length === 0) {
-    alert(t('alert.selectCompanies'));
-    return;
-  }
-  if (!confirm(t('confirm.bulkDeleteCompanies', { count: companyNos.length }))) return;
-  try {
-    const res = await fetch('/api/companies/bulk-delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ companyNos }),
-    });
-    const result = await res.json();
-    if (!res.ok || !result.ok) throw new Error(result.error || 'Failed to delete selected companies.');
-    showToast(t('companyModal.bulkDeleted', { count: result.deletedCount || companyNos.length }) || 'Selected companies deleted.', 'success');
-    if (result.skippedCount > 0) {
-      showToast((LANG === 'ja' ? '一部の行は削除対象外のためスキップしました。' : 'Some rows were skipped because they are not deletable.'), 'info');
-    }
-    companyNos.forEach((companyNo) => {
-      removeAwaitingCardFromUi(companyNo);
-      removeCompanyRowFromUi(companyNo);
-    });
-    refreshAfterMutation();
-  } catch (e) {
-    showToast((t('alert.error') || 'Error') + ': ' + e.message, 'error');
-  }
-}
-
-function connectEvents(){
-  if(es){
-    es.close();
-    es=null;
-  }
-  es=createSessionEventSource('/events');
-  es.onmessage=function(e){
-    try{
-      const d=JSON.parse(e.data);
-      if (document.hidden) {
-        if (d.type === 'cli-log') {
-          hiddenCliLogBuffer.push({ message: d.message, logType: d.logType, time: d.time });
-          if (hiddenCliLogBuffer.length > 180) {
-            hiddenCliLogBuffer = hiddenCliLogBuffer.slice(-180);
-          }
-          if (d.logType === 'action') hiddenRefreshPending = true;
-        } else if (d.type !== 'claude-stdout') {
-          hiddenRefreshPending = true;
-        }
-        return;
-      }
-      if(d.type==='cli-log'){
-        appendCliLog(d.message,d.logType,d.time);
-        if(d.logType==='action') requestDashboardRefresh({ delay: 180 });
-      }else if(d.type==='claude-stdout'){
-        appendRawTerminal(d.text, d.stream);
-      }else if(d.type==='claude-exit'){
-        appendRawTerminal('\\n[AI 終了 code=' + d.code + ']\\n','system');
-        pollClaudeStatus();
-      }else{
-        requestDashboardRefresh({ delay: 160 });
-      }
-    }catch(err){
-      requestDashboardRefresh({ delay: 220 });
-    }
-  };
-  es.onerror=function(){
-    document.getElementById('liveLabel').textContent=t('app.offline');
-    document.getElementById('liveDot').className='live-dot off';
-    document.getElementById('cliDot').className='live-dot off';
-    if(es){
-      es.close();
-      es=null;
-    }
-    if(!reconnectTimer){
-      reconnectTimer=setTimeout(()=>{
-        reconnectTimer=null;
-        connectEvents();
-      },3000);
-    }
-    if(!offlinePollTimer){
-      offlinePollTimer=setInterval(()=>requestDashboardRefresh({ delay: 0 }),30000);
-    }
-  };
-  es.onopen=function(){
-    document.getElementById('liveLabel').textContent=t('app.live');
-    document.getElementById('liveDot').className='live-dot on';
-    document.getElementById('cliDot').className='live-dot on';
-    if(reconnectTimer){
-      clearTimeout(reconnectTimer);
-      reconnectTimer=null;
-    }
-    if(offlinePollTimer){
-      clearInterval(offlinePollTimer);
-      offlinePollTimer=null;
-    }
-  };
-}
-
-const _assetPromises = {};
-function ensureScriptOnce(src) {
-  if (_assetPromises[src]) return _assetPromises[src];
-  _assetPromises[src] = new Promise((resolve, reject) => {
-    const existing = Array.from(document.scripts || []).find((script) => script.src === src);
-    if (existing) {
-      if (existing.dataset.loaded === '1') {
-        resolve();
-        return;
-      }
-      existing.addEventListener('load', () => resolve(), { once: true });
-      existing.addEventListener('error', () => reject(new Error('Failed to load script: ' + src)), { once: true });
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = src;
-    script.async = true;
-    script.onload = () => {
-      script.dataset.loaded = '1';
-      resolve();
-    };
-    script.onerror = () => reject(new Error('Failed to load script: ' + src));
-    document.head.appendChild(script);
-  });
-  return _assetPromises[src];
-}
-
-function ensureStyleOnce(href) {
-  if (_assetPromises[href]) return _assetPromises[href];
-  _assetPromises[href] = new Promise((resolve, reject) => {
-    const existing = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).find((link) => link.href === href);
-    if (existing) {
-      resolve();
-      return;
-    }
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = href;
-    link.onload = () => resolve();
-    link.onerror = () => reject(new Error('Failed to load stylesheet: ' + href));
-    document.head.appendChild(link);
-  });
-  return _assetPromises[href];
-}
-
-function ensureChartAssets() {
-  return ensureScriptOnce('https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js');
-}
-
-function ensureXtermAssets() {
-  return Promise.all([
-    ensureStyleOnce('https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css'),
-    ensureScriptOnce('https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js'),
-    ensureScriptOnce('https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js'),
-  ]);
-}
-
-// ─── Analytics Charts ─────────────────────────────────────────────
-let _statusDonut = null;
-let _trendChart = null;
-
-function initCharts() {
-  if (typeof Chart === 'undefined') return;
-  const initialTrendData = (typeof _latestDashboardData !== 'undefined' && _latestDashboardData && _latestDashboardData.trendData)
-    ? _latestDashboardData.trendData
-    : null;
-  const initialTrendLabels = Array.isArray(initialTrendData && initialTrendData.labels) && initialTrendData.labels.length
-    ? initialTrendData.labels
-    : ['6日前','5日前','4日前','3日前','2日前','昨日','今日'];
-  const initialTrendSent = Array.isArray(initialTrendData && initialTrendData.sent) && initialTrendData.sent.length
-    ? initialTrendData.sent
-    : [0,0,0,0,0,0,0];
-  const initialTrendActionNeeded = Array.isArray(initialTrendData && initialTrendData.actionNeeded) && initialTrendData.actionNeeded.length
-    ? initialTrendData.actionNeeded
-    : [0,0,0,0,0,0,0];
-  const initialTrendError = Array.isArray(initialTrendData && (initialTrendData.error || initialTrendData.errors))
-    && (initialTrendData.error || initialTrendData.errors).length
-    ? (initialTrendData.error || initialTrendData.errors)
-    : [0,0,0,0,0,0,0];
-
-  // Doughnut - ステータス内訳
-  const ctxD = document.getElementById('statusDonutChart');
-  if (ctxD && !_statusDonut) {
-    _statusDonut = new Chart(ctxD.getContext('2d'), {
-      type: 'doughnut',
-      data: {
-        labels: ['送信済', '要対応', 'エラー', '未処理'],
-        datasets: [{
-          data: [0,0,0,0],
-          backgroundColor: ['#10b981','#f59e0b','#ef4444','#cbd5e1'],
-          borderWidth: 2, borderColor: '#fff', hoverOffset: 4
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false, cutout: '72%',
-        plugins: {
-          legend: { position: 'right', labels: { boxWidth: 8, usePointStyle: true, pointStyle: 'circle', padding: 12, font: { size: 11, family: "'Inter','Noto Sans JP',sans-serif" } } },
-          tooltip: { backgroundColor: '#0f172a', titleFont: { size: 11 }, bodyFont: { size: 11, family: "'JetBrains Mono',monospace" }, padding: 10, cornerRadius: 6, callbacks: { label: (c) => ' ' + c.label + ': ' + c.raw + '件' } }
-        }
-      }
-    });
-  }
-
-  // Area chart - 処理推移 (last 7 days)
-    const ctxA = document.getElementById('trendAreaChart');
-  if (ctxA && !_trendChart) {
-    const grad1 = ctxA.getContext('2d').createLinearGradient(0,0,0,170);
-    grad1.addColorStop(0,'rgba(245,158,11,0.25)'); grad1.addColorStop(1,'rgba(245,158,11,0)');
-    const grad2 = ctxA.getContext('2d').createLinearGradient(0,0,0,170);
-    grad2.addColorStop(0,'rgba(16,185,129,0.25)'); grad2.addColorStop(1,'rgba(16,185,129,0)');
-    Chart.defaults.font.family = "'JetBrains Mono','Inter','Noto Sans JP',monospace";
-    Chart.defaults.color = '#94a3b8';
-    _trendChart = new Chart(ctxA.getContext('2d'), {
-      type: 'line',
-      data: {
-        labels: initialTrendLabels,
-        datasets: [
-          { label:'送信済', data:initialTrendSent, borderColor:'#10b981', backgroundColor:grad2, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#10b981', pointBorderWidth:2 },
-          { label:'要対応', data:initialTrendActionNeeded, borderColor:'#f59e0b', backgroundColor:grad1, borderWidth:2, tension:0.4, fill:true, pointRadius:0, pointHoverRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#f59e0b', pointBorderWidth:2 },
-          { label:'エラー', data:initialTrendError, borderColor:'#ef4444', backgroundColor:'transparent', borderWidth:1.5, borderDash:[4,4], tension:0.3, fill:false, pointRadius:0, pointHoverRadius:3, pointBackgroundColor:'#ef4444' }
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        interaction: { mode:'index', intersect:false },
-        plugins: { legend: { display:false }, tooltip: { backgroundColor:'#0f172a', titleColor:'#fff', bodyColor:'#e5e7eb', titleFont:{size:11,weight:'bold'}, bodyFont:{size:11,family:"'JetBrains Mono',monospace"}, padding:10, cornerRadius:4, usePointStyle:true, boxPadding:4 } },
-        scales: {
-          y: { beginAtZero:true, border:{display:false}, grid:{color:'rgba(15,23,42,.03)'}, ticks:{maxTicksLimit:5, font:{size:10}, padding:8} },
-          x: { border:{display:false}, grid:{display:false}, ticks:{font:{size:10}} }
-        }
-      }
-    });
-  }
-}
-
-function updateCharts(data) {
-  if (!data || typeof Chart === 'undefined') return;
-  const companies = data.companies || [];
-  const countByAction = (st) => companies.filter(c => c.lastAction === st).length;
-  const actionNeeded = countByAction('form_fill') + countByAction('confirm_reached') + countByAction('awaiting_approval');
-  const awaiting = countByAction('awaiting_approval');
-  const sent = countByAction('submitted');
-  const errors = countByAction('error');
-  const actionableTotal = (data.stats && data.stats.approachable) || 0;
-  const unprocessed = Math.max(0, actionableTotal - sent - actionNeeded - errors);
-
-  if (_statusDonut) {
-    _statusDonut.data.datasets[0].data = [sent, actionNeeded, errors, unprocessed];
-    _statusDonut.update('none');
-  }
-
-  // Update trend chart with per-day data
-  if (_trendChart && data.trendData) {
-    const trendErrorSeries = Array.isArray(data.trendData.error)
-      ? data.trendData.error
-      : (Array.isArray(data.trendData.errors) ? data.trendData.errors : null);
-    _trendChart.data.labels = data.trendData.labels;
-    _trendChart.data.datasets[0].data = data.trendData.sent;
-    _trendChart.data.datasets[1].data = data.trendData.actionNeeded;
-    if (trendErrorSeries && _trendChart.data.datasets[2]) _trendChart.data.datasets[2].data = trendErrorSeries;
-    _trendChart.resize();
-    _trendChart.update();
-  }
-
-  // Update analytics progress panel
-  const stats = data.stats || {};
-  const total = stats.approachable || 0;
-  const done = stats.submitted || 0;
-  const pct = total > 0 ? Math.round(done / total * 100) : 0;
-  const pEl = document.getElementById('analyticsPercent');
-  const rEl = document.getElementById('analyticsRatio');
-  const bEl = document.getElementById('analyticsProgressBar');
-  const subNumEl = document.getElementById('analyticsSubmittedNum');
-  if (pEl) pEl.textContent = pct;
-  if (subNumEl) subNumEl.textContent = done;
-  if (rEl) rEl.textContent = '/ ' + total;
-  if (bEl) bEl.style.width = pct + '%';
-}
-
-let _liveMonitorOpen = false;
-let _monitorUnreadCount = 0;
-let _monitorToastTimer = null;
-let _lastMonitorEventCount = 0;
-let _monitorBaseStatus = 'idle';
-
-function toggleMonitorPanel() {
-  _liveMonitorOpen = !_liveMonitorOpen;
-  const panel = document.getElementById('liveMonitorCard');
-  const fab = document.getElementById('monitorFab');
-  const toast = document.getElementById('monitorToast');
-  if (panel) {
-    if (_liveMonitorOpen) {
-      panel.style.display = 'flex';
-      panel.style.animation = 'monitorPanelIn .25s var(--ease-out-expo)';
-      _monitorUnreadCount = 0;
-      updateMonitorBadge();
-      if (toast) toast.style.display = 'none';
-    } else {
-      panel.style.display = 'none';
-    }
-  }
-  if (fab) {
-    fab.querySelector('.material-symbols-outlined').textContent = _liveMonitorOpen ? 'close' : 'chat';
-  }
-  try { localStorage.setItem('liveMonitorOpen', _liveMonitorOpen ? '1' : '0'); } catch(_) {}
-}
-
-function updateMonitorBadge() {
-  const badge = document.getElementById('monitorFabBadge');
-  if (!badge) return;
-  if (_monitorUnreadCount > 0 && !_liveMonitorOpen) {
-    badge.style.display = 'block';
-    badge.textContent = _monitorUnreadCount > 9 ? '9+' : String(_monitorUnreadCount);
-  } else {
-    badge.style.display = 'none';
-  }
-}
-
-function showMonitorToast(company, step, status) {
-  if (_liveMonitorOpen) return;
-  const toast = document.getElementById('monitorToast');
-  const toastCompany = document.getElementById('monitorToastCompany');
-  const toastStep = document.getElementById('monitorToastStep');
-  const toastTime = document.getElementById('monitorToastTime');
-  const toastDot = document.getElementById('monitorToastDot');
-  if (!toast) return;
-  const dotColors = { processing:'#3b82f6', awaiting_approval:'#f59e0b', error:'#ef4444', submitted:'#10b981', completed:'#10b981' };
-  if (toastCompany) toastCompany.textContent = company || '-';
-  if (toastStep) toastStep.textContent = step || '-';
-  if (toastTime) toastTime.textContent = new Date().toLocaleTimeString(LANG === 'ja' ? 'ja-JP' : undefined, { hour:'2-digit', minute:'2-digit' });
-  if (toastDot) toastDot.style.background = dotColors[status] || 'var(--primary)';
-  toast.style.display = 'block';
-  toast.style.animation = 'monitorToastIn .3s var(--ease-spring)';
-  if (_monitorToastTimer) clearTimeout(_monitorToastTimer);
-  _monitorToastTimer = setTimeout(() => {
-    if (toast) { toast.style.animation = 'monitorToastOut .2s forwards'; setTimeout(() => { toast.style.display = 'none'; }, 200); }
-  }, 5000);
-}
-
-// Compat shims for old callers
-function setLiveMonitorOpen(nextOpen, { persist = true } = {}) {
-  if (!!nextOpen !== _liveMonitorOpen) toggleMonitorPanel();
-}
-function toggleLiveMonitor() { toggleMonitorPanel(); }
-
-(function() {
-  const s = (function() { try { return localStorage.getItem('liveMonitorOpen'); } catch(_) { return null; } })();
-  // Start closed by default (chat-bot style)
-  setTimeout(() => { if (s === '1') toggleMonitorPanel(); }, 100);
-})();
-
-let _analyticsOpen = true;
-function scheduleAnalyticsInit() {
-  ensureAnalyticsInitialized();
-}
-// Analytics panel is always visible, but chart boot can wait for idle time.
-scheduleAnalyticsInit();
-
-// Escape key to close modals/overlays
-document.addEventListener('keydown', function(e) {
-  if (e.key !== 'Escape') return;
-  // Close dynamically created overlays (company detail, message view)
-  var overlays = document.querySelectorAll('[style*="position:fixed"][style*="z-index:9999"]');
-  if (overlays.length > 0) { overlays[overlays.length - 1].remove(); return; }
-  // Close loading overlay
-  var loading = document.getElementById('loadingOverlay');
-  if (loading && loading.style.display !== 'none') { loading.style.display = 'none'; return; }
-  // Close launch modal
-  var launchModal = document.getElementById('launchModal');
-  if (launchModal && launchModal.style.display !== 'none') { launchModal.style.display = 'none'; return; }
-  // Close docs modal
-  var docsModal = document.getElementById('docsModal');
-  if (docsModal && docsModal.style.display !== 'none') { docsModal.style.display = 'none'; return; }
-  // Close company form modal
-  var companyModal = document.getElementById('companyFormModal');
-  if (companyModal && companyModal.style.display !== 'none') { companyModal.style.display = 'none'; return; }
-});
-
-// Initial data fetch
-refreshData({toastOnError:true});
-connectEvents();
-connectPtyWs();
-
-// Claude CLI status — initial check + periodic polling
-pollClaudeStatus();
-_claudeStatusTimer = setInterval(pollClaudeStatus, 30000);
-
-// Auto-update status polling
-async function pollUpdateStatus() {
-  if (document.hidden) return;
-  try {
-    const res = await fetch('/api/update-status');
-    const d = await res.json();
-    const banner = document.getElementById('updateBanner');
-    if (!banner) return;
-    if (d.state === 'available') {
-      banner.style.display = 'flex';
-      banner.style.background = '#0043ce';
-      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">system_update</span> <b>v' + esc(d.version) + '</b> が利用可能です — バックグラウンドでダウンロード中...';
-    } else if (d.state === 'downloading') {
-      banner.style.display = 'flex';
-      banner.style.background = '#0043ce';
-      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">downloading</span> アップデートダウンロード中 <b>' + (d.percent || 0) + '%</b>...';
-    } else if (d.state === 'downloaded') {
-      banner.style.display = 'flex';
-      banner.style.background = '#198038';
-      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">check_circle</span> v' + esc(d.version) + ' の準備完了 — <b style="cursor:pointer;text-decoration:underline" onclick="fetch(\\'/api/install-update\\',{method:\\'POST\\'})">今すぐ再起動してインストール</b>';
-    } else if (d.state === 'error') {
-      banner.style.display = 'flex';
-      banner.style.background = '#da1e28';
-      banner.innerHTML = '<span class="material-symbols-outlined" style="font-size:15px">error</span> 自動更新エラー: ' + esc(d.message || '');
-    } else if (d.state === 'disabled-dev' || d.state === 'dashboard-only' || d.state === 'disabled') {
-      banner.style.display = 'none';
-    } else {
-      banner.style.display = 'none';
-    }
-  } catch(e) { /* ignore */ }
-}
-pollUpdateStatus();
-setInterval(pollUpdateStatus, 60000);
-
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) return;
-  if (hiddenCliLogBuffer.length > 0) {
-    const buffered = hiddenCliLogBuffer.slice();
-    hiddenCliLogBuffer = [];
-    buffered.forEach((entry) => appendCliLog(entry.message, entry.logType, entry.time));
-  }
-  if (hiddenRefreshPending) {
-    hiddenRefreshPending = false;
-    requestDashboardRefresh({ force: true, delay: 0 });
-  }
-  pollClaudeStatus();
-  pollUpdateStatus();
-});
-
-// CLI log stream
-const cliColors={info:'#8bc5ed',action:'#3fb950',error:'#f85149',warn:'#e3b341',step:'#d2a8ff',thinking:'#818cf8'};
-const cliLabels={info:'INF',action:'ACT',error:'ERR',warn:'WRN',step:'STP',thinking:'THK'};
-
-function updateMonitorThinking(msg) {
-  const row = document.getElementById('monitorThinkingRow');
-  const text = document.getElementById('monitorThinkingText');
-  const chip = document.getElementById('monitorStatusChip');
-  const dot = document.getElementById('monitorDot');
-  if (!row) return;
-  if (msg) {
-    if (text) text.textContent = msg;
-    row.style.display = 'flex';
-    if (chip) { chip.innerHTML = '<span class="think-spin" style="border-top-color:#fff;border-color:rgba(255,255,255,.2)"></span> ' + (LANG==='ja'?'思考中':'Thinking'); chip.style.color='#c4b5fd'; chip.style.background='rgba(99,102,241,.3)'; }
-    if (dot) { dot.style.background='#818cf8'; }
-  } else {
-    row.style.display = 'none';
-    const baseMeta = getMonitorStatusMeta(_monitorBaseStatus);
-    if (chip) { chip.textContent = baseMeta.label; chip.style.color = baseMeta.tone.fg; chip.style.background = baseMeta.tone.bg; }
-    if (dot) { dot.style.background = baseMeta.dotColor; }
-  }
-}
-
-function updateCliThinking(msg) {
-  const row = document.getElementById('cliThinkingRow');
-  const text = document.getElementById('cliThinkingText');
-  if (!row) return;
-  if (msg) {
-    if (text) text.textContent = msg;
-    row.style.display = 'flex';
-  } else {
-    row.style.display = 'none';
-  }
-}
-
-function appendCliLog(msg,type,time){
-  const el=document.getElementById('cliStream');
-  const ts=time?new Date(time).toLocaleTimeString('ja-JP'):'';
-  const lastEventEl=document.getElementById('cliLastEvent');
-  const streamLastEventEl=document.getElementById('cliStreamLastEvent');
-
-  // Remove existing thinking rows first
-  if(el) el.querySelectorAll('.cli-thinking-line').forEach(n=>n.remove());
-
-  if(type==='thinking'){
-    updateMonitorThinking(msg);
-    updateCliThinking(msg);
-    pushMonitorCliEvent(msg, type, time);
-    if (streamLastEventEl && ts) streamLastEventEl.textContent=ts;
-    if(!el)return;
-    const line=document.createElement('div');
-    line.className='cli-thinking-line';
-    const spinner=document.createElement('span');
-    spinner.className='think-spin';
-    const txt=document.createElement('span');
-    txt.style.cssText='font-size:.76rem;color:#818cf8;font-style:italic;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-    txt.textContent=msg;
-    line.appendChild(spinner);
-    line.appendChild(txt);
-    el.prepend(line);
-    while(el.children.length>300){ el.removeChild(el.lastElementChild); }
-    return;
-  }
-
-  // Non-thinking: clear thinking indicator and update timestamp
-  updateMonitorThinking(null);
-  updateCliThinking(null);
-  pushMonitorCliEvent(msg, type, time);
-  if(lastEventEl) lastEventEl.textContent=ts;
-  if(streamLastEventEl) streamLastEventEl.textContent=ts;
-  if(!el)return;
-
-  const color=cliColors[type]||'#c9d1d9';
-  const label=cliLabels[type]||'LOG';
-  const line=document.createElement('div');
-  line.className='cli-line';
-  const tsSpan=document.createElement('span');
-  tsSpan.style.cssText='color:#484f58;user-select:none';
-  tsSpan.textContent=ts;
-  const labelSpan=document.createElement('span');
-  labelSpan.style.cssText='background:'+color+';color:#0d1117;font-size:.62rem;font-weight:700;padding:0 5px;vertical-align:middle';
-  labelSpan.textContent=label;
-  const msgSpan=document.createElement('span');
-  msgSpan.style.color=color;
-  msgSpan.textContent=msg;
-  line.appendChild(tsSpan);
-  line.appendChild(document.createTextNode(' '));
-  line.appendChild(labelSpan);
-  line.appendChild(document.createTextNode(' '));
-  line.appendChild(msgSpan);
-  el.prepend(line);
-  while(el.children.length>300){
-    el.removeChild(el.lastElementChild);
-  }
-}
-
-// ─── xterm.js + WebSocket PTY ───────────────────────────────────────────
-function _xtermOptions() {
-  return {
-    theme: {
-      background: '#0d1117', foreground: '#c9d1d9',
-      cursor: '#58a6ff', selectionBackground: '#264f78',
-    },
-    fontFamily: '"JetBrains Mono", "Cascadia Code", monospace',
-    fontSize: 12,
-    lineHeight: 1.5,
-    scrollback: 2000,
-    cursorBlink: true,
-    convertEol: true,
-  };
-}
-
-function initXtermTerminals() {
-  if (typeof Terminal === 'undefined') return;
-
-  // Tab terminal
-  const tabContainer = document.getElementById('xtermTabContainer');
-  if (tabContainer && !_tabTerm) {
-    _tabTerm = new Terminal(_xtermOptions());
-    const fitTab = new FitAddon.FitAddon();
-    _tabTerm.loadAddon(fitTab);
-    _tabTerm.open(tabContainer);
-    fitTab.fit();
-    _tabTerm.onData((d) => _sendPtyInput(d));
-    new ResizeObserver(() => { try { fitTab.fit(); } catch(_){} }).observe(tabContainer);
-  }
-
-  // Drawer terminal
-  const drawerContainer = document.getElementById('xtermDrawerContainer');
-  if (drawerContainer && !_drawerTerm) {
-    _drawerTerm = new Terminal(_xtermOptions());
-    const fitDrawer = new FitAddon.FitAddon();
-    _drawerTerm.loadAddon(fitDrawer);
-    _drawerTerm.open(drawerContainer);
-    fitDrawer.fit();
-    _drawerTerm.onData((d) => _sendPtyInput(d));
-    new ResizeObserver(() => { try { fitDrawer.fit(); _notifyResize(); } catch(_){} }).observe(drawerContainer);
-  }
-}
-
-function _notifyResize() {
-  if (!_ptyWs || _ptyWs.readyState !== WebSocket.OPEN) return;
-  const cols = (_drawerTerm || _tabTerm)?.cols || 120;
-  const rows = (_drawerTerm || _tabTerm)?.rows || 30;
-  _ptyWs.send(JSON.stringify({ type: 'resize', cols, rows }));
-}
-
-function _sendPtyInput(data) {
-  if (_ptyWs && _ptyWs.readyState === WebSocket.OPEN) {
-    _ptyWs.send(JSON.stringify({ type: 'input', data }));
-  }
-}
-
-function _setWsStatus(status) {
-  const s1 = document.getElementById('termWsStatus');
-  const s2 = document.getElementById('termDrawerWsStatus');
-  if (s1) s1.textContent = status;
-  if (s2) s2.textContent = status;
-}
-
-function connectPtyWs() {
-  if (_ptyWs && (_ptyWs.readyState === WebSocket.OPEN || _ptyWs.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-  if (_ptyWsRetryTimer) { clearTimeout(_ptyWsRetryTimer); _ptyWsRetryTimer = null; }
-  const ws = createSessionWebSocket('/terminal');
-  _ptyWs = ws;
-  _setWsStatus('connecting…');
-
-  ws.onopen = () => _setWsStatus('connected');
-
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'output') {
-        _tabTerm?.write(msg.data);
-        _drawerTerm?.write(msg.data);
-        document.getElementById('cliLastEvent').textContent = new Date().toLocaleTimeString('ja-JP');
-        ingestPtyProgress(msg.data);
-      } else if (msg.type === 'exit') {
-        const txt = '\\r\\n\\x1b[2m[AI 終了 code=' + msg.code + ']\\x1b[0m\\r\\n';
-        _tabTerm?.write(txt);
-        _drawerTerm?.write(txt);
-        setTimeout(pollClaudeStatus, 500);
-      } else if (msg.type === 'connected') {
-        _setWsStatus(msg.running ? 'PTY active' : 'ready');
-        if (msg.mode) {
-          const l1 = document.getElementById('termModeLabel');
-          const l2 = document.getElementById('termDrawerModeLabel');
-          if (l1) l1.textContent = msg.mode;
-          if (l2) l2.textContent = msg.mode;
-        }
-      }
-    } catch (_) {}
-  };
-
-  ws.onclose = () => {
-    _setWsStatus('disconnected');
-    if (_ptyWs === ws) {
-      _ptyWs = null;
-      _ptyWsRetryTimer = setTimeout(connectPtyWs, 4000);
-    }
-  };
-
-  ws.onerror = () => ws.close();
-}
-
-// Legacy: sendClaudeInput now routes through PTY WebSocket
-function sendClaudeInput(text) {
-  const msg = text !== undefined ? text : '';
-  if (!msg.trim()) return;
-  _sendPtyInput(msg + '\\r');
-}
-
-// Stub kept for compatibility (output now comes via WS, not SSE)
-function appendRawTerminal(text, stream) {
-  const ts = new Date().toLocaleTimeString('ja-JP');
-  const el = document.getElementById('cliLastEvent');
-  if (el) el.textContent = ts;
-}
-// ─────────────────────────────────────────────────────────────────────────
-
-// Filters
-document.querySelectorAll('#tab-companies .fb').forEach(b=>{
-  b.addEventListener('click',()=>{
-    document.querySelectorAll('#tab-companies .fb').forEach(x=>x.classList.remove('active'));
-    b.classList.add('active');
-    currentFilter=b.dataset.f;
-    applyCompanyFilters();
-  });
-});
-
-// Company search
-document.getElementById('q').addEventListener('input',e=>{
-  applyCompanyFilters();
-});
-document.getElementById('companyTypeFilter')?.addEventListener('change',()=>applyCompanyFilters());
-document.getElementById('companyProgressFilter')?.addEventListener('change',()=>applyCompanyFilters());
-
-// Sort table
-let sortCol='no',sortAsc=true;
-function sortTable(col){
-  if(sortCol===col){sortAsc=!sortAsc;}else{sortCol=col;sortAsc=true;}
-  document.querySelectorAll('.sort-icon').forEach(s=>s.textContent='');
-  const icon=document.querySelector('.sort-icon[data-col="'+col+'"]');
-  if(icon)icon.textContent=sortAsc?'\\u25B2':'\\u25BC';
-  const tbody=document.getElementById('companyBody');
-  const rows=Array.from(tbody.querySelectorAll('tr'));
-  rows.sort((a,b)=>{
-    let va,vb;
-    if(col==='no'){va=parseInt(a.dataset.no)||0;vb=parseInt(b.dataset.no)||0;}
-    else if(col==='name'){va=a.dataset.n||'';vb=b.dataset.n||'';}
-    else if(col==='type'){va=a.dataset.type||'';vb=b.dataset.type||'';}
-    else if(col==='progress'){
-      const order={submitted:5,awaiting_approval:4,confirm_reached:3,form_fill:2,error:1,'':0};
-      va=order[a.dataset.progress]||0;vb=order[b.dataset.progress]||0;
-    }
-    else if(col==='sent'){va=parseInt(a.dataset.sentAt||'0',10)||0;vb=parseInt(b.dataset.sentAt||'0',10)||0;}
-    else{va=0;vb=0;}
-    if(typeof va==='string'){return sortAsc?va.localeCompare(vb):vb.localeCompare(va);}
-    return sortAsc?va-vb:vb-va;
-  });
-  rows.forEach(r=>tbody.appendChild(r));
-  syncCompanySelectionUi();
-}
-
-// Sent tab filter
-let sentFilter='all';
-document.querySelectorAll('.fb-sent').forEach(b=>{
-  b.addEventListener('click',()=>{
-    document.querySelectorAll('.fb-sent').forEach(x=>x.classList.remove('active'));
-    b.classList.add('active');
-    sentFilter=b.dataset.sf;
-    applySentFilter();
-  });
-});
-document.getElementById('sentSearch')?.addEventListener('input',()=>applySentFilter());
-document.getElementById('sentTypeFilter')?.addEventListener('change',()=>applySentFilter());
-function applySentFilter(){
-  const q=(document.getElementById('sentSearch').value||'').toLowerCase();
-  const typeFilter=(document.getElementById('sentTypeFilter')?.value||'').toLowerCase();
-  let visible=0;
-  document.querySelectorAll('.sent-card').forEach(card=>{
-    const matchQ=!q||(card.dataset.sn||'').includes(q);
-    const cnt=parseInt(card.dataset.sc)||1;
-    const matchType=!typeFilter||(card.dataset.typeExact||'')===typeFilter;
-    const matchF=sentFilter==='all'||(sentFilter==='1'&&cnt===1)||(sentFilter==='2+'&&cnt>=2);
-    const show=matchQ&&matchType&&matchF;
-    card.style.display=show?'':'none';
-    if(show)visible++;
-  });
-  document.getElementById('sentCount').textContent=visible+' '+(LANG==='ja'?'件':'items');
-}
-
-// Tab switching
-document.querySelectorAll('.tab-btn').forEach(b=>{
-  b.addEventListener('click',()=>{
-    document.querySelectorAll('.tab-btn').forEach(x=>x.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));
-    b.classList.add('active');
-    document.getElementById('tab-'+b.dataset.tab).classList.add('active');
-    _activeMainTab = b.dataset.tab || 'companies';
-    _analyticsOpen = _activeMainTab === 'companies';
-    if(b.dataset.tab==='settings') loadSettings();
-    if (_activeMainTab === 'companies') ensureAnalyticsInitialized();
-    if (_latestDashboardData && b.dataset.tab !== 'settings') {
-      render(_latestDashboardData);
-    }
-    if (b.dataset.tab === 'logs') {
-      ensureXtermAssets()
-        .then(() => {
-          initXtermTerminals();
-          connectPtyWs();
-        })
-        .catch((error) => showToast((LANG === 'ja' ? 'CLIビューの読込失敗: ' : 'Failed to load CLI view: ') + error.message, 'error'));
-    }
-  });
-});
-
-// Progress pipeline
-function updatePipeline(stats){
-  const total=stats.approachable||1;
-  const actionNeeded=(stats.actionNeeded||0);
-  const segments=[
-    {val:stats.submitted,color:'#10b981',label:t('progress.sent')},
-    {val:actionNeeded,color:'#f59e0b',label:t('progress.filled')},
-    {val:stats.error,color:'#dc3545',label:t('progress.error')},
-  ];
-  const remaining=total-segments.reduce((s,x)=>s+Math.max(0,x.val),0);
-  segments.push({val:remaining,color:'#dee2e6',label:t('progress.unprocessed')});
-
-  const el=document.getElementById('pipeline');
-  el.innerHTML=segments.filter(s=>s.val>0).map(s=>
-    '<div class="pip-seg" style="background:'+s.color+';flex:'+Math.max(s.val,0)+'" title="'+s.label+': '+s.val+'"></div>'
-  ).join('');
-
-  const done=stats.submitted;
-  document.getElementById('progressLabel').textContent=done+' / '+total+' '+t('progress.complete')+' ('+Math.round(done/total*100)+'%)';
-}
-
-// ===================== SETTINGS TAB LOGIC =====================
-
-// Settings sidebar navigation
-function openSettingsSection(section) {
-  document.querySelectorAll('.settings-sidebar-btn').forEach(x => x.classList.toggle('active', x.dataset.section === section));
-  document.querySelectorAll('.settings-section').forEach(x => x.classList.toggle('active', x.id === 'sec-' + section));
-}
-
-document.querySelectorAll('.settings-sidebar-btn').forEach(b=>{
-  b.addEventListener('click',()=> openSettingsSection(b.dataset.section));
-});
-
-let _settingsCache = null;
-let _settingsSetupRefreshTimer = null;
-
-async function loadSettings(options = {}) {
-  const force = !!(options && options.force);
-  if (_settingsLoaded && !force) {
-    renderSettingsSetupGuide();
-    return;
-  }
-  if (_settingsDirty && !force) {
-    renderSettingsSetupGuide();
-    return;
-  }
-  try {
-    const res = await fetch('/api/settings');
-    const data = await res.json();
-    _settingsCache = data;
-    populateCompanyProfile(data.companyProfile);
-    populateValuePropositions(data.valuePropositions);
-    populateTargetList(data.targetList);
-    populateExclusionRules(data.exclusionRules);
-    populateMessageTemplates(data.messageTemplates);
-    populatePreferences(data.preferences);
-    _settingsLoaded = true;
-    _settingsDirty = false;
-    renderSettingsSetupGuide();
-  } catch (e) {
-    showToast(t('alert.error') + ': ' + e.message, 'error');
-  }
-}
-
-function scheduleSettingsSetupRefresh() {
-  _settingsDirty = true;
-  clearTimeout(_settingsSetupRefreshTimer);
-  _settingsSetupRefreshTimer = setTimeout(renderSettingsSetupGuide, 0);
-}
-
-function getFieldValue(id) {
-  const el = document.getElementById(id);
-  return el ? String(el.value || '').trim() : '';
-}
-
-function countMeaningfulItems(items, fields) {
-  return (items || []).filter(item => fields.some(field => String((item && item[field]) || '').trim())).length;
-}
-
-function countIndustryProfiles(profiles) {
-  return Object.entries(profiles || {}).filter(([key, value]) => {
-    if (!String(key || '').trim()) return false;
-    return ['opener','point','examples','strength'].some(field => String((value && value[field]) || '').trim());
-  }).length;
-}
-
-function createSetupCheck(label, done, level) {
-  return { label, done: !!done, level: level || 'required' };
-}
-
-function getSettingsSetupState() {
-  const strengthCount = countMeaningfulItems(collectStrengthItems(), ['key', 'label', 'detail']);
-  const successPatternCount = countMeaningfulItems(collectSuccessPatternItems(), ['partner', 'proof', 'type']);
-  const industryProfileCount = countIndustryProfiles(collectIndustryProfiles());
-  const hasTargetMapping = hasFilledTargetColumn('companyName')
-    && (hasFilledTargetColumn('url') || hasFilledTargetColumn('formUrl'));
-
-  const sections = {
-    companyProfile: {
-      status: ['cp-companyName', 'cp-contactName', 'cp-email', 'cp-phone'].every(id => !!getFieldValue(id)) ? 'ready' : 'attention',
-      items: [
-        createSetupCheck(t('field.companyName'), !!getFieldValue('cp-companyName'), 'required'),
-        createSetupCheck(t('field.contactName'), !!getFieldValue('cp-contactName'), 'required'),
-        createSetupCheck(t('field.email'), !!getFieldValue('cp-email'), 'required'),
-        createSetupCheck(t('field.phone'), !!getFieldValue('cp-phone'), 'required'),
-      ],
-    },
-    valuePropositions: {
-      status: strengthCount > 0 ? 'ready' : 'attention',
-      items: [
-        createSetupCheck(t('field.strengths'), strengthCount > 0, 'required'),
-        createSetupCheck(t('field.successPatterns'), successPatternCount > 0, 'recommended'),
-        createSetupCheck(t('field.industryProfiles'), industryProfileCount > 0, 'recommended'),
-      ],
-    },
-    targetList: {
-      status: getFieldValue('tl-filePath') ? 'ready' : 'attention',
-      items: [
-        createSetupCheck(t('field.filePath'), !!getFieldValue('tl-filePath'), 'required'),
-        createSetupCheck(t('field.columnMapping'), hasTargetMapping, 'recommended'),
-        createSetupCheck(t('field.fileType'), !!getFieldValue('tl-fileType'), 'recommended'),
-      ],
-    },
-        messageTemplates: {
-          status: ['mt-greetingLine', 'mt-closingLine', 'mt-signatureTemplate'].every(id => !!getFieldValue(id)) ? 'ready' : 'attention',
-          items: [
-            createSetupCheck(t('field.greetingLine'), !!getFieldValue('mt-greetingLine'), 'required'),
-            createSetupCheck(t('field.closingLine'), !!getFieldValue('mt-closingLine'), 'required'),
-            createSetupCheck(t('field.signatureTemplate'), !!getFieldValue('mt-signatureTemplate'), 'required'),
-            createSetupCheck(t('field.approachObjective'), !!getFieldValue('mt-approachObjective'), 'recommended'),
-            createSetupCheck(t('field.cta'), !!getFieldValue('mt-cta'), 'recommended'),
-          ],
-    },
-    preferences: {
-      status: ['pf-screenshotDir', 'pf-dataDir', 'pf-aiProvider'].every(id => !!getFieldValue(id)) ? 'ready' : 'attention',
-      items: [
-        createSetupCheck(t('field.screenshotDir'), !!getFieldValue('pf-screenshotDir'), 'recommended'),
-        createSetupCheck(t('field.dataDir'), !!getFieldValue('pf-dataDir'), 'recommended'),
-        createSetupCheck(t('field.aiProvider'), !!getFieldValue('pf-aiProvider'), 'recommended'),
-        createSetupCheck(t('field.aiModelClaude'), !!getFieldValue('pf-aiModelClaude'), 'recommended'),
-      ],
-    },
-    exclusionRules: {
-      status: 'optional',
-      items: [
-        createSetupCheck(t('field.excludeStatuses'), getStringListItems('er-excludeStatuses-list').length > 0, 'optional'),
-        createSetupCheck(t('field.ngList'), countMeaningfulItems(collectNgItems(), ['pattern', 'reason']) > 0, 'optional'),
-        createSetupCheck(t('field.customRules'), countMeaningfulItems(collectCustomRules(), ['pattern', 'status', 'reason']) > 0, 'optional'),
-      ],
-    },
-  };
-
-  const coreSections = ['companyProfile', 'valuePropositions', 'targetList', 'messageTemplates', 'preferences'];
-  const coreReadyCount = coreSections.filter(section => sections[section].status === 'ready').length;
-  return { sections, coreSections, coreReadyCount };
-}
-
-function renderSetupChecklist(items) {
-  return items.map(item =>
-    '<li class="setup-check-item ' + (item.done ? 'done' : 'pending') + '">'
-      + '<span class="setup-check-dot"></span>'
-      + '<span>' + esc(item.label) + '<span class="settings-field-chip ' + item.level + ' setup-check-level">' + esc(t('settings.tag.' + item.level)) + '</span></span>'
-      + '</li>'
-  ).join('');
-}
-
-function applySettingsStatus(targetId, status) {
-  const el = document.getElementById(targetId);
-  if (!el) return;
-  el.textContent = t('settings.setupGuide.status.' + status);
-  el.className = el.className.replace(/\b(ready|attention|optional)\b/g, '').trim();
-  el.classList.add(status);
-}
-
-function renderSettingsSetupGuide() {
-  const guide = document.getElementById('settingsSetupGuide');
-  if (!guide) return;
-
-  const state = getSettingsSetupState();
-  const total = state.coreSections.length;
-  const done = state.coreReadyCount;
-  const percent = total > 0 ? Math.round((done / total) * 100) : 0;
-
-  const label = document.getElementById('settingsSetupProgressLabel');
-  if (label) label.textContent = t('settings.setupGuide.progress', { done: String(done), total: String(total) });
-
-  const bar = document.getElementById('settingsSetupProgressBar');
-  if (bar) bar.style.width = percent + '%';
-
-  const note = document.getElementById('settingsSetupProgressNote');
-  if (note) note.textContent = done === total ? t('settings.setupGuide.progressDone') : t('settings.setupGuide.progressPending');
-
-  Object.entries(state.sections).forEach(([section, config]) => {
-    applySettingsStatus('setupStatus-' + section, config.status);
-    applySettingsStatus('settingsSidebarStatus-' + section, config.status);
-    const list = document.getElementById('setupList-' + section);
-    if (list) list.innerHTML = renderSetupChecklist(config.items);
-  });
-}
-
-const settingsMainEl = document.getElementById('settingsMain');
-if (settingsMainEl) {
-  settingsMainEl.addEventListener('input', scheduleSettingsSetupRefresh);
-  settingsMainEl.addEventListener('change', scheduleSettingsSetupRefresh);
-  settingsMainEl.addEventListener('change', (event) => {
-    if (event && event.target && event.target.id === 'pf-aiProvider') {
-      updateLaunchProviderUi(event.target.value || _currentAiProvider);
-    }
-  });
-}
-
-// --- Populate helpers ---
-
-function populateCompanyProfile(cp) {
-  const fields = ['companyName','companyNameEn','companyNameKana','representative','contactName','contactNameKana','contactTitle','department','email','phone','fax','mobile','postalCode','address','addressEn','website','partnerPage','corporateProfile','established','employeeCount','capital','industry','businessDescription','notes'];
-  fields.forEach(f => {
-    const el = document.getElementById('cp-'+f);
-    if (el) el.value = cp[f] || '';
-  });
-}
-
-function populateValuePropositions(vp) {
-  document.getElementById('vp-companyUrl').value = vp.companyUrl || '';
-
-  // Service URLs
-  renderSimpleObjList('vp-serviceUrls-list', vp.serviceUrls || [], ['label','url'], {label:LANG==='ja'?'ラベル':'Label',url:'URL'});
-
-  // Document paths
-  renderSimpleObjList('vp-documentPaths-list', vp.documentPaths || [], ['name','path','description'], {name:LANG==='ja'?'名前':'Name',path:LANG==='ja'?'ファイルパス':'Path',description:LANG==='ja'?'説明':'Description'});
-
-  // Strengths
-  renderStrengthsList(vp.strengths || []);
-
-  // Success patterns
-  renderSuccessPatternsList(vp.successPatterns || []);
-
-  // Industry profiles
-  renderIndustryProfilesList(vp.industryProfiles || {});
-}
-
-function populateTargetList(tl) {
-  document.getElementById('tl-filePath').value = tl.filePath || '';
-  document.getElementById('tl-fileType').value = tl.fileType || 'xlsx';
-  document.getElementById('tl-sheetIndex').value = tl.sheetIndex || 0;
-  renderTargetColumnMapping(tl.columnMapping || {});
-}
-
-function populateExclusionRules(er) {
-  renderExclusionList('er-competitors-list', er.competitors || [], ['pattern','status']);
-  renderExclusionList('er-existingClients-list', er.existingClients || [], ['pattern','status']);
-  renderNgList(er.ngList || []);
-  renderCustomRulesList(er.customRules || []);
-  renderStringList('er-excludeStatuses-list', er.excludeStatuses || []);
-}
-
-function populateMessageTemplates(mt) {
-  const style = mt.style || {};
-  document.getElementById('mt-tone').value = style.tone || 'formal';
-  document.getElementById('mt-language').value = style.language || 'ja';
-  document.getElementById('mt-maxLength').value = style.maxLength || 2000;
-  document.getElementById('mt-signatureFormat').value = style.signatureFormat || 'full';
-  renderStringList('mt-inquiryTypes-list', mt.inquiryTypes || []);
-  document.getElementById('mt-greetingLine').value = mt.greetingLine || '';
-  document.getElementById('mt-approachObjective').value = mt.approachObjective || '';
-  document.getElementById('mt-approachGuardrails').value = mt.approachGuardrails || '';
-  document.getElementById('mt-closingLine').value = mt.closingLine || '';
-  document.getElementById('mt-cta').value = mt.cta || '';
-  document.getElementById('mt-referenceUrlText').value = mt.referenceUrlText || '';
-  document.getElementById('mt-signatureTemplate').value = mt.signatureTemplate || '';
-  const letter = mt.letterTemplate || {};
-  document.getElementById('mt-letter-enabled').value = String(letter.enabled || false);
-  document.getElementById('mt-letter-format').value = letter.format || 'A4';
-  document.getElementById('mt-letter-header').value = letter.header || '';
-  document.getElementById('mt-letter-footer').value = letter.footer || '';
-}
-
-function populatePreferences(pf) {
-  const fields = {
-    dashboardPort:'number', dashboardHost:'text', language:'select', timezone:'text', dateFormat:'text',
-    screenshotDir:'text', dataDir:'text', emailSearchKeyword:'text', emailProvider:'select',
-    maxRetries:'number', pageTimeout:'number', formFillTimeout:'number',
-    headless:'select', locale:'text', requireApprovalBeforeSend:'select', autoSendEligibleForms:'select',
-    userAgent:'text', logLevel:'select', maxLogEntries:'number', exportFilenamePrefix:'text',
-    aiProvider:'select'
-  };
-  Object.keys(fields).forEach(f => {
-    const el = document.getElementById('pf-'+f);
-    if (!el) return;
-    const val = pf[f];
-    if (fields[f] === 'select') {
-      el.value = String(val !== undefined ? val : '');
-    } else {
-      el.value = val !== undefined ? val : '';
-    }
-  });
-  const aiModels = pf.aiModels || {};
-  const aiModelClaude = document.getElementById('pf-aiModelClaude');
-  const aiModelCodex = document.getElementById('pf-aiModelCodex');
-  const aiModelGemini = document.getElementById('pf-aiModelGemini');
-  if (aiModelClaude) aiModelClaude.value = aiModels.claude || pf.claudeModel || '';
-  if (aiModelCodex) aiModelCodex.value = aiModels.codex || '';
-  if (aiModelGemini) aiModelGemini.value = aiModels.gemini || '';
-  _currentAiAutoSendSafe = !!pf.autoSendEligibleForms;
-  _launchAutoSendSafe = _currentAiAutoSendSafe;
-  if (pf.aiProvider) {
-    _currentAiProvider = pf.aiProvider;
-    updateLaunchProviderUi(_currentAiProvider);
-  }
-}
-
-async function browseForDirectory(fieldId) {
-  const input = document.getElementById(fieldId);
-  if (!input) return;
-  if (!NATIVE_DIRECTORY_PICKER_AVAILABLE) {
-    showToast(t('settings.dirPicker.desktopOnly'), 'info');
-    input.focus();
-    input.select?.();
-    return;
-  }
-  try {
-    const res = await fetch('/api/settings/select-directory', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ currentPath: input.value || '' }),
-    });
-    const result = await res.json();
-    if (result && result.ok && result.path) {
-      input.value = result.path;
-      scheduleSettingsSetupRefresh();
-      return;
-    }
-    if (result && result.cancelled) return;
-    showToast(t('alert.error') + ': ' + ((result && result.error) || 'Directory selection failed.'), 'error');
-  } catch (e) {
-    showToast(t('alert.error') + ': ' + e.message, 'error');
-  }
-}
-
-function renderTargetColumnMapping(mapping) {
-  const container = document.getElementById('tl-columnMappingList');
-  if (!container) return;
-  const current = { ...(mapping || {}) };
-  const fixedRows = TARGET_COLUMN_FIELDS.map((field) => {
-    const value = current[field];
-    return '<div class="column-map-row" data-key="' + esc(field) + '" data-fixed="1">'
-      + '<span class="column-map-label">' + esc(TARGET_COLUMN_LABELS[field] || field) + '</span>'
-      + '<input type="number" min="0" data-field="columnIndex" value="' + (value !== undefined && value !== null && value !== '' ? esc(value) : '') + '">'
-      + '<span></span>'
-      + '</div>';
-  }).join('');
-
-  const customEntries = Object.entries(current).filter(([field]) => !TARGET_COLUMN_FIELDS.includes(field));
-  const customRows = customEntries.map(([field, value], index) =>
-    '<div class="column-map-row" data-fixed="0">'
-      + '<input type="text" class="column-map-key" data-field="columnKey" value="' + esc(field) + '" placeholder="' + esc(t('field.customColumnKey')) + '">'
-      + '<input type="number" min="0" data-field="columnIndex" value="' + (value !== undefined && value !== null && value !== '' ? esc(value) : '') + '">'
-      + '<button type="button" class="remove-btn" onclick="removeCustomColumnMappingRow(' + index + ')">&times;</button>'
-      + '</div>'
-  ).join('');
-
-  container.innerHTML = fixedRows + customRows;
-  container.dataset.mapping = JSON.stringify(current);
-  scheduleSettingsSetupRefresh();
-}
-
-function collectTargetColumnMapping() {
-  const container = document.getElementById('tl-columnMappingList');
-  if (!container) return {};
-  const rows = container.querySelectorAll('.column-map-row');
-  const result = {};
-  rows.forEach((row) => {
-    const fixedKey = row.dataset.key || '';
-    const keyInput = row.querySelector('[data-field="columnKey"]');
-    const key = (fixedKey || (keyInput ? keyInput.value.trim() : '')).trim();
-    if (!key) return;
-    const indexInput = row.querySelector('[data-field="columnIndex"]');
-    const raw = indexInput ? String(indexInput.value || '').trim() : '';
-    if (raw === '') {
-      if (row.dataset.fixed === '1') result[key] = 0;
-      return;
-    }
-    const parsed = Number.parseInt(raw, 10);
-    if (Number.isFinite(parsed)) {
-      result[key] = parsed;
-    } else if (row.dataset.fixed === '1') {
-      result[key] = 0;
-    }
-  });
-  return result;
-}
-
-function hasFilledTargetColumn(field) {
-  const row = document.querySelector('#tl-columnMappingList .column-map-row[data-key="' + field + '"]');
-  if (!row) return false;
-  const input = row.querySelector('[data-field="columnIndex"]');
-  return !!(input && String(input.value || '').trim() !== '');
-}
-
-function addCustomColumnMappingRow() {
-  const mapping = collectTargetColumnMapping();
-  let suffix = 1;
-  let key = 'customField' + suffix;
-  while (Object.prototype.hasOwnProperty.call(mapping, key)) {
-    suffix += 1;
-    key = 'customField' + suffix;
-  }
-  mapping[key] = '';
-  renderTargetColumnMapping(mapping);
-}
-
-function removeCustomColumnMappingRow(index) {
-  const mapping = collectTargetColumnMapping();
-  const customKeys = Object.keys(mapping).filter((field) => !TARGET_COLUMN_FIELDS.includes(field));
-  const key = customKeys[index];
-  if (!key) return;
-  delete mapping[key];
-  renderTargetColumnMapping(mapping);
-}
-
-// --- String list renderer (for excludeStatuses, inquiryTypes) ---
-function renderStringList(containerId, items) {
-  const container = document.getElementById(containerId);
-  let html = '';
-  items.forEach((item, i) => {
-    html += '<div class="list-item"><span style="flex:1">'+esc(item)+'</span><button class="remove-btn" onclick="removeStringItem(\\x27'+containerId+'\\x27,'+i+')">&times;</button></div>';
-  });
-  html += '<div class="add-row"><input type="text" placeholder="'+t('settings.add')+'..." onkeydown="if(event.key===\\x27Enter\\x27)addStringItem(\\x27'+containerId+'\\x27,this)"><button onclick="addStringItem(\\x27'+containerId+'\\x27,this.previousElementSibling)">'+t('settings.add')+'</button></div>';
-  container.innerHTML = html;
-  container.dataset.items = JSON.stringify(items);
-  scheduleSettingsSetupRefresh();
-}
-
-function addStringItem(containerId, input) {
-  const val = input.value.trim();
-  if (!val) return;
-  const container = document.getElementById(containerId);
-  const items = JSON.parse(container.dataset.items || '[]');
-  items.push(val);
-  renderStringList(containerId, items);
-}
-
-function removeStringItem(containerId, idx) {
-  const container = document.getElementById(containerId);
-  const items = JSON.parse(container.dataset.items || '[]');
-  items.splice(idx, 1);
-  renderStringList(containerId, items);
-}
-
-function getStringListItems(containerId) {
-  const container = document.getElementById(containerId);
-  return JSON.parse(container.dataset.items || '[]');
-}
-
-// --- Simple object list renderer (for serviceUrls, documentPaths) ---
-function renderSimpleObjList(containerId, items, fields, labels) {
-  const container = document.getElementById(containerId);
-  let html = '';
-  items.forEach((item, i) => {
-    const display = fields.map(f => esc(item[f] || '')).join(' | ');
-    html += '<div class="list-item"><span style="flex:1;font-size:.78rem">'+display+'</span><button class="remove-btn" onclick="removeObjItem(\\x27'+containerId+'\\x27,'+i+')">&times;</button></div>';
-  });
-  const addInputs = fields.map(f => '<input type="text" placeholder="'+esc(labels[f]||f)+'" data-field="'+f+'">').join('');
-  html += '<div class="add-row">'+addInputs+'<button onclick="addObjItem(\\x27'+containerId+'\\x27,['+fields.map(f=>"\\x27"+f+"\\x27").join(',')+'])">'+t('settings.add')+'</button></div>';
-  container.innerHTML = html;
-  container.dataset.items = JSON.stringify(items);
-  container.dataset.fields = JSON.stringify(fields);
-  scheduleSettingsSetupRefresh();
-}
-
-function addObjItem(containerId, fields) {
-  const container = document.getElementById(containerId);
-  const items = JSON.parse(container.dataset.items || '[]');
-  const storedFields = JSON.parse(container.dataset.fields || '[]');
-  const inputs = container.querySelectorAll('.add-row input');
-  const obj = {};
-  let hasVal = false;
-  inputs.forEach(input => {
-    obj[input.dataset.field] = input.value.trim();
-    if (input.value.trim()) hasVal = true;
-  });
-  if (!hasVal) return;
-  items.push(obj);
-  const labels = {};
-  inputs.forEach(input => { labels[input.dataset.field] = input.placeholder; });
-  renderSimpleObjList(containerId, items, storedFields, labels);
-}
-
-function removeObjItem(containerId, idx) {
-  const container = document.getElementById(containerId);
-  const items = JSON.parse(container.dataset.items || '[]');
-  const fields = JSON.parse(container.dataset.fields || '[]');
-  items.splice(idx, 1);
-  const labels = {};
-  fields.forEach(f => { labels[f] = f; });
-  renderSimpleObjList(containerId, items, fields, labels);
-}
-
-function getObjListItems(containerId) {
-  const container = document.getElementById(containerId);
-  return JSON.parse(container.dataset.items || '[]');
-}
-
-// --- Strengths list ---
-function renderStrengthsList(items) {
-  const container = document.getElementById('vp-strengths-list');
-  container.innerHTML = items.map((item, i) =>
-    '<div class="obj-list-item" data-idx="'+i+'">'
-    +'<div class="d-flex justify-content-between"><strong style="font-size:.82rem">'+(item.label||item.key||'Strength '+(i+1))+'</strong><button class="remove-btn" onclick="removeStrengthItem('+i+')">&times;</button></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'キー':'Key')+'</label><input type="text" value="'+esc(item.key||'')+'" data-field="key"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'ラベル':'Label')+'</label><input type="text" value="'+esc(item.label||'')+'" data-field="label"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'詳細':'Detail')+'</label><input type="text" value="'+esc(item.detail||'')+'" data-field="detail"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'キーワード':'Keywords')+'</label><input type="text" value="'+esc((item.keywords||[]).join(', '))+'" data-field="keywords" placeholder="'+(LANG==='ja'?'カンマ区切り':'comma separated')+'"></div>'
-    +'</div>'
-  ).join('');
-  container.dataset.items = JSON.stringify(items);
-  scheduleSettingsSetupRefresh();
-}
-
-function addStrengthItem() {
-  const container = document.getElementById('vp-strengths-list');
-  const items = collectStrengthItems();
-  items.push({ key: '', label: '', detail: '', keywords: [] });
-  renderStrengthsList(items);
-}
-
-function removeStrengthItem(idx) {
-  const items = collectStrengthItems();
-  items.splice(idx, 1);
-  renderStrengthsList(items);
-}
-
-function collectStrengthItems() {
-  const container = document.getElementById('vp-strengths-list');
-  const cards = container.querySelectorAll('.obj-list-item');
-  return Array.from(cards).map(card => {
-    const obj = {};
-    card.querySelectorAll('input').forEach(inp => {
-      if (inp.dataset.field === 'keywords') {
-        obj.keywords = inp.value.split(',').map(s=>s.trim()).filter(Boolean);
-      } else {
-        obj[inp.dataset.field] = inp.value;
-      }
-    });
-    return obj;
-  });
-}
-
-// --- Success patterns list ---
-function renderSuccessPatternsList(items) {
-  const container = document.getElementById('vp-successPatterns-list');
-  container.innerHTML = items.map((item, i) =>
-    '<div class="obj-list-item" data-idx="'+i+'">'
-    +'<div class="d-flex justify-content-between"><strong style="font-size:.82rem">'+(item.partner||'Pattern '+(i+1))+'</strong><button class="remove-btn" onclick="removeSuccessPatternItem('+i+')">&times;</button></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'パートナー':'Partner')+'</label><input type="text" value="'+esc(item.partner||'')+'" data-field="partner"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'実績内容':'Proof')+'</label><input type="text" value="'+esc(item.proof||'')+'" data-field="proof"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'カテゴリ':'Type')+'</label><input type="text" value="'+esc(item.type||'')+'" data-field="type"></div>'
-    +'</div>'
-  ).join('');
-  container.dataset.items = JSON.stringify(items);
-  scheduleSettingsSetupRefresh();
-}
-
-function addSuccessPatternItem() {
-  const items = collectSuccessPatternItems();
-  items.push({ partner: '', proof: '', type: '' });
-  renderSuccessPatternsList(items);
-}
-
-function removeSuccessPatternItem(idx) {
-  const items = collectSuccessPatternItems();
-  items.splice(idx, 1);
-  renderSuccessPatternsList(items);
-}
-
-function collectSuccessPatternItems() {
-  const container = document.getElementById('vp-successPatterns-list');
-  const cards = container.querySelectorAll('.obj-list-item');
-  return Array.from(cards).map(card => {
-    const obj = {};
-    card.querySelectorAll('input').forEach(inp => { obj[inp.dataset.field] = inp.value; });
-    return obj;
-  });
-}
-
-// --- Industry profiles ---
-function renderIndustryProfilesList(profiles) {
-  const container = document.getElementById('vp-industryProfiles-list');
-  const entries = Object.entries(profiles);
-  container.innerHTML = entries.map(([key, val], i) =>
-    '<div class="obj-list-item" data-idx="'+i+'">'
-    +'<div class="d-flex justify-content-between"><strong style="font-size:.82rem">'+esc(key)+'</strong><button class="remove-btn" onclick="removeIndustryProfile('+i+')">&times;</button></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'業種キー':'Key')+'</label><input type="text" value="'+esc(key)+'" data-field="__key"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'オープナー':'Opener')+'</label><input type="text" value="'+esc(val.opener||'')+'" data-field="opener"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'ポイント':'Point')+'</label><input type="text" value="'+esc(val.point||'')+'" data-field="point"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'実績例':'Examples')+'</label><input type="text" value="'+esc(val.examples||'')+'" data-field="examples"></div>'
-    +'<div class="obj-row"><label>'+(LANG==='ja'?'強み':'Strength')+'</label><input type="text" value="'+esc(val.strength||'')+'" data-field="strength"></div>'
-    +'</div>'
-  ).join('');
-  container.dataset.items = JSON.stringify(profiles);
-  scheduleSettingsSetupRefresh();
-}
-
-function addIndustryProfile() {
-  const profiles = collectIndustryProfiles();
-  profiles['new_type'] = { opener: '', point: '', examples: '', strength: '' };
-  renderIndustryProfilesList(profiles);
-}
-
-function removeIndustryProfile(idx) {
-  const profiles = collectIndustryProfiles();
-  const keys = Object.keys(profiles);
-  if (keys[idx]) delete profiles[keys[idx]];
-  renderIndustryProfilesList(profiles);
-}
-
-function collectIndustryProfiles() {
-  const container = document.getElementById('vp-industryProfiles-list');
-  const cards = container.querySelectorAll('.obj-list-item');
-  const result = {};
-  cards.forEach(card => {
-    const inputs = card.querySelectorAll('input');
-    let key = '';
-    const obj = {};
-    inputs.forEach(inp => {
-      if (inp.dataset.field === '__key') key = inp.value.trim();
-      else obj[inp.dataset.field] = inp.value;
-    });
-    if (key) result[key] = obj;
-  });
-  return result;
-}
-
-// --- Exclusion lists ---
-const _exclPh = LANG==='ja' ? {pattern:'会社名パターン',status:'ステータス',reason:'理由'} : {pattern:'Pattern',status:'Status',reason:'Reason'};
-function renderExclusionList(containerId, items, fields) {
-  const container = document.getElementById(containerId);
-  container.innerHTML = items.map((item, i) =>
-    '<div class="obj-list-item" data-idx="'+i+'">'
-    +'<div class="d-flex justify-content-between align-items-center">'
-    +'<div style="flex:1;display:flex;gap:8px">'
-    +fields.map(f => '<input type="text" value="'+esc(item[f]||'')+'" data-field="'+f+'" placeholder="'+(_exclPh[f]||f)+'" style="flex:1;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">').join('')
-    +'</div>'
-    +'<button class="remove-btn" onclick="removeExclusionItem(\\x27'+containerId+'\\x27,'+i+')">&times;</button>'
-    +'</div></div>'
-  ).join('');
-  container.dataset.items = JSON.stringify(items);
-  container.dataset.fields = JSON.stringify(fields);
-  scheduleSettingsSetupRefresh();
-}
-
-function addExclusionItem(type) {
-  const containerId = 'er-'+type+'-list';
-  const items = collectExclusionItems(containerId);
-  items.push({ pattern: '', status: '' });
-  const fields = JSON.parse(document.getElementById(containerId).dataset.fields || '["pattern","status"]');
-  renderExclusionList(containerId, items, fields);
-}
-
-function removeExclusionItem(containerId, idx) {
-  const items = collectExclusionItems(containerId);
-  items.splice(idx, 1);
-  const fields = JSON.parse(document.getElementById(containerId).dataset.fields || '["pattern","status"]');
-  renderExclusionList(containerId, items, fields);
-}
-
-function collectExclusionItems(containerId) {
-  const container = document.getElementById(containerId);
-  const cards = container.querySelectorAll('.obj-list-item');
-  return Array.from(cards).map(card => {
-    const obj = {};
-    card.querySelectorAll('input').forEach(inp => { obj[inp.dataset.field] = inp.value; });
-    return obj;
-  });
-}
-
-// NG list
-function renderNgList(items) {
-  const container = document.getElementById('er-ngList-list');
-  container.innerHTML = items.map((item, i) =>
-    '<div class="obj-list-item" data-idx="'+i+'">'
-    +'<div class="d-flex justify-content-between align-items-center">'
-    +'<div style="flex:1;display:flex;gap:8px">'
-    +'<input type="text" value="'+esc(item.pattern||'')+'" data-field="pattern" placeholder="'+(LANG==='ja'?'会社名パターン':'Pattern')+'" style="flex:1;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">'
-    +'<input type="text" value="'+esc(item.reason||'')+'" data-field="reason" placeholder="'+(LANG==='ja'?'除外理由':'Reason')+'" style="flex:1;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">'
-    +'<input type="text" value="'+esc(item.status||'NG')+'" data-field="status" placeholder="'+(LANG==='ja'?'ステータス':'Status')+'" style="width:80px;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">'
-    +'</div>'
-    +'<button class="remove-btn" onclick="removeNgItem('+i+')">&times;</button>'
-    +'</div></div>'
-  ).join('');
-  container.dataset.items = JSON.stringify(items);
-  scheduleSettingsSetupRefresh();
-}
-
-function addNgItem() {
-  const items = collectNgItems();
-  items.push({ pattern: '', reason: '', status: 'NG' });
-  renderNgList(items);
-}
-
-function removeNgItem(idx) {
-  const items = collectNgItems();
-  items.splice(idx, 1);
-  renderNgList(items);
-}
-
-function collectNgItems() {
-  const container = document.getElementById('er-ngList-list');
-  const cards = container.querySelectorAll('.obj-list-item');
-  return Array.from(cards).map(card => {
-    const obj = {};
-    card.querySelectorAll('input').forEach(inp => { obj[inp.dataset.field] = inp.value; });
-    return obj;
-  });
-}
-
-// Custom rules
-function renderCustomRulesList(items) {
-  const container = document.getElementById('er-customRules-list');
-  container.innerHTML = items.map((item, i) =>
-    '<div class="obj-list-item" data-idx="'+i+'">'
-    +'<div class="d-flex justify-content-between align-items-center">'
-    +'<div style="flex:1;display:flex;gap:8px">'
-    +'<input type="text" value="'+esc(item.pattern||'')+'" data-field="pattern" placeholder="'+(LANG==='ja'?'正規表現パターン':'Regex pattern')+'" style="flex:1;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">'
-    +'<input type="text" value="'+esc(item.status||'')+'" data-field="status" placeholder="'+(LANG==='ja'?'ステータス':'Status')+'" style="width:120px;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">'
-    +'<input type="text" value="'+esc(item.reason||'')+'" data-field="reason" placeholder="'+(LANG==='ja'?'理由':'Reason')+'" style="flex:1;padding:4px 8px;border:1px solid var(--surface-high);border-radius:var(--radius-md);font-size:.8rem">'
-    +'</div>'
-    +'<button class="remove-btn" onclick="removeCustomRule('+i+')">&times;</button>'
-    +'</div></div>'
-  ).join('');
-  container.dataset.items = JSON.stringify(items);
-  scheduleSettingsSetupRefresh();
-}
-
-function addCustomRule() {
-  const items = collectCustomRules();
-  items.push({ pattern: '', status: '', reason: '' });
-  renderCustomRulesList(items);
-}
-
-function removeCustomRule(idx) {
-  const items = collectCustomRules();
-  items.splice(idx, 1);
-  renderCustomRulesList(items);
-}
-
-function collectCustomRules() {
-  const container = document.getElementById('er-customRules-list');
-  const cards = container.querySelectorAll('.obj-list-item');
-  return Array.from(cards).map(card => {
-    const obj = {};
-    card.querySelectorAll('input').forEach(inp => { obj[inp.dataset.field] = inp.value; });
-    return obj;
-  });
-}
-
-// --- Save section ---
-async function saveSection(section) {
-  let data;
-  try {
-    if (section === 'companyProfile') {
-      data = {};
-      ['companyName','companyNameEn','companyNameKana','representative','contactName','contactNameKana','contactTitle','department','email','phone','fax','mobile','postalCode','address','addressEn','website','partnerPage','corporateProfile','established','employeeCount','capital','industry','businessDescription','notes'].forEach(f => {
-        data[f] = document.getElementById('cp-'+f).value;
-      });
-    } else if (section === 'valuePropositions') {
-      data = {
-        companyUrl: document.getElementById('vp-companyUrl').value,
-        serviceUrls: getObjListItems('vp-serviceUrls-list'),
-        documentPaths: getObjListItems('vp-documentPaths-list'),
-        strengths: collectStrengthItems(),
-        successPatterns: collectSuccessPatternItems(),
-        industryProfiles: collectIndustryProfiles(),
-      };
-    } else if (section === 'targetList') {
-      data = {
-        filePath: document.getElementById('tl-filePath').value,
-        fileType: document.getElementById('tl-fileType').value,
-        sheetIndex: parseInt(document.getElementById('tl-sheetIndex').value) || 0,
-        columnMapping: collectTargetColumnMapping(),
-      };
-    } else if (section === 'exclusionRules') {
-      data = {
-        competitors: collectExclusionItems('er-competitors-list'),
-        existingClients: collectExclusionItems('er-existingClients-list'),
-        ngList: collectNgItems(),
-        customRules: collectCustomRules(),
-        excludeStatuses: getStringListItems('er-excludeStatuses-list'),
-      };
-    } else if (section === 'messageTemplates') {
-      data = {
-        style: {
-          tone: document.getElementById('mt-tone').value,
-          language: document.getElementById('mt-language').value,
-          maxLength: parseInt(document.getElementById('mt-maxLength').value) || 2000,
-          signatureFormat: document.getElementById('mt-signatureFormat').value,
-        },
-        inquiryTypes: getStringListItems('mt-inquiryTypes-list'),
-        greetingLine: document.getElementById('mt-greetingLine').value,
-        approachObjective: document.getElementById('mt-approachObjective').value,
-        approachGuardrails: document.getElementById('mt-approachGuardrails').value,
-        closingLine: document.getElementById('mt-closingLine').value,
-        cta: document.getElementById('mt-cta').value,
-        referenceUrlText: document.getElementById('mt-referenceUrlText').value,
-        signatureTemplate: document.getElementById('mt-signatureTemplate').value,
-        letterTemplate: {
-          enabled: document.getElementById('mt-letter-enabled').value === 'true',
-          format: document.getElementById('mt-letter-format').value,
-          header: document.getElementById('mt-letter-header').value,
-          footer: document.getElementById('mt-letter-footer').value,
-        },
-      };
-    } else if (section === 'preferences') {
-      data = {
-        dashboardPort: parseInt(document.getElementById('pf-dashboardPort').value) || 3765,
-        dashboardHost: document.getElementById('pf-dashboardHost').value,
-        language: document.getElementById('pf-language').value,
-        timezone: document.getElementById('pf-timezone').value,
-        dateFormat: document.getElementById('pf-dateFormat').value,
-        screenshotDir: document.getElementById('pf-screenshotDir').value,
-        dataDir: document.getElementById('pf-dataDir').value,
-        emailSearchKeyword: document.getElementById('pf-emailSearchKeyword').value,
-        emailProvider: document.getElementById('pf-emailProvider').value,
-        maxRetries: parseInt(document.getElementById('pf-maxRetries').value) || 3,
-        pageTimeout: parseInt(document.getElementById('pf-pageTimeout').value) || 15000,
-        formFillTimeout: parseInt(document.getElementById('pf-formFillTimeout').value) || 5000,
-        headless: document.getElementById('pf-headless').value === 'true',
-        locale: document.getElementById('pf-locale').value,
-        requireApprovalBeforeSend: document.getElementById('pf-requireApprovalBeforeSend').value === 'true',
-        autoSendEligibleForms: document.getElementById('pf-autoSendEligibleForms').value === 'true',
-        userAgent: document.getElementById('pf-userAgent').value,
-        logLevel: document.getElementById('pf-logLevel').value,
-        maxLogEntries: parseInt(document.getElementById('pf-maxLogEntries').value) || 10000,
-        exportFilenamePrefix: document.getElementById('pf-exportFilenamePrefix').value,
-        aiProvider: document.getElementById('pf-aiProvider').value,
-        aiModels: {
-          claude: document.getElementById('pf-aiModelClaude').value,
-          codex: document.getElementById('pf-aiModelCodex').value,
-          gemini: document.getElementById('pf-aiModelGemini').value,
-        },
-        claudeModel: document.getElementById('pf-aiModelClaude').value,
-      };
-    }
-
-    const res = await safeFetch('/api/settings/' + section, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    }, '設定を保存中...');
-    const result = await res.json();
-  if (result.ok) {
-      _settingsCache = { ...(_settingsCache || {}), [section]: data };
-      _settingsLoaded = true;
-      _settingsDirty = false;
-      renderSettingsSetupGuide();
-      if (section === 'targetList') loadTargetPreview();
-      if (section === 'preferences') {
-        _currentAiProvider = data.aiProvider || _currentAiProvider;
-        _currentAiAutoSendSafe = !!data.autoSendEligibleForms;
-        _launchAutoSendSafe = _currentAiAutoSendSafe;
-        updateLaunchProviderUi(_currentAiProvider);
-        setTimeout(pollClaudeStatus, 300);
-      }
-      showToast(t('settings.saved'), 'success');
-    } else {
-      showToast(t('settings.saveError') + ': ' + (result.error || 'Unknown'), 'error');
-    }
-  } catch (e) {
-    showToast(t('settings.saveError') + ': ' + e.message, 'error');
-  }
-}
-
-// Target list preview
-async function loadTargetPreview() {
-  try {
-    const res = await fetch('/api/settings/target-list/preview');
-    const data = await res.json();
-    if (data.error) { document.getElementById('targetPreview').innerHTML = '<div class="text-danger">'+esc(data.error)+'</div>'; return; }
-    const rows = data.rows || [];
-    if (rows.length === 0) { document.getElementById('targetPreview').innerHTML = '<div class="text-muted">No data found.</div>'; return; }
-    const headers = data.headers || [];
-    let html = '<table class="preview-table"><thead><tr>';
-    headers.forEach((h,i) => { html += '<th>Col '+i+(h?' ('+esc(h)+')':'')+'</th>'; });
-    html += '</tr></thead><tbody>';
-    rows.forEach(row => {
-      html += '<tr>';
-      for (let i = 0; i < headers.length; i++) { html += '<td>'+esc(row[i]||'')+'</td>'; }
-      html += '</tr>';
-    });
-    html += '</tbody></table>';
-    document.getElementById('targetPreview').innerHTML = html;
-  } catch (e) {
-    document.getElementById('targetPreview').innerHTML = '<div class="text-danger">'+esc(e.message)+'</div>';
-  }
-}
-
-// ─── フローティングターミナルドロワー ───────────────────────────────
-// ヘッダーのターミナルボタンで全タブから開閉できる固定ドロワー
-function toggleTermDrawer() {
-  _termDrawerOpen = !_termDrawerOpen;
-  const drawer = document.getElementById('termDrawer');
-  const btn = document.getElementById('termDrawerToggleBtn');
-  if (!drawer) return;
-  drawer.style.transform = _termDrawerOpen ? 'translateY(0)' : 'translateY(100%)';
-  if (btn) btn.style.background = _termDrawerOpen ? 'var(--primary)' : 'var(--surface-low)';
-  if (btn) {
-    const icon = btn.querySelector('.material-symbols-outlined');
-    if (icon) icon.style.color = _termDrawerOpen ? '#fff' : '';
-  }
-  if (_termDrawerOpen) {
-    const s = document.getElementById('termDrawerStream');
-    if (s) s.scrollTop = s.scrollHeight;
-    try { localStorage.setItem('termDrawerOpen','1'); } catch(_){}
-  } else {
-    try { localStorage.setItem('termDrawerOpen','0'); } catch(_){}
-  }
-}
-// ターミナルドロワーは主監視UIから外したため、自動復元しない
+${renderDashboardScript()}
+${renderAnalyticsScript()}
 </script>
 
 </body>
 </html>`;
+}
+
+// Settings API dispatcher (src/routes/settings-api.cjs に分離済み)
+// lazy-init: 初回リクエストで factory を呼んで dispatcher を取得する。
+// ctx に渡す関数群はすべて function 宣言で hoisting 済み。
+let _settingsApiDispatch = null;
+function getSettingsApiDispatch() {
+  if (!_settingsApiDispatch) {
+    _settingsApiDispatch = require('./routes/settings-api.cjs')({
+      jsonResponse,
+      parseJsonBody,
+      notifyClients,
+      refreshWatchTargets,
+      openDirectoryPicker,
+      toStoredProjectPath,
+      loadData,
+      purgeHistoryOnlyCompany,
+      findRuntimeCompanyRecord,
+    });
+  }
+  return _settingsApiDispatch;
+}
+
+// Simple API dispatcher (src/routes/simple-api.cjs)
+// /api/cli-log, /api/install-update, /api/update-status, /api/export, /api/data,
+// /api/claude-status, /api/ai/status, /api/ai/setup-diagnostics, /api/ai-submit*
+let _simpleApiDispatch = null;
+function getSimpleApiDispatch() {
+  if (!_simpleApiDispatch) {
+    _simpleApiDispatch = require('./routes/simple-api.cjs')({
+      jsonResponse,
+      parseJsonBody,
+      loadData,
+      sseClients,
+      probeClaudeStatus,
+      probeAiSetupDiagnostics,
+      getSelectedAiProvider,
+      ensureParentDir,
+      AUTO_UPDATE_ENABLED,
+      APP_BUILD_SOURCE,
+      APP_VERSION,
+    });
+  }
+  return _simpleApiDispatch;
+}
+
+// AI Runtime API dispatcher (src/routes/ai-runtime-api.cjs)
+// /api/install-ai-cli, /api/launch-ai, /api/launch-ai-external, /api/stop-ai, /api/ai-input
+let _aiRuntimeApiDispatch = null;
+function getAiRuntimeApiDispatch() {
+  if (!_aiRuntimeApiDispatch) {
+    _aiRuntimeApiDispatch = require('./routes/ai-runtime-api.cjs')({
+      jsonResponse,
+      parseJsonBody,
+      PROJECT_ROOT,
+      normalizeProviderId,
+      getSelectedAiProvider,
+      getProvider,
+      getProviderDisplayName,
+      probeNpmStatus,
+      probeClaudeStatus,
+      setProviderInstallState,
+      invalidateAiStatusCache,
+      clearAiExecutablePath: (providerId) => { _aiExecutablePath[providerId] = null; },
+      startManagedAiSession,
+      launchClaudeInExternalTerminal,
+      stopManagedClaudePty,
+      stopHeadlessAiRun,
+      getActiveHeadlessRun,
+      getHeadlessAiRun: () => headlessAiRun,
+      getClaudePty: () => claudePty,
+      getClaudeProcess: () => claudeProcess,
+      clearClaudeProcess: () => {
+        if (claudeProcess && !claudeProcess.killed) {
+          try { claudeProcess.kill(); } catch (_) {}
+        }
+        claudeProcess = null;
+      },
+      appendDiagnosticEvent,
+    });
+  }
+  return _aiRuntimeApiDispatch;
+}
+
+// Form Session API dispatcher (src/routes/form-session-api.cjs)
+// /api/form-session/* 全 10 エンドポイント
+let _formSessionApiDispatch = null;
+function getFormSessionApiDispatch() {
+  if (!_formSessionApiDispatch) {
+    _formSessionApiDispatch = require('./routes/form-session-api.cjs')({
+      jsonResponse,
+      parseJsonBody,
+      getFormSessionManager: () => _formSessionManager,
+      settings,
+    });
+  }
+  return _formSessionApiDispatch;
+}
+
+// Approve API dispatcher (src/routes/approve-api.cjs)
+// /api/approve (確認待ち → 送信済み / スキップ)
+let _approveApiDispatch = null;
+function getApproveApiDispatch() {
+  if (!_approveApiDispatch) {
+    _approveApiDispatch = require('./routes/approve-api.cjs')({
+      getUiLang,
+      i18nT,
+      appendDiagnosticEvent,
+      getCompanyLogContext,
+      isAwaitingTransitionAllowed,
+      findRuntimeCompanyRecord,
+      getKnownFormUrl,
+      ensureSubmittedContactHistory,
+      stringifyLogDetails,
+      getLatestLog,
+      updateCompany,
+      notifyClients,
+      ensureParentDir,
+    });
+  }
+  return _approveApiDispatch;
+}
+
+// AI Form Fill API dispatcher (src/routes/ai-form-fill-api.cjs)
+// /api/ai-form-fill (AI バッチキュー投入のメインエンドポイント)
+let _aiFormFillApiDispatch = null;
+function getAiFormFillApiDispatch() {
+  if (!_aiFormFillApiDispatch) {
+    _aiFormFillApiDispatch = require('./routes/ai-form-fill-api.cjs')({
+      jsonResponse,
+      parseJsonBody,
+      normalizeProviderId,
+      getSelectedAiProvider,
+      isAiRuntimeActivelyProcessing,
+      findCompaniesByNos,
+      appendDiagnosticEvent,
+      executeBackendPhaseABatch,
+      ensureClaudeAutomationReady,
+      queueAiFormFill,
+      getManagedAiAutoSendSafe,
+      getManagedAiReservedCompanyNos,
+      cleanupStaleManagedAiMonitorEvents,
+      getActiveHeadlessRun,
+      getClaudePty: () => claudePty,
+      getManagedAiBatchController: () => managedAiBatchController,
+      setManagedAiBatchActive: (value) => {
+        if (managedAiBatchController) managedAiBatchController.activeBatch = value;
+      },
+      getManagedAiRecoveryTimer: () => managedAiRecoveryTimer,
+    });
+  }
+  return _aiFormFillApiDispatch;
 }
 
 // HTTP Server
@@ -10777,15 +6385,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Assets serving (favicon, icons)
+  // Assets serving (favicon, icons, vendor fonts/css)
+  // /assets/foo.png         → assets/foo.png (レガシー)
+  // /assets/vendor/x.woff2  → assets/vendor/x.woff2 (新規・ローカルバンドル)
   if (pathname.startsWith('/assets/')) {
-    const filename = path.basename(pathname);
-    const ext = path.extname(filename).toLowerCase();
-    const mime = ext === '.ico' ? 'image/x-icon' : ext === '.png' ? 'image/png' : 'application/octet-stream';
-    for (const filepath of getAssetCandidates(filename)) {
+    const relative = decodeURIComponent(pathname.slice('/assets/'.length));
+    const ext = path.extname(relative).toLowerCase();
+    const mime = assetMimeFor(ext);
+    for (const filepath of getAssetCandidates(relative)) {
       try {
         const data = fs.readFileSync(filepath);
-        res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=86400' });
+        // フォント・CSS・画像は長期キャッシュ（ファイル名が変わらない前提）
+        const cache = ['.woff2', '.woff', '.ttf', '.otf', '.css', '.js', '.png', '.ico', '.svg']
+          .includes(ext) ? 'public, max-age=604800, immutable' : 'public, max-age=86400';
+        res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': cache });
         res.end(data);
         return;
       } catch (_) {}
@@ -10818,1192 +6431,55 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // --- Settings API endpoints ---
+  // --- Settings API endpoints (src/routes/settings-api.cjs に分離済み) ---
+  // /api/settings/*, /api/companies/*, /api/outreach-targets, /api/outreach/prepare,
+  // /api/target-list/import を 1 箇所の dispatcher で処理する。
+  if (await getSettingsApiDispatch()(req, res, pathname)) return;
 
-  // POST /api/settings/select-directory - open native folder picker
-  if (req.url === '/api/settings/select-directory' && req.method === 'POST') {
-    try {
-      const body = await parseJsonBody(req).catch(() => ({}));
-      const selectedPath = await openDirectoryPicker(body.currentPath || '');
-      if (!selectedPath) {
-        jsonResponse(res, 200, { ok: true, cancelled: true });
-        return;
-      }
-      jsonResponse(res, 200, { ok: true, path: toStoredProjectPath(selectedPath) });
-    } catch (e) {
-      const statusCode = /desktop app|browser-only mode/i.test(String(e.message || '')) ? 409 : 500;
-      jsonResponse(res, statusCode, { ok: false, error: e.message });
-    }
-    return;
-  }
+  // --- Simple API endpoints (src/routes/simple-api.cjs) ---
+  // /api/cli-log, /api/install-update, /api/update-status, /api/export, /api/data,
+  // /api/claude-status, /api/ai/status, /api/ai/setup-diagnostics, /api/ai-submit*
+  if (await getSimpleApiDispatch()(req, res, pathname, requestUrl)) return;
 
-  // GET /api/settings/excel/export - export Company Profile + Value Propositions workbook
-  if (req.url.startsWith('/api/settings/excel/export') && req.method === 'GET') {
-    try {
-      const requestUrl = new URL(req.url, 'http://127.0.0.1');
-      const mode = requestUrl.searchParams.get('mode') === 'template' ? 'template' : 'current';
-      const buffer = buildSettingsWorkbookBuffer({
-        mode,
-        settingsData: settings.getAll(),
-      });
-      const stamp = new Date().toISOString().slice(0, 10);
-      const filename = `sales-claw-settings-${mode}-${stamp}.xlsx`;
-      res.writeHead(200, {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'Cache-Control': 'no-store',
-      });
-      res.end(buffer);
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
+  // --- AI Runtime API endpoints (src/routes/ai-runtime-api.cjs) ---
+  // /api/install-ai-cli, /api/launch-ai, /api/launch-ai-external, /api/stop-ai, /api/ai-input
+  if (await getAiRuntimeApiDispatch()(req, res, pathname)) return;
 
-  // POST /api/settings/excel/import - import Company Profile + Value Propositions workbook
-  if (req.url === '/api/settings/excel/import' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const { contentBase64 } = data || {};
-      if (!contentBase64) {
-        jsonResponse(res, 400, { ok: false, error: 'contentBase64 is required.' });
-        return;
-      }
-      const imported = parseSettingsWorkbookBuffer(Buffer.from(contentBase64, 'base64'));
-      if (imported.sections.companyProfile) {
-        settings.replaceSection('companyProfile', imported.sections.companyProfile);
-      }
-      if (imported.sections.valuePropositions) {
-        settings.replaceSection('valuePropositions', imported.sections.valuePropositions);
-      }
-      notifyClients({ type: 'update', reason: 'settings-excel-imported', time: Date.now() });
-      jsonResponse(res, 200, {
-        ok: true,
-        applied: imported.applied,
-        summary: imported.summary,
-        companyProfile: imported.sections.companyProfile || null,
-        valuePropositions: imported.sections.valuePropositions || null,
-      });
-    } catch (e) {
-      jsonResponse(res, 400, { ok: false, error: e.message });
-    }
-    return;
-  }
+  // --- Form Session API endpoints (src/routes/form-session-api.cjs) ---
+  // /api/form-session/* 全 10 エンドポイント
+  if (await getFormSessionApiDispatch()(req, res, pathname)) return;
 
-  // GET /api/settings - returns all settings
-  if (req.url === '/api/settings' && req.method === 'GET') {
-    try {
-      jsonResponse(res, 200, settings.getAll());
-    } catch (e) {
-      jsonResponse(res, 500, { error: e.message });
-    }
-    return;
-  }
+  // --- Approve API endpoint (src/routes/approve-api.cjs) ---
+  // POST /api/approve
+  if (await getApproveApiDispatch()(req, res, pathname)) return;
 
-  // PUT /api/settings/:section - update a section
-  if (req.url.match(/^\/api\/settings\/(companyProfile|valuePropositions|targetList|exclusionRules|messageTemplates|preferences)$/) && req.method === 'PUT') {
-    try {
-      const section = req.url.split('/').pop();
-      const data = await parseJsonBody(req);
-      settings.replaceSection(section, data);
-
-      // 設定変更を監査ログに記録
-      try {
-        const { logAction } = require('./action-logger.cjs');
-        logAction(-1, 'SYSTEM', 'settings_changed', 'セクション「' + section + '」を更新');
-      } catch (_) {}
-
-      refreshWatchTargets();
-      notifyClients({ type: 'update', reason: 'settings-saved', time: Date.now() });
-      jsonResponse(res, 200, { ok: true, data: settings.getSection(section) });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/settings/upload-document - register document file path
-  if (req.url === '/api/settings/upload-document' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const { name, filePath, description } = data;
-      if (!name || !filePath) {
-        jsonResponse(res, 400, { error: 'name and filePath are required' });
-        return;
-      }
-      const vp = settings.getSection('valuePropositions');
-      const docs = vp.documentPaths || [];
-      docs.push({ name, path: filePath, description: description || '' });
-      settings.updateSection('valuePropositions', { documentPaths: docs });
-      jsonResponse(res, 200, { ok: true });
-    } catch (e) {
-      jsonResponse(res, 500, { error: e.message });
-    }
-    return;
-  }
-
-  // GET /api/settings/target-list/preview - preview first 10 rows
-  if (req.url === '/api/settings/target-list/preview' && req.method === 'GET') {
-    try {
-      const preview = getTargetPreview(10);
-      if (!preview.ok) {
-        jsonResponse(res, 200, { error: preview.error });
-        return;
-      }
-      jsonResponse(res, 200, { headers: preview.headers, rows: preview.rows });
-    } catch (e) {
-      jsonResponse(res, 200, { error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/target-list/import - import Excel/CSV and switch target list
-  if (req.url === '/api/target-list/import' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const { fileName, contentBase64 } = data || {};
-      if (!fileName || !contentBase64) {
-        jsonResponse(res, 400, { ok: false, error: 'fileName and contentBase64 are required.' });
-        return;
-      }
-
-      const imported = importTargetList({
-        fileName,
-        buffer: Buffer.from(contentBase64, 'base64'),
-      });
-
-      if (!imported.ok) {
-        jsonResponse(res, 400, { ok: false, error: imported.error || 'Import failed.' });
-        return;
-      }
-
-      refreshWatchTargets();
-      notifyClients({ type: 'update', reason: 'target-list-imported', time: Date.now() });
-      jsonResponse(res, 200, { ok: true, ...imported });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/companies - add a company row to current target list
-  if (req.url === '/api/companies' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const created = appendCompany(data || {});
-      if (!created.ok) {
-        jsonResponse(res, 400, { ok: false, error: created.error || 'Company add failed.' });
-        return;
-      }
-
-      if (data && data.addToTarget) {
-        setTargets([{
-          companyNo: created.company.no,
-          companyName: created.company.companyName,
-        }], true);
-      }
-
-      refreshWatchTargets();
-      notifyClients({ type: 'update', reason: 'company-added', time: Date.now() });
-      jsonResponse(res, 200, { ok: true, company: created.company, targetPath: created.targetPath });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  if (req.url === '/api/companies/bulk-delete' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const companyNos = Array.isArray(data && data.companyNos) ? data.companyNos : [];
-      if (companyNos.length === 0) {
-        jsonResponse(res, 400, { ok: false, error: 'companyNos is required.' });
-        return;
-      }
-
-      const uniqueCompanyNos = Array.from(new Set(companyNos.map((value) => String(value))));
-      const deletedCompanies = [];
-      const skippedCompanies = [];
-      const runtimeCompanyMap = new Map(loadData().companies.map((company) => [String(company.no), company]));
-      for (const companyNo of uniqueCompanyNos) {
-        let removed = deleteCompany(companyNo);
-        if (!removed.ok) removed = purgeHistoryOnlyCompany(companyNo);
-        if (!removed.ok) {
-          skippedCompanies.push({ companyNo, error: removed.error || `Failed to delete company ${companyNo}.` });
-          continue;
-        }
-        const runtimeCompany = runtimeCompanyMap.get(String(companyNo));
-        deletedCompanies.push({
-          ...removed.company,
-          no: removed.company && removed.company.no !== undefined ? removed.company.no : companyNo,
-          companyName: (removed.company && removed.company.companyName) || (runtimeCompany && runtimeCompany.name) || String(companyNo),
-        });
-      }
-
-      if (deletedCompanies.length > 0) {
-        setTargets(deletedCompanies.map((company) => ({
-          companyNo: company.no,
-          companyName: company.companyName,
-        })), false);
-      }
-
-      refreshWatchTargets();
-      notifyClients({ type: 'update', reason: 'company-bulk-deleted', time: Date.now() });
-      jsonResponse(res, 200, {
-        ok: true,
-        deletedCount: deletedCompanies.length,
-        companies: deletedCompanies,
-        skippedCount: skippedCompanies.length,
-        skippedCompanies,
-      });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  const companyApiMatch = pathname.match(/^\/api\/companies\/([^/]+)$/);
-  if (companyApiMatch && req.method === 'PUT') {
-    try {
-      const companyNo = decodeURIComponent(companyApiMatch[1]);
-      const data = await parseJsonBody(req);
-      const updated = updateCompany(companyNo, data || {});
-      if (!updated.ok) {
-        jsonResponse(res, 400, { ok: false, error: updated.error || 'Company update failed.' });
-        return;
-      }
-
-      if (data && Object.prototype.hasOwnProperty.call(data, 'addToTarget')) {
-        setTargets([{
-          companyNo: updated.company.no,
-          companyName: updated.company.companyName,
-        }], !!data.addToTarget);
-      }
-
-      refreshWatchTargets();
-      notifyClients({ type: 'update', reason: 'company-updated', time: Date.now() });
-      jsonResponse(res, 200, { ok: true, company: updated.company, targetPath: updated.targetPath });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  if (companyApiMatch && req.method === 'DELETE') {
-    try {
-      const companyNo = decodeURIComponent(companyApiMatch[1]);
-      const runtimeCompany = findRuntimeCompanyRecord(companyNo);
-      let removed = deleteCompany(companyNo);
-      if (!removed.ok) removed = purgeHistoryOnlyCompany(companyNo);
-      if (!removed.ok) {
-        jsonResponse(res, 400, { ok: false, error: removed.error || 'Company delete failed.' });
-        return;
-      }
-
-      setTargets([{
-        companyNo: removed.company.no,
-        companyName: removed.company.companyName || (runtimeCompany && runtimeCompany.name) || String(companyNo),
-      }], false);
-
-      refreshWatchTargets();
-      notifyClients({ type: 'update', reason: 'company-deleted', time: Date.now() });
-      jsonResponse(res, 200, { ok: true, company: removed.company, targetPath: removed.targetPath });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/outreach-targets - persist outreach target selection
-  if (req.url === '/api/outreach-targets' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const companyNos = Array.isArray(data && data.companyNos) ? data.companyNos : [];
-      const active = data && data.active !== false;
-      if (companyNos.length === 0) {
-        jsonResponse(res, 400, { ok: false, error: 'companyNos is required.' });
-        return;
-      }
-
-      const found = findCompaniesByNos(companyNos);
-      if (!found.ok) {
-        jsonResponse(res, 400, { ok: false, error: found.error || 'Target companies not found.' });
-        return;
-      }
-
-      const targets = found.companies.map((company) => ({
-        companyNo: company.no,
-        companyName: company.companyName,
-      }));
-      setTargets(targets, active);
-      notifyClients({ type: 'update', reason: 'outreach-targets-updated', time: Date.now() });
-      jsonResponse(res, 200, { ok: true, count: targets.length, active });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/outreach/prepare - disabled to prevent direct JS automation fallback
-  if (req.url === '/api/outreach/prepare' && req.method === 'POST') {
-    jsonResponse(res, 410, {
-      ok: false,
-      error: 'Direct JS outreach preparation has been removed. Use /api/ai-form-fill with a managed AI session.',
-    });
-    return;
-  }
+  // --- AI Form Fill API endpoint (src/routes/ai-form-fill-api.cjs) ---
+  // POST /api/ai-form-fill
+  if (await getAiFormFillApiDispatch()(req, res, pathname)) return;
 
   // --- Existing API endpoints ---
 
-  // Approve / Skip
-  if (req.url === '/api/approve' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const { companyNo, companyName, decision, feedback } = JSON.parse(body);
-        const companyNoNum = Number(companyNo);
-        const lang = getUiLang();
-        const normalizedDecision = String(decision || '').trim();
-        if (!Number.isFinite(companyNoNum) || !normalizedDecision) {
-          appendDiagnosticEvent('approve_invalid_request', {
-            companyNo,
-            decision: normalizedDecision || '',
-          });
-          console.warn(`[approve] invalid request: companyNo=${companyNo} decision=${normalizedDecision || '-'}`);
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: i18nT(lang, 'audit.invalidRequest') || 'companyNo and decision required' }));
-          return;
-        }
-        const { logAction } = require('./action-logger.cjs');
-        const { recordContact, getHistory } = require('./contact-history.cjs');
-        const auditContext = getCompanyLogContext(companyNoNum);
-        let approvalArtifacts = null;
-        const allowInputOnlyApproval = !!(auditContext.screenshot && auditContext.screenshot.readyForManualApproval);
-        if (normalizedDecision === 'sent' || normalizedDecision === 'skip') {
-          if (!isAwaitingTransitionAllowed(auditContext.lastAction, normalizedDecision)) {
-            appendDiagnosticEvent('approve_blocked_invalid_state', {
-              companyNo: companyNoNum,
-              companyName,
-              decision: normalizedDecision,
-              state: auditContext.lastAction || '',
-            });
-            console.warn(`[approve] blocked invalid state: companyNo=${companyNoNum} decision=${normalizedDecision} state=${auditContext.lastAction || '-'}`);
-            res.writeHead(409, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              error: i18nT(lang, 'audit.blockedInvalidState', { state: auditContext.lastAction || '-' }),
-            }));
-            return;
-          }
-          if (normalizedDecision === 'sent') {
-            try {
-              approvalArtifacts = assertApprovalArtifacts(companyNoNum, {
-                logs: auditContext.logs,
-                formFillLog: auditContext.formFillLog,
-                awaitingLog: auditContext.awaitingLog,
-                confirmLog: auditContext.confirmLog,
-                submittedLog: auditContext.submittedLog,
-                allowInputOnly: allowInputOnlyApproval,
-                message: i18nT(lang, 'audit.blockedMissingScreenshot'),
-              });
-            } catch (error) {
-              appendDiagnosticEvent('approve_blocked_missing_screenshot', {
-                companyNo: companyNoNum,
-                companyName,
-                decision: normalizedDecision,
-                allowInputOnlyApproval,
-                screenshotState: auditContext.screenshot ? auditContext.screenshot.auditState : '',
-              });
-              console.warn(`[approve] blocked missing screenshot: companyNo=${companyNoNum} decision=${normalizedDecision}`);
-              res.writeHead(409, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: i18nT(lang, 'audit.blockedMissingScreenshot') }));
-              return;
-            }
-          } else {
-            approvalArtifacts = getExpectedApprovalArtifacts(companyNoNum, {
-              logs: auditContext.logs,
-              formFillLog: auditContext.formFillLog,
-              awaitingLog: auditContext.awaitingLog,
-              confirmLog: auditContext.confirmLog,
-              submittedLog: auditContext.submittedLog,
-            });
-          }
-        }
-        if (normalizedDecision === 'sent') {
-          const approvalScreenshot = approvalArtifacts
-            ? (approvalArtifacts.actual.sent || approvalArtifacts.actual.confirm || approvalArtifacts.actual.input || approvalArtifacts.screenshots.sent || approvalArtifacts.screenshots.confirm || approvalArtifacts.screenshots.input)
-            : null;
-          logAction(companyNoNum, companyName, 'submitted', buildApprovalLogDetails({
-            companyNo: companyNoNum,
-            source: 'dashboard-approve',
-            action: 'submitted',
-            mode: 'manual',
-            screenshot: approvalScreenshot,
-            success: true,
-            verified: true,
-            detail: allowInputOnlyApproval ? 'ダッシュボードで手動送信完了を確認' : 'ダッシュボードで承認済み',
-            approvalRequired: true,
-          }));
-          const draft = auditContext.allLogs.filter(l => String(l.companyNo) === String(companyNoNum) && l.action === 'message_draft').pop();
-          const knownFormUrl = getKnownFormUrl(companyNoNum, findRuntimeCompanyRecord(companyNoNum)?.formUrl || '');
-          ensureSubmittedContactHistory(
-            companyNoNum,
-            companyName,
-            auditContext.submittedLog || getLatestLog(auditContext.logs || [], 'submitted') || { timestamp: new Date().toISOString() },
-            knownFormUrl,
-            draft ? stringifyLogDetails(draft.details) : '',
-            getHistory(companyNoNum),
-            {
-              screenshot: approvalScreenshot || '',
-              sourceAction: 'dashboard-approve',
-              sourceActionAt: auditContext.submittedLog && auditContext.submittedLog.timestamp ? auditContext.submittedLog.timestamp : new Date().toISOString(),
-              status: 'submitted',
-              notes: allowInputOnlyApproval ? 'manual-approve-input-only' : 'manual-approve-confirmed',
-            },
-          );
-          finishLiveMonitor(companyNoNum, {
-            companyNo: companyNoNum,
-            companyName,
-            status: 'submitted',
-            step: allowInputOnlyApproval ? 'ダッシュボードで手動送信完了を確認' : 'ダッシュボードで承認済み',
-            currentUrl: knownFormUrl,
-            formUrl: knownFormUrl,
-            latestScreenshot: approvalScreenshot,
-          });
-          // 元のCSV/Excelに送信済みを書き戻す（失敗してもメイン処理に影響させない）
-          try { updateCompany(companyNoNum, { progress: '送信済み' }); } catch (_) {}
-        } else if (normalizedDecision === 'skip') {
-          const reason = feedback ? 'Skip reason: ' + feedback : 'Skipped from dashboard';
-          const approvalScreenshot = approvalArtifacts
-            ? (approvalArtifacts.actual.confirm || approvalArtifacts.actual.input || approvalArtifacts.screenshots.confirm || approvalArtifacts.screenshots.input)
-            : null;
-          logAction(companyNoNum, companyName, 'skipped', buildApprovalLogDetails({
-            companyNo: companyNoNum,
-            source: 'dashboard-approve',
-            action: 'skipped',
-            mode: 'manual',
-            screenshot: approvalScreenshot,
-            success: true,
-            verified: true,
-            detail: 'ダッシュボードでスキップ',
-            reason,
-            approvalRequired: true,
-          }));
-          if (feedback) {
-            ensureDataDir();
-            const fbFile = resolveDataPath('skip-feedback.json');
-            ensureParentDir(fbFile);
-            let fbData = [];
-            try { fbData = JSON.parse(fs.readFileSync(fbFile, 'utf-8')); } catch {}
-            fbData.push({ date: new Date().toISOString(), companyNo: companyNoNum, companyName, feedback });
-            fs.writeFileSync(fbFile, JSON.stringify(fbData, null, 2), 'utf-8');
-          }
-          finishLiveMonitor(companyNoNum, {
-            companyNo: companyNoNum,
-            companyName,
-            status: 'skipped',
-            step: 'ダッシュボードでスキップ',
-            latestScreenshot: approvalScreenshot,
-          });
-          // 元のCSV/Excelにスキップを書き戻す
-          try { updateCompany(companyNoNum, { progress: 'スキップ' }); } catch (_) {}
-        } else {
-          appendDiagnosticEvent('approve_invalid_decision', {
-            companyNo: companyNoNum,
-            companyName,
-            decision: normalizedDecision,
-          });
-          console.warn(`[approve] invalid decision: companyNo=${companyNoNum} decision=${normalizedDecision}`);
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: i18nT(lang, 'audit.invalidDecision') || 'decision must be "sent" or "skip"' }));
-          return;
-        }
-        notifyClients();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        appendDiagnosticEvent('approve_internal_error', {
-          error: e.message,
-        });
-        console.error(`[approve] internal error: ${e.message}`);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // AI Submit disabled — direct JS submission removed
-  if (req.url === '/api/ai-submit' && req.method === 'POST') {
-    jsonResponse(res, 410, {
-      ok: false,
-      error: 'Direct JS AI submission has been removed. Submit manually from the preserved browser tab.',
-    });
-    return;
-  }
-
-  // AI Submit status disabled — direct JS submission removed
-  if (req.url === '/api/ai-submit-status') {
-    jsonResponse(res, 410, {
-      ok: false,
-      error: 'Direct JS AI submission status has been removed.',
-    });
-    return;
-  }
-
-  // CLI log post
-  if (req.url === '/api/cli-log' && req.method === 'POST') {
-    const CLI_LOG_MAX = 64 * 1024;
-    let body = '';
-    let bodyOverflow = false;
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > CLI_LOG_MAX) {
-        bodyOverflow = true;
-        res.writeHead(413, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Payload too large' }));
-        req.destroy();
-      }
-    });
-    req.on('end', () => {
-      if (bodyOverflow) return;
-      try {
-        const { message, type } = JSON.parse(body);
-        const CLI_LOG_ALLOWED_TYPES = new Set(['info', 'step', 'error', 'action', 'warn', 'warning', 'thinking', 'debug']);
-        const safeType = CLI_LOG_ALLOWED_TYPES.has(type) ? type : 'info';
-        sseClients.forEach(r => {
-          r.write(`data: ${JSON.stringify({ type: 'cli-log', message: String(message || '').slice(0, 4000), logType: safeType, time: new Date().toISOString() })}\n\n`);
-        });
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
-    return;
-  }
-
-  // GET /api/ai/status — check managed PTY first, then system-wide
-  if ((pathname === '/api/claude-status' || pathname === '/api/ai/status') && req.method === 'GET') {
-    try {
-      const requestedProvider = requestUrl.searchParams.get('provider') || getSelectedAiProvider();
-      const status = await probeClaudeStatus(requestedProvider);
-      jsonResponse(res, 200, status);
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // GET /api/ai/setup-diagnostics — bootstrap diagnostics for the selected provider
-  if (pathname === '/api/ai/setup-diagnostics' && req.method === 'GET') {
-    try {
-      const requestedProvider = requestUrl.searchParams.get('provider') || getSelectedAiProvider();
-      const diagnostics = await probeAiSetupDiagnostics(requestedProvider);
-      jsonResponse(res, 200, { ok: true, ...diagnostics });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/install-ai-cli — attempt automatic global install
-  if ((pathname === '/api/install-claude-cli' || pathname === '/api/install-ai-cli') && req.method === 'POST') {
-    try {
-      const body = await parseJsonBody(req).catch(() => ({}));
-      const providerId = normalizeProviderId(body.provider || getSelectedAiProvider());
-      const provider = getProvider(providerId);
-      const npmStatus = await probeNpmStatus();
-      if (!npmStatus.available) {
-        const installError = `${provider.cliLabel} の自動インストールには npm が必要です。${npmStatus.error || ''}`.trim();
-        setProviderInstallState(providerId, 'failed', installError);
-        jsonResponse(res, 409, {
-          ok: false,
-          provider: providerId,
-          providerLabel: provider.displayName,
-          error: installError,
-          command: getInstallCommand(providerId),
-        });
-        return;
-      }
-      const installSpec = getInstallSpawnArgs(providerId);
-      setProviderInstallState(providerId, 'installing', null);
-      invalidateAiStatusCache(providerId);
-      _aiExecutablePath[providerId] = null;
-
-      const { spawn } = require('child_process');
-      const child = spawn(installSpec.command, installSpec.args, {
-        cwd: PROJECT_ROOT,
-        env: process.env,
-        shell: process.platform === 'win32',
-        windowsHide: process.platform === 'win32',
-      });
-
-      let stdout = '';
-      let stderr = '';
-      child.stdout && child.stdout.on('data', (data) => { stdout += data.toString(); });
-      child.stderr && child.stderr.on('data', (data) => { stderr += data.toString(); });
-
-      const result = await new Promise((resolve, reject) => {
-        child.on('error', reject);
-        child.on('close', (code) => resolve({ code }));
-      });
-
-      if (result.code !== 0) {
-        const installError = (stderr || stdout || `npm exited with code ${result.code}`).trim();
-        setProviderInstallState(providerId, 'failed', installError);
-        jsonResponse(res, 500, {
-          ok: false,
-          provider: providerId,
-          providerLabel: provider.displayName,
-          error: installError,
-          code: result.code,
-          command: getInstallCommand(providerId),
-        });
-        return;
-      }
-
-      invalidateAiStatusCache(providerId);
-      const status = await probeClaudeStatus(providerId);
-      if (!status.installed) {
-        const installError = `${provider.cliLabel} was not detected after installation.`;
-        setProviderInstallState(providerId, 'failed', installError);
-        jsonResponse(res, 500, {
-          ok: false,
-          provider: providerId,
-          providerLabel: provider.displayName,
-          error: installError,
-          command: getInstallCommand(providerId),
-        });
-        return;
-      }
-
-      setProviderInstallState(providerId, 'idle', null);
-      jsonResponse(res, 200, {
-        ok: true,
-        provider: providerId,
-        providerLabel: provider.displayName,
-        installed: status.installed,
-        version: status.version,
-        command: getInstallCommand(providerId),
-      });
-    } catch (e) {
-      const providerId = getSelectedAiProvider();
-      setProviderInstallState(providerId, 'failed', e.message);
-      jsonResponse(res, 500, { ok: false, provider: providerId, error: e.message, command: getInstallCommand(providerId) });
-    }
-    return;
-  }
-
-  // POST /api/launch-ai — spawn selected provider in a real PTY via node-pty
-  if ((pathname === '/api/launch-claude' || pathname === '/api/launch-ai') && req.method === 'POST') {
-    try {
-      const body = await parseJsonBody(req).catch(() => ({}));
-      const { mode = 'default', cols = 120, rows = 30 } = body;
-      const autoSendSafe = body.autoSendSafe === true;
-      const providerId = normalizeProviderId(body.provider || getSelectedAiProvider());
-      const result = await startManagedAiSession(mode, providerId, {
-        cols,
-        rows,
-        allowReuse: false,
-        autoSendSafe,
-      });
-      jsonResponse(res, 200, result);
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/launch-ai-external — open selected provider in an interactive external terminal
-  if ((pathname === '/api/launch-claude-external' || pathname === '/api/launch-ai-external') && req.method === 'POST') {
-    try {
-      const body = await parseJsonBody(req).catch(() => ({}));
-      const providerId = normalizeProviderId(body.provider || getSelectedAiProvider());
-      const { mode = 'default' } = body;
-      const result = await launchClaudeInExternalTerminal(mode, providerId, body.autoSendSafe === true);
-      invalidateAiStatusCache(providerId);
-      jsonResponse(res, 200, result);
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/ai-form-fill — queue work into the selected AI automation runtime
-  if (req.url === '/api/ai-form-fill' && req.method === 'POST') {
-    try {
-      const data = await parseJsonBody(req);
-      const companyNos = Array.isArray(data && data.companyNos) ? data.companyNos : [];
-      const providerId = normalizeProviderId(data && data.provider ? data.provider : getSelectedAiProvider());
-      if (companyNos.length === 0) {
-        appendDiagnosticEvent('ai_form_fill_invalid_request', { companyNos, provider: providerId });
-        jsonResponse(res, 400, { ok: false, error: 'companyNos is required.' });
-        return;
-      }
-      const found = findCompaniesByNos(companyNos);
-      if (!found.ok) {
-        appendDiagnosticEvent('ai_form_fill_target_lookup_failed', {
-          companyNos,
-          provider: providerId,
-          error: found.error || 'Target companies not found.',
-        });
-        jsonResponse(res, 400, { ok: false, error: found.error || 'Target companies not found.' });
-        return;
-      }
-
-      // 重複キューイング防止: 実際に稼働中のAI/batchだけを基準に判定する
-      const { getLiveMonitorSummary } = require('./live-monitor.cjs');
-      const ptyActuallyRunning = !!(claudePty || getActiveHeadlessRun());
-      if (!ptyActuallyRunning) {
-        // PTYが停止中かつリカバリタイマーもない → activeBatch は確実に古い
-        if (!managedAiRecoveryTimer && managedAiBatchController) {
-          managedAiBatchController.activeBatch = null;
-        }
-        cleanupStaleManagedAiMonitorEvents(0);
-      }
-      const monitorSummary = getLiveMonitorSummary();
-      const activeNos = getManagedAiReservedCompanyNos();
-      if (isAiRuntimeActivelyProcessing()) {
-        (monitorSummary.events || [])
-          .filter(ev => ev && ev.active !== false && !['awaiting_approval','submitted','completed','skipped','error'].includes(ev.status))
-          .forEach((ev) => {
-            activeNos.add(Number(ev.companyNo));
-          });
-      }
-      const alreadyQueued = found.companies.filter(c => activeNos.has(Number(c.no)));
-      if (alreadyQueued.length > 0) {
-        const names = alreadyQueued.map(c => c.companyName || c.name || '#' + c.no).join(', ');
-        jsonResponse(res, 409, { ok: false, error: '以下の企業は既に処理中です: ' + names + '。完了後に再度キューしてください。' });
-        return;
-      }
-
-      // 2回目以降のアプローチ判定: 送信済み企業にはcontactNoを付与
-      const { getHistory } = require('./contact-history.cjs');
-      const companiesWithContactNo = found.companies.map(c => {
-        const history = getHistory(c.no);
-        const contactNo = (history && Array.isArray(history.contacts)) ? history.contacts.length + 1 : 1;
-        return { ...c, contactNo };
-      });
-
-      const ready = await ensureClaudeAutomationReady(providerId);
-      if (!ready.ok) {
-        appendDiagnosticEvent('ai_form_fill_not_ready', {
-          companyNos,
-          provider: ready.providerId || providerId,
-          error: ready.error || 'AI automation is not ready.',
-          statusCode: ready.statusCode || 409,
-        });
-        jsonResponse(res, ready.statusCode || 409, { ok: false, error: ready.error });
-        return;
-      }
-
-      const phaseA = await executeBackendPhaseABatch(companiesWithContactNo, providerId);
-      if (phaseA.successes.length === 0) {
-        appendDiagnosticEvent('ai_form_fill_phase_a_failed', {
-          companyNos,
-          provider: providerId,
-          successCount: 0,
-          failureCount: phaseA.failures.length,
-          elapsedMs: phaseA.elapsedMs,
-        });
-        jsonResponse(res, 409, {
-          ok: false,
-          error: 'Phase A（企業分析+文面生成）が全件失敗しました。ログを確認してください。',
-          phaseA: {
-            successCount: 0,
-            failureCount: phaseA.failures.length,
-            elapsedMs: phaseA.elapsedMs,
-            failures: phaseA.failures.map((entry) => ({
-              companyNo: entry.companyNo,
-              companyName: entry.companyName,
-              error: entry.error,
-            })),
-          },
-        });
-        return;
-      }
-
-      const successfulCompanies = companiesWithContactNo.filter((company) =>
-        phaseA.successes.some((entry) => String(entry.companyNo) === String(company.no))
-      ).map((company) => {
-        const phaseAResult = phaseA.successes.find((entry) => String(entry.companyNo) === String(company.no));
-        return {
-          ...company,
-          formUrl: (phaseAResult && phaseAResult.formUrl) || company.formUrl || '',
-          phaseA: phaseAResult ? {
-            analysis: phaseAResult.analysis || null,
-            message: phaseAResult.message || '',
-            messagePrompt: phaseAResult.messagePrompt || '',
-            analysisElapsedMs: phaseAResult.elapsedMs,
-            formUrl: phaseAResult.formUrl || company.formUrl || '',
-            formResolutionMethod: phaseAResult.formResolutionMethod || null,
-          } : null,
-        };
-      });
-      const phaseAByCompany = new Map(
-        phaseA.successes.map((entry) => [
-          String(entry.companyNo),
-          {
-            analysis: entry.analysis || null,
-            message: entry.message || '',
-            messagePrompt: entry.messagePrompt || '',
-            elapsedMs: entry.elapsedMs,
-            formUrl: entry.formUrl || '',
-            formResolutionMethod: entry.formResolutionMethod || null,
-          },
-        ])
-      );
-
-      const result = await queueAiFormFill(successfulCompanies, providerId, {
-        autoSendSafe: getManagedAiAutoSendSafe(),
-        phaseAByCompany,
-        phaseASuccesses: phaseA.successes,
-        phaseAFailures: phaseA.failures,
-      });
-      jsonResponse(res, 200, {
-        ...result,
-        phaseA: {
-          successCount: phaseA.successes.length,
-          failureCount: phaseA.failures.length,
-          elapsedMs: phaseA.elapsedMs,
-          failures: phaseA.failures.map((entry) => ({
-            companyNo: entry.companyNo,
-            companyName: entry.companyName,
-            error: entry.error,
-          })),
-        },
-      });
-    } catch (e) {
-      appendDiagnosticEvent('ai_form_fill_internal_error', { error: e.message });
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/stop-ai — stop active AI runtime
-  if ((pathname === '/api/stop-claude' || pathname === '/api/stop-ai') && req.method === 'POST') {
-    const providerId = headlessAiRun ? headlessAiRun.provider : getSelectedAiProvider();
-    const provider = getProvider(providerId);
-    const stopped = getActiveHeadlessRun(providerId)
-      ? await stopHeadlessAiRun(providerId)
-      : await stopManagedClaudePty({ suppressAutoRecovery: true });
-    if (!stopped.ok) {
-      jsonResponse(res, 500, stopped);
-      return;
-    }
-    if (claudeProcess && !claudeProcess.killed) {
-      try { claudeProcess.kill(); } catch (_) {}
-      claudeProcess = null;
-    }
-    invalidateAiStatusCache(providerId);
-    jsonResponse(res, 200, { ...stopped, provider: providerId, providerLabel: provider.displayName });
-    return;
-  }
-
-  // POST /api/ai-input — send text to managed AI PTY (fallback for non-WS clients)
-  if ((pathname === '/api/claude-input' || pathname === '/api/ai-input') && req.method === 'POST') {
-    try {
-      const body = await parseJsonBody(req).catch(() => ({}));
-      const { text } = body;
-      if (claudePty) {
-        claudePty.write(text || '');
-        jsonResponse(res, 200, { ok: true });
-      } else {
-        jsonResponse(res, 409, { ok: false, error: `${getProviderDisplayName(getSelectedAiProvider())} is not running (managed mode)` });
-      }
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // POST /api/install-update — write flag file for electron-main to call quitAndInstall
-  if (req.url === '/api/install-update' && req.method === 'POST') {
-    try {
-      if (!AUTO_UPDATE_ENABLED) {
-        jsonResponse(res, 409, {
-          ok: false,
-          error: APP_BUILD_SOURCE === 'development'
-            ? 'Development build does not support auto-install updates.'
-            : 'Auto-update is not available in this runtime.',
-          buildSource: APP_BUILD_SOURCE,
-          appVersion: APP_VERSION,
-        });
-        return;
-      }
-      ensureDataDir();
-      const flagFile = resolveDataPath('install-update.flag');
-      ensureParentDir(flagFile);
-      fs.writeFileSync(flagFile, Date.now().toString());
-      jsonResponse(res, 200, { ok: true });
-    } catch (e) {
-      jsonResponse(res, 500, { ok: false, error: e.message });
-    }
-    return;
-  }
-
-  // GET /api/update-status — read update status written by electron-main.js
-  if (req.url === '/api/update-status' && req.method === 'GET') {
-    try {
-      if (APP_BUILD_SOURCE === 'dashboard-only') {
-        jsonResponse(res, 200, {
-          ok: true,
-          state: 'dashboard-only',
-          appVersion: APP_VERSION,
-          buildSource: APP_BUILD_SOURCE,
-          autoUpdateEnabled: false,
-        });
-        return;
-      }
-
-      if (!AUTO_UPDATE_ENABLED) {
-        jsonResponse(res, 200, {
-          ok: true,
-          state: APP_BUILD_SOURCE === 'development' ? 'disabled-dev' : 'disabled',
-          appVersion: APP_VERSION,
-          buildSource: APP_BUILD_SOURCE,
-          autoUpdateEnabled: false,
-        });
-        return;
-      }
-
-      const statusFile = resolveDataPath('update-status.json');
-      if (fs.existsSync(statusFile)) {
-        const raw = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
-        jsonResponse(res, 200, { ok: true, buildSource: APP_BUILD_SOURCE, autoUpdateEnabled: AUTO_UPDATE_ENABLED, ...raw, appVersion: APP_VERSION });
-      } else {
-        jsonResponse(res, 200, { ok: true, state: 'unknown', appVersion: APP_VERSION, buildSource: APP_BUILD_SOURCE, autoUpdateEnabled: AUTO_UPDATE_ENABLED });
-      }
-    } catch (e) {
-      jsonResponse(res, 200, { ok: true, state: 'unknown', appVersion: APP_VERSION, buildSource: APP_BUILD_SOURCE, autoUpdateEnabled: AUTO_UPDATE_ENABLED });
-    }
-    return;
-  }
-
-  // Excel export
-  if (req.url === '/api/export') {
-    try {
-      const data = loadData();
-      const prefs = settings.getSection('preferences');
-      const prefix = prefs.exportFilenamePrefix || 'outreach_progress';
-      const wb = XLSX.utils.book_new();
-      const rows = [['No.', 'Status', 'Company', 'Type', 'Progress', 'Form URL', 'CAPTCHA', 'Last Action', 'Last Action Time', 'Details']];
-      data.companies.forEach(c => {
-        rows.push([
-          c.no, c.status, c.name, c.type,
-          c.lastAction || c.progress || 'Pending',
-          c.formUrl, c.captcha,
-          c.lastLog ? c.lastLog.action : '',
-          c.lastLog ? new Date(c.lastLog.timestamp).toLocaleString('ja-JP', { timeZone: settings.getSection('preferences').timezone || 'Asia/Tokyo' }) : '',
-          c.lastErrorDetail || (c.logs.length > 0 ? c.logs.map(l => `${l.action}: ${typeof l.details === 'object' ? JSON.stringify(l.details) : l.details}`).join(' | ') : ''),
-        ]);
-      });
-      const ws = XLSX.utils.aoa_to_sheet(rows);
-      ws['!cols'] = [{ wch: 5 }, { wch: 8 }, { wch: 25 }, { wch: 25 }, { wch: 12 }, { wch: 40 }, { wch: 8 }, { wch: 15 }, { wch: 18 }, { wch: 50 }];
-      XLSX.utils.book_append_sheet(wb, ws, 'Progress');
-
-      const logRows = [['Time', 'No.', 'Company', 'Action', 'Details']];
-      data.recentLogs.forEach(l => {
-        logRows.push([new Date(l.timestamp).toLocaleString('ja-JP', { timeZone: settings.getSection('preferences').timezone || 'Asia/Tokyo' }), l.companyNo, l.companyName, l.action, typeof l.details === 'object' ? JSON.stringify(l.details) : l.details || '']);
-      });
-      const ws2 = XLSX.utils.aoa_to_sheet(logRows);
-      ws2['!cols'] = [{ wch: 20 }, { wch: 5 }, { wch: 25 }, { wch: 15 }, { wch: 60 }];
-      XLSX.utils.book_append_sheet(wb, ws2, 'Action Log');
-
-      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-      res.writeHead(200, {
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="${prefix}_${new Date().toISOString().slice(0,10)}.xlsx"`,
-      });
-      res.end(buf);
-    } catch (e) {
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('Export error: ' + e.message);
-    }
-    return;
-  }
-
-  if (req.url === '/api/data') {
-    try {
-      jsonResponse(res, 200, loadData());
-    } catch (e) {
-      jsonResponse(res, 500, { error: e.message });
-    }
-    return;
-  }
 
   // ── Form Session API (/api/form-session/*) ────────────────────────
-  if (pathname.startsWith('/api/form-session')) {
-    if (!_formSessionManager) {
-      jsonResponse(res, 501, { ok: false, error: 'FormSession はElectronモードでのみ利用できます' });
-      return;
-    }
-
-    // POST /api/form-session/create
-    if (pathname === '/api/form-session/create' && req.method === 'POST') {
-      try {
-        const body = await parseJsonBody(req);
-        const formUrl = typeof body.formUrl === 'string' ? body.formUrl.trim() : '';
-        const companyNo = body.companyNo != null ? String(body.companyNo) : '';
-        if (!formUrl) { jsonResponse(res, 400, { ok: false, error: 'formUrl が必要です' }); return; }
-
-        const sessionId = await _formSessionManager.createSession(formUrl, companyNo);
-        jsonResponse(res, 200, { ok: true, sessionId });
-      } catch (e) {
-        jsonResponse(res, 500, { ok: false, error: e.message });
-      }
-      return;
-    }
-
-    // GET /api/form-session (list)
-    if (pathname === '/api/form-session' && req.method === 'GET') {
-      jsonResponse(res, 200, { ok: true, sessions: _formSessionManager.listSessions() });
-      return;
-    }
-
-    // POST /api/form-session/active/hide (hide current session without knowing sessionId)
-    if (pathname === '/api/form-session/active/hide' && req.method === 'POST') {
-      _formSessionManager.hideCurrentSession();
-      jsonResponse(res, 200, { ok: true });
-      return;
-    }
-
-    // session-scoped endpoints: /api/form-session/:id/*
-    const sessionMatch = pathname.match(/^\/api\/form-session\/([^/]+)(?:\/(.+))?$/);
-    if (sessionMatch) {
-      const [, sessionId, action] = sessionMatch;
-
-      // GET .../structure
-      if (action === 'structure' && req.method === 'GET') {
-        try {
-          const fields = await _formSessionManager.getFormStructure(sessionId);
-          jsonResponse(res, 200, { ok: true, fields });
-        } catch (e) {
-          jsonResponse(res, 500, { ok: false, error: e.message });
-        }
-        return;
-      }
-
-      // POST .../fill  — backend validates mappings against settings
-      if (action === 'fill' && req.method === 'POST') {
-        try {
-          const body = await parseJsonBody(req);
-          const rawMappings = Array.isArray(body.mappings) ? body.mappings : [];
-
-          // 許可リスト: settings に存在するキーからのみ値を使用
-          const sender = settings.getSender();
-          const allowedValues = {
-            companyName: sender.companyName || '',
-            contactName: sender.name || '',
-            name: sender.name || '',
-            contactNameKana: sender.nameKana || '',
-            nameKana: sender.nameKana || '',
-            contactTitle: sender.title || '',
-            title: sender.title || '',
-            department: sender.department || '',
-            email: sender.email || '',
-            phone: sender.phone || '',
-            mobile: sender.mobile || '',
-            fax: sender.fax || '',
-            website: sender.website || '',
-            address: sender.address || '',
-            postalCode: sender.postalCode || '',
-          };
-
-          const validMappings = rawMappings
-            .filter(m => m && typeof m.selector === 'string' && m.selector.trim())
-            .map(m => {
-              // value は settings からの値または AI が生成したメッセージ本文のみ許可
-              const resolved = m.valueKey && allowedValues[m.valueKey] !== undefined
-                ? allowedValues[m.valueKey]
-                : (typeof m.value === 'string' ? m.value : '');
-              return { selector: m.selector.trim(), value: resolved, type: m.type || 'text' };
-            })
-            .filter(m => m.value !== '');
-
-          const results = await _formSessionManager.fillForm(sessionId, validMappings);
-          jsonResponse(res, 200, { ok: true, results });
-        } catch (e) {
-          jsonResponse(res, 500, { ok: false, error: e.message });
-        }
-        return;
-      }
-
-      // POST .../screenshot
-      if (action === 'screenshot' && req.method === 'POST') {
-        try {
-          const body = await parseJsonBody(req);
-          const session = _formSessionManager.getSession(sessionId);
-          if (!session) { jsonResponse(res, 404, { ok: false, error: 'Session not found' }); return; }
-
-          const ALLOWED_SUFFIXES = ['input', 'confirm', 'sent', 'error'];
-          const suffix = ALLOWED_SUFFIXES.includes(body.suffix) ? body.suffix : 'input';
-          const safeNo = String(session.companyNo).replace(/[^a-zA-Z0-9_-]/g, '_');
-          const screenshotDir = settings.getScreenshotDir();
-          const savePath = path.join(screenshotDir, `ss-${safeNo}-${suffix}.png`);
-
-          const savedPath = await _formSessionManager.captureScreenshot(sessionId, savePath);
-          jsonResponse(res, 200, { ok: true, path: savedPath });
-        } catch (e) {
-          jsonResponse(res, 500, { ok: false, error: e.message });
-        }
-        return;
-      }
-
-      // POST .../show
-      if (action === 'show' && req.method === 'POST') {
-        try {
-          _formSessionManager.showSession(sessionId);
-          jsonResponse(res, 200, { ok: true });
-        } catch (e) {
-          jsonResponse(res, 500, { ok: false, error: e.message });
-        }
-        return;
-      }
-
-      // POST .../hide
-      if (action === 'hide' && req.method === 'POST') {
-        try {
-          _formSessionManager.hideCurrentSession();
-          jsonResponse(res, 200, { ok: true });
-        } catch (e) {
-          jsonResponse(res, 500, { ok: false, error: e.message });
-        }
-        return;
-      }
-
-      // GET .../info
-      if (action === 'info' && req.method === 'GET') {
-        const info = _formSessionManager.getSession(sessionId);
-        if (!info) { jsonResponse(res, 404, { ok: false, error: 'Session not found' }); return; }
-        jsonResponse(res, 200, { ok: true, session: info });
-        return;
-      }
-
-      // DELETE .../  (destroy)
-      if (!action && req.method === 'DELETE') {
-        try {
-          _formSessionManager.destroySession(sessionId);
-          jsonResponse(res, 200, { ok: true });
-        } catch (e) {
-          jsonResponse(res, 500, { ok: false, error: e.message });
-        }
-        return;
-      }
-    }
-
-    jsonResponse(res, 404, { ok: false, error: 'Not found' });
-    return;
-  }
+  // form-session routes は src/routes/form-session-api.cjs に分離済み (dispatcher で処理)
 
   // Dashboard HTML
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
     'Set-Cookie': buildDashboardSessionCookieHeaders(),
-    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; frame-ancestors 'none'; object-src 'none';",
+    'Content-Security-Policy': [
+      // 全アセット (フォント・Tailwind・Phosphor・Material Symbols) はローカルバンドル済み
+      // 外部CDN依存ゼロ → 厳格な 'self' のみで運用
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "connect-src 'self'",
+      "font-src 'self' data:",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+    ].join('; ') + ';',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
   });
@@ -12051,6 +6527,18 @@ async function startDashboardServer(opts = {}) {
     refreshWatchTargets();
     startHeartbeat();
     cleanupStaleManagedAiMonitorEvents();
+
+    // 起動時 recovery snapshot 検出（永続化された managed batch 残りがあれば診断イベントとして記録）
+    try {
+      const snap = loadRecoverySnapshot();
+      if (snap && Array.isArray(snap.batches) && snap.batches.length > 0) {
+        console.log(`[startup] recovery snapshot detected: ${snap.batches.length} batches`);
+        appendDiagnosticEvent('managed_ai_recovery_snapshot_detected_on_startup', {
+          batchCount: snap.batches.length,
+          providerId: snap.providerId,
+        });
+      }
+    } catch (_) {}
 
     const _sl = settings.getSection('preferences').language || 'ja';
     console.log(`\n===================================`);

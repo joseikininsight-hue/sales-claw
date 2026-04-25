@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>Sales Claw — リデザイン v2 (B+ Polished)</title>
+<meta name="viewport" content="width=1600" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="tokens.css" />
+<style>
+  html, body { margin: 0; padding: 0; background: #f0eee9; height: 100%; }
+  * { box-sizing: border-box; }
+  .sc-root, body { font-family: 'Inter', 'Noto Sans JP', system-ui, sans-serif; }
+  @keyframes sc-spin { to { transform: rotate(360deg); } }
+  @keyframes sc-blink { 50% { opacity: 0 } }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+<template id="__bundler_thumbnail">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect width="400" height="300" fill="url(#g)"/>
+  <rect x="120" y="90" width="160" height="120" rx="16" fill="#fff"/>
+  <text x="200" y="165" font-family="Inter, sans-serif" font-weight="800" font-size="36" fill="#2563eb" text-anchor="middle">SC</text>
+</svg>
+</template>
+
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="sc-primitives.jsx"></script>
+<script type="text/babel" src="var-b-plus.jsx"></script>
+
+<script type="text/babel">
+const { useState } = React;
+
+function Art({ width, height, bg = '#f5f5f3', children }) {
+  return (
+    <div style={{ width, height, background: bg, overflow: 'hidden',
+                  borderRadius: 10, position: 'relative' }}>
+      {children}
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <DesignCanvas>
+      {/* B+ Polished — the perfect mix */}
+      <DCSection id="b-plus"
+        title="Variation B+ · Polished Perfect Mix"
+        subtitle="B(Linear密度) × A(日本語ステータス) × リファレンス画像の構成。KPIストリップ + チャート + パイプライン + 密度テーブル。">
+        <DCArtboard id="bp-light-companies" label="B+ · Light · 企業一覧" width={1360} height={860}>
+          <Art width={1360} height={860}><VarBPlus theme="light" activeTab="companies" /></Art>
+        </DCArtboard>
+        <DCArtboard id="bp-dark-companies" label="B+ · Dark · 企業一覧" width={1360} height={860}>
+          <Art width={1360} height={860} bg="#0b0e14"><VarBPlus theme="dark" activeTab="companies" /></Art>
+        </DCArtboard>
+        <DCArtboard id="bp-ai-modal" label="B+ · AI 起動モーダル" width={1360} height={860}>
+          <Art width={1360} height={860}>
+            <VarBPlus theme="light" activeTab="companies" showAiModal={true} />
+          </Art>
+        </DCArtboard>
+        <DCArtboard id="bp-pending" label="B+ · 確認待ち (承認フロー)" width={1360} height={860}>
+          <Art width={1360} height={860}><VarBPlus theme="light" activeTab="pending" /></Art>
+        </DCArtboard>
+        <DCArtboard id="bp-live" label="B+ · Live Activity パネル" width={1360} height={860}>
+          <Art width={1360} height={860}>
+            <VarBPlus theme="light" activeTab="companies" showLiveActivity={true} />
+          </Art>
+        </DCArtboard>
+        <DCArtboard id="bp-cli" label="B+ · CLI Activity" width={1360} height={860}>
+          <Art width={1360} height={860}><VarBPlus theme="light" activeTab="cli" /></Art>
+        </DCArtboard>
+        <DCArtboard id="bp-sent" label="B+ · 送信済み" width={1360} height={860}>
+          <Art width={1360} height={860}><VarBPlus theme="light" activeTab="sent" /></Art>
+        </DCArtboard>
+        <DCArtboard id="bp-settings" label="B+ · 設定" width={1360} height={860}>
+          <Art width={1360} height={860}><VarBPlus theme="light" activeTab="settings" /></Art>
+        </DCArtboard>
+      </DCSection>
+
+      {/* Notes */}
+      <DCSection id="notes"
+        title="ブラッシュアップ内容 / What changed"
+        subtitle="Before → After">
+        <DCArtboard id="notes-1" label="改善点サマリー" width={680} height={520}>
+          <div style={{
+            width: 680, height: 520, padding: 28, borderRadius: 10,
+            background: '#fff', border: '1px solid rgba(0,0,0,.07)',
+            fontFamily: 'Inter, Noto Sans JP, sans-serif',
+          }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em',
+                          color: '#9a9a96', textTransform: 'uppercase' }}>Variation B+</div>
+            <h2 style={{ margin: '4px 0 16px', fontSize: 22, fontWeight: 800 }}>Polished Perfect Mix</h2>
+            {[
+              { t: 'ステータスピル', d: 'A案の日本語ラウンドピルを採用 (送信済み / 下書き / エラー / 確認待ち)。テーブル・モーダル全体で統一。' },
+              { t: 'KPIストリップ', d: '参考画像に合わせ 6 カード横並び。大きな数値 + 差分 + 下に棒スパークライン。日英併記ラベル。' },
+              { t: 'チャート + パイプライン', d: '左に 30日間アクティビティ、右に日本語ラベルのパイプライン (488 / 211 / …) とマイクロバー。' },
+              { t: 'フィルタータブ', d: 'カウント入りのピル化。アクティブは primary + シャドウ。ページネーション右寄せ。' },
+              { t: 'テーブル行', d: '高さ 36px。企業名は太字、アクション列に「完了 / AI FILL / 再試行 / レビュー」ピル。' },
+              { t: 'サイドバー', d: 'ブランド強化 + 検索バー + ⌘K。保存済みビューに色ドット。フッターに Claude 状態カード。' },
+              { t: 'AI 起動モーダル', d: '2カラム (AI選択 + セットアップ診断 / ポリシー + モード)。日本語コピー整え、フッターに予想コスト。' },
+              { t: '確認待ち画面', d: '左リスト (信頼度バー付) + 右詳細 (本文 + 安全チェック + 送信ボタン)。' },
+            ].map((r, i) => (
+              <div key={i} style={{
+                display: 'grid', gridTemplateColumns: '170px 1fr', gap: 12,
+                padding: '7px 0', borderTop: i ? '1px solid rgba(0,0,0,.05)' : 'none',
+                fontSize: 11.5,
+              }}>
+                <div style={{ fontWeight: 700, color: '#1a1a1a' }}>{r.t}</div>
+                <div style={{ color: '#5a5a58', lineHeight: 1.55 }}>{r.d}</div>
+              </div>
+            ))}
+          </div>
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

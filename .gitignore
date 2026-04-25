@@ -33,11 +33,17 @@ data/*.csv
 # Playwright
 .playwright-mcp/
 
+# Test artifacts (generated)
+playwright-report/
+playwright-results.xml
+test-results/
+
 # Claude Code project config
 # Include settings and routing config, exclude user sessions
 .claude/subagents/
 .claude/conversations/
 .claude/*.session
+.claude/worktrees/
 
 # OS files
 .DS_Store
@@ -79,6 +85,7 @@ assets/名称未設定のデザイン.png
 
 # Electron build output
 dist/
+.next/
 
 # Electron dev
 .webpack/

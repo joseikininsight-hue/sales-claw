@@ -3,11 +3,14 @@ productName: Sales Claw
 copyright: MIT License
 
 # 自動更新: GitHub Releases から配信
-# Release CI で GH_OWNER / GH_REPO を設定して、fork 先に誤配信しないようにする
+# app-update.yml に実リポジトリを焼き込み、インストール済みアプリが latest.yml を参照できるようにする
 publish:
-  provider: github
-  owner: ${env.GH_OWNER}
-  repo: ${env.GH_REPO}
+  - provider: github
+    owner: joseikininsight-hue
+    repo: sales-claw
+    releaseType: release
+    channel: latest
+    publishAutoUpdate: true
 
 # asar無効でファイルパスをシンプルに
 asar: false
@@ -24,6 +27,7 @@ extraResources:
       - icon.png
       - icon.ico
       - tray.png
+      - vendor/**
 
 # パッケージに含めるファイル
 files:
@@ -31,6 +35,10 @@ files:
   - "!dist/**"
   - "!.git/**"
   - "!.github/**"
+  - "!.electron-userdata/**"
+  - "!.aidesigner/**"
+  - "!.code-review-graph/**"
+  - "!.claude/**"
   - "!screenshots/**"
   - "!data/settings.json"
   - "!data/action-log.json"
@@ -49,9 +57,11 @@ files:
   - "!data/ai-run-metrics.jsonl"
   - "!tmp/**"
   - "!temp/**"
+  - "!playwright-report/**"
+  - "!test-results/**"
+  - "!sample/**"
   - "!launch-silent.vbs"
   - "!launch.sh"
-  - "!.claude/settings.local.json"
   - "!.agents/**"
   - "!.mcp.json"
   - "!assets/名称未設定のデザイン.png"
