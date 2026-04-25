@@ -26,6 +26,8 @@ const fs = require('fs');
 const XLSX = require('xlsx');
 const settings = require('../settings-manager.cjs');
 const { ensureDataDir, resolveDataPath } = require('../data-paths.cjs');
+const { logAction } = require('../action-logger.cjs');
+const { recordContact } = require('../contact-history.cjs');
 
 /**
  * Simple API ルーターを生成する factory。
@@ -74,6 +76,87 @@ module.exports = function createSimpleApiRoutes(ctx) {
     jsonResponse(res, 410, {
       ok: false,
       error: 'Direct JS AI submission status has been removed.',
+    });
+  }
+
+  // POST /api/resend-prepare — 「編集して再送」用エンドポイント
+  // body: { no, name, message, formUrl? }
+  // 効果: 編集された本文で message_draft → awaiting_approval ログを追加し、
+  //       contact-history に resend_pending として記録する。
+  //       これで該当企業が「確認待ち」タブに最新の本文で復帰する。
+  async function handleResendPrepare(req, res) {
+    const MAX = 96 * 1024; // 本文の長さに余裕を持たせる
+    let body = '';
+    let overflow = false;
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > MAX) {
+        overflow = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (overflow) return;
+      try {
+        const parsed = JSON.parse(body || '{}');
+        const companyNo = parseInt(parsed.no, 10);
+        const name = String(parsed.name || '').trim();
+        const message = typeof parsed.message === 'string' ? parsed.message : '';
+        const formUrl = typeof parsed.formUrl === 'string' ? parsed.formUrl.trim() : '';
+
+        if (!companyNo || !Number.isFinite(companyNo) || companyNo <= 0) {
+          jsonResponse(res, 400, { ok: false, error: 'Invalid company number' });
+          return;
+        }
+        if (!name) {
+          jsonResponse(res, 400, { ok: false, error: 'Company name is required' });
+          return;
+        }
+        if (!message.trim()) {
+          jsonResponse(res, 400, { ok: false, error: 'Message body is required' });
+          return;
+        }
+        if (message.length > 32 * 1024) {
+          jsonResponse(res, 400, { ok: false, error: 'Message body too large (>32KB)' });
+          return;
+        }
+
+        // 1) 編集後本文を新しい message_draft として記録
+        logAction(companyNo, name, 'message_draft', message);
+
+        // 2) 再送のため awaiting_approval に戻す
+        const note = '再送依頼: 編集後の本文で確認待ちに復帰';
+        logAction(companyNo, name, 'awaiting_approval', note);
+
+        // 3) 連絡履歴に「再送リクエスト」として追記 (実送信は次の AI セッションで行う想定)
+        let contactNo = null;
+        try {
+          contactNo = recordContact(companyNo, name, {
+            message,
+            formUrl,
+            method: 'web_form',
+            status: 'resend_pending',
+            sourceAction: 'resend_request',
+            sourceActionAt: new Date().toISOString(),
+            response: null,
+            notes: '編集して再送 (UI から要求)',
+          });
+        } catch (e) {
+          // 履歴書き込みに失敗しても action-log は残っているので致命ではない
+          console.warn('[resend-prepare] recordContact failed:', e && e.message);
+        }
+
+        jsonResponse(res, 200, {
+          ok: true,
+          no: companyNo,
+          contactNo,
+          message: '再送リクエストを記録しました。確認待ちタブに表示されます。',
+        });
+      } catch (e) {
+        jsonResponse(res, 400, { ok: false, error: e.message });
+      }
     });
   }
 
@@ -277,6 +360,12 @@ module.exports = function createSimpleApiRoutes(ctx) {
     // POST /api/cli-log
     if (pathname === '/api/cli-log' && method === 'POST') {
       await handleCliLog(req, res);
+      return true;
+    }
+
+    // POST /api/resend-prepare
+    if (pathname === '/api/resend-prepare' && method === 'POST') {
+      await handleResendPrepare(req, res);
       return true;
     }
 

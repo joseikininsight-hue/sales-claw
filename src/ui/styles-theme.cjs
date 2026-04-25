@@ -247,10 +247,13 @@ const THEME_CSS = `
 .insight-wave{position:absolute;right:0;top:0;bottom:0;width:55%;pointer-events:none;opacity:.45;z-index:1}
 [data-theme="dark"] .insight-wave{opacity:.8}
 
-/* Header wave decoration — Pattern ④ only (dark theme) */
+/* Header wave decoration — Pattern ④ only (dark theme).
+ * NOTE: do NOT switch .app-header to position:relative here — the base style
+ * has position:fixed (top:0) and the wave is positioned via ::after with
+ * position:absolute, which resolves against the fixed header just fine.
+ * Forcing relative breaks the sticky tab nav (#mainTabNav) underneath. */
 .app-header::after{content:'';position:absolute;right:-4%;top:0;bottom:0;width:42%;pointer-events:none;opacity:0;transition:opacity .4s;background:radial-gradient(ellipse at right center,rgba(99,102,241,.25) 0%,rgba(59,130,246,.12) 45%,transparent 75%);z-index:-1}
 [data-theme="dark"] .app-header::after{opacity:1}
-.app-header{position:relative}
 
 /* =========================================================
    REFINED TABLE (light soft-shadow / dark gradient accent)
