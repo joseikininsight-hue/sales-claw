@@ -9,8 +9,12 @@
  */
 
 const STYLE = [
+  /* ---------- Layout shell ---------- */
+  '.settings-layout.set2-active{background:var(--bg-base)!important;gap:14px;padding:14px;align-items:flex-start}',
+  '.settings-main.set2-active{background:transparent!important;padding:0!important;max-height:none!important;display:flex;flex-direction:column;gap:14px;flex:1 1 auto;min-width:0}',
+
   /* ---------- Sidebar ---------- */
-  '.settings-sidebar{width:230px;padding:12px 8px;background:var(--bg-card);border-right:1px solid var(--border-subtle)}',
+  '.settings-sidebar.set2-styled{width:248px!important;padding:14px 10px!important;background:var(--bg-card)!important;border:1px solid var(--border-subtle)!important;border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient);align-self:flex-start;display:flex;flex-direction:column;gap:0;flex-shrink:0;position:sticky;top:64px}',
   '.set2-side-title{font-size:.6rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);padding:6px 12px;margin-bottom:4px}',
   '.settings-sidebar-btn{display:flex!important;align-items:flex-start!important;gap:11px;padding:10px 12px!important;border:1px solid transparent;border-radius:var(--radius-md)!important;background:transparent;color:var(--text-1);text-align:left;cursor:pointer;transition:all .15s var(--ease-out-expo);width:100%;margin-bottom:4px;font-weight:600!important;text-transform:none!important;letter-spacing:0!important}',
   '.settings-sidebar-btn:hover{background:var(--bg-hover);border-color:transparent}',
@@ -28,8 +32,18 @@ const STYLE = [
   /* ---------- Hide legacy setup guide once redesign loads ---------- */
   '.set2-active .settings-setup-guide{display:none!important}',
 
+  /* ---------- Sidebar footer hint ---------- */
+  '.set2-side-spacer{flex:1 1 auto;min-height:8px}',
+  '.set2-side-hint{margin:8px 6px 0;padding:10px 12px;background:var(--info-dim);border:1px solid rgba(124,58,237,.2);border-radius:var(--radius-md)!important;display:flex;align-items:center;gap:9px}',
+  '.set2-side-hint-icon{width:28px;height:28px;border-radius:8px!important;background:#fff;color:var(--info);display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid rgba(124,58,237,.2)}',
+  '.set2-side-hint-icon .material-symbols-outlined{font-size:16px}',
+  '.set2-side-hint-body{display:flex;flex-direction:column;gap:1px;min-width:0}',
+  '.set2-side-hint-title{font-size:.74rem;font-weight:700;color:var(--text-1);line-height:1.2}',
+  '.set2-side-hint-link{font-size:.66rem;color:var(--info);font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:3px;margin-top:1px}',
+  '.set2-side-hint-link:hover{text-decoration:underline}',
+
   /* ---------- Section header ---------- */
-  '.set2-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:18px 22px 14px;border-bottom:1px solid var(--border-subtle);background:var(--bg-card)}',
+  '.set2-header{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 24px 18px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient)}',
   '.set2-header-text h2{font-size:1.32rem;font-weight:800;margin:0 0 4px;color:var(--text-1);letter-spacing:.005em}',
   '.set2-header-text p{font-size:.78rem;color:var(--text-2);margin:0;line-height:1.6}',
   '.set2-progress{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;min-width:200px}',
@@ -38,8 +52,8 @@ const STYLE = [
   '.set2-progress-track{width:200px;height:6px;background:var(--bg-raised);border-radius:3px!important;overflow:hidden}',
   '.set2-progress-track span{display:block;height:100%;background:linear-gradient(90deg,var(--primary) 0%,#60a5fa 100%);width:0;transition:width .3s ease;border-radius:3px!important}',
 
-  /* ---------- Step indicator ---------- */
-  '.set2-stepper{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;padding:14px 18px 18px;background:var(--bg-card);position:relative}',
+  /* ---------- Step indicator (separate card under header) ---------- */
+  '.set2-stepper{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:0;padding:18px 22px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient);position:relative}',
   '.set2-step{display:flex;flex-direction:column;align-items:center;gap:6px;position:relative;padding:0 8px;cursor:pointer;text-align:center}',
   '.set2-step::before,.set2-step::after{content:"";position:absolute;top:14px;height:2px;background:var(--border-default);z-index:0}',
   '.set2-step::before{left:0;right:50%}',
@@ -56,9 +70,12 @@ const STYLE = [
   '.set2-step-sub{font-size:.62rem;color:var(--text-3);line-height:1.3}',
 
   /* ---------- Section body wrapper ---------- */
-  '.set2-section-shell{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;padding:14px 22px 0}',
+  '.set2-section-shell{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;padding:0}',
   '.set2-section-shell.no-preview{grid-template-columns:minmax(0,1fr)}',
-  '.set2-form-wrap{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient);padding:16px 18px}',
+  '.set2-form-wrap{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:var(--radius-lg)!important;box-shadow:var(--shadow-ambient);padding:20px 24px;min-height:520px;display:flex;flex-direction:column}',
+  '.set2-form-wrap > .settings-section{display:block!important;flex:1 1 auto}',
+  '.set2-form-wrap .settings-section h3{display:none}',
+  '.set2-form-wrap .save-bar{display:none!important}',
   '.set2-form-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border-subtle)}',
   '.set2-form-title{font-size:.96rem;font-weight:800;color:var(--text-1);margin:0;letter-spacing:.01em}',
   '.set2-form-actions{display:flex;align-items:center;gap:6px}',
@@ -277,53 +294,107 @@ const SCRIPT = `(function(){
     return document.querySelector('.settings-section.active');
   }
 
+  function unwrapPreviousShell(main) {
+    // Move any previously-wrapped section content back to its original .settings-section
+    // so the rebuild is fully idempotent. Without this, repeat calls find an empty
+    // .settings-section.active and the form silently disappears.
+    $$('.set2-form-wrap', main).forEach(function(wrap){
+      var sectionId = wrap.dataset.set2WrappedSection;
+      if (!sectionId) return;
+      var section = document.getElementById('sec-' + sectionId) || main.querySelector('.settings-section[data-section="' + sectionId + '"]');
+      if (!section) return;
+      // wrap may contain the actual <section> element directly, or its children moved in
+      var nestedSection = wrap.querySelector('.settings-section');
+      if (nestedSection) {
+        // Move the wrapped section back to its original parent (right after where it was)
+        section.parentNode.insertBefore(nestedSection, section.nextSibling);
+        section.remove(); // remove the empty placeholder we left
+      } else {
+        // legacy form: children were moved
+        while (wrap.firstChild) section.appendChild(wrap.firstChild);
+      }
+    });
+  }
+
   function rebuildShell() {
     var main = document.getElementById('settingsMain');
     if (!main) return;
     main.classList.add('set2-active');
+    var sidebar = document.querySelector('.settings-sidebar');
+    if (sidebar) sidebar.classList.add('set2-styled');
+    var layout = document.querySelector('.settings-layout');
+    if (layout) layout.classList.add('set2-active');
 
     var activeId = activeSectionId();
     var meta = SECTION_BY_ID[activeId];
     if (!meta) return;
     var prog = computeProgress();
 
-    // remove previous redesign elements
+    // 1) Reverse any previous wrapping to make rebuild idempotent
+    unwrapPreviousShell(main);
+
+    // 2) remove previous redesign elements
     $$('.set2-header, .set2-stepper, .set2-section-shell, .set2-bottom, .set2-preview', main).forEach(function(el){ el.remove(); });
 
-    // header + stepper at top
-    var headerWrap = document.createElement('div');
-    headerWrap.innerHTML = renderHeader(meta, prog) + renderStepper(activeId);
-    while (headerWrap.firstChild) main.insertBefore(headerWrap.firstChild, main.firstChild.nextSibling || null);
-    // actually we want them BEFORE the legacy guide (which is hidden) but AT TOP of main
-    var legacyGuide = main.querySelector('.settings-setup-guide');
-    var stepperEl = main.querySelector('.set2-stepper');
-    var headerEl = main.querySelector('.set2-header');
-    if (legacyGuide && headerEl) main.insertBefore(headerEl, legacyGuide);
-    if (legacyGuide && stepperEl) main.insertBefore(stepperEl, legacyGuide);
+    // 3) header + stepper at top of main
+    var headerEl = document.createElement('div');
+    headerEl.outerHTML = renderHeader(meta, prog);
+    var hWrap = document.createElement('div');
+    hWrap.innerHTML = renderHeader(meta, prog) + renderStepper(activeId);
+    var hChildren = Array.prototype.slice.call(hWrap.children);
+    var firstChild = main.firstChild;
+    hChildren.forEach(function(c){ main.insertBefore(c, firstChild); });
 
-    // wrap the active section into shell with preview
+    // 4) wrap the active section into shell with preview (KEEP the .settings-section element intact)
     var section = findActiveLegacySection();
     if (section) {
       var shell = document.createElement('div');
       shell.className = 'set2-section-shell' + (activeId === 'companyProfile' ? '' : ' no-preview');
       var formWrap = document.createElement('div');
       formWrap.className = 'set2-form-wrap';
-      // move the section's children into formWrap (preserve all original IDs/handlers)
-      while (section.firstChild) formWrap.appendChild(section.firstChild);
+      formWrap.dataset.set2WrappedSection = activeId;
+      // Insert a placeholder at the section's original position so unwrap can put it back
+      var placeholder = document.createElement('div');
+      placeholder.id = 'sec-' + activeId;
+      placeholder.className = 'settings-section';
+      placeholder.setAttribute('data-section', activeId);
+      placeholder.style.display = 'none';
+      section.parentNode.insertBefore(placeholder, section);
+      // Move the entire <section> element into formWrap (preserves IDs/handlers)
+      formWrap.appendChild(section);
+      // Ensure the moved section stays "active" so legacy CSS keeps it visible
+      section.classList.add('active');
+      section.style.display = '';
       shell.appendChild(formWrap);
       if (activeId === 'companyProfile') {
         var preview = document.createElement('div');
         preview.innerHTML = renderPreviewForCompany();
         shell.appendChild(preview.firstChild);
       }
-      // place shell BEFORE the now-empty section
-      section.parentNode.insertBefore(shell, section);
+      // place shell at the natural position (where placeholder is)
+      placeholder.parentNode.insertBefore(shell, placeholder);
     }
 
-    // Bottom: hint + save next
+    // 5) Sidebar hint card (move from main bottom to sidebar bottom)
+    if (sidebar && !sidebar.querySelector('.set2-side-hint')) {
+      var spacer = document.createElement('div');
+      spacer.className = 'set2-side-spacer';
+      var hint = document.createElement('div');
+      hint.className = 'set2-side-hint';
+      hint.innerHTML = '<div class="set2-side-hint-icon"><span class="material-symbols-outlined">tips_and_updates</span></div>'
+        + '<div class="set2-side-hint-body">'
+        +   '<div class="set2-side-hint-title">設定のヒント</div>'
+        +   '<a class="set2-side-hint-link" href="https://github.com/joseikininsight-hue/sales-claw#readme" target="_blank" rel="noopener">詳細ガイドを見る <span class="material-symbols-outlined" style="font-size:12px">open_in_new</span></a>'
+        + '</div>';
+      sidebar.appendChild(spacer);
+      sidebar.appendChild(hint);
+    }
+
+    // 6) Bottom: 保存して次へ button (hint moved to sidebar)
     var bottom = document.createElement('div');
-    bottom.innerHTML = renderBottom();
-    main.appendChild(bottom.firstChild);
+    bottom.className = 'set2-bottom';
+    bottom.innerHTML = '<span></span><button type="button" class="set2-save-next" data-set2-save-next="1"><span>保存して次へ</span><span class="material-symbols-outlined">arrow_forward</span></button>';
+    main.appendChild(bottom);
   }
 
   // ---- Save & next ----
