@@ -52,6 +52,7 @@ const renderDashboardScript = require('./ui/client-scripts/dashboard.cjs');
 const renderAnalyticsScript = require('./ui/client-scripts/dashboard-analytics.cjs');
 const renderColumnResizerScript = require('./ui/client-scripts/column-resizer.cjs');
 const renderAwaitingCardRedesignScript = require('./ui/client-scripts/awaiting-card-redesign.cjs');
+const renderSentCardRedesignScript = require('./ui/client-scripts/sent-card-redesign.cjs');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const AI_STATUS_CACHE_TTL_MS = 15000;
@@ -6187,6 +6188,7 @@ const DASHBOARD_SESSION_COOKIE_NAME = ${serializeForInlineScript(getDashboardSes
 const NATIVE_DIRECTORY_PICKER_AVAILABLE = ${process.versions.electron ? 'true' : 'false'};
 const BUILD_SOURCE = ${serializeForInlineScript(APP_BUILD_SOURCE)};
 ${renderAwaitingCardRedesignScript()}
+${renderSentCardRedesignScript()}
 ${renderDashboardScript()}
 ${renderAnalyticsScript()}
 ${renderColumnResizerScript()}
