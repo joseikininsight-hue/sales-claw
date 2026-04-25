@@ -85,6 +85,7 @@ assets/名称未設定のデザイン.png
 
 # Electron build output
 dist/
+dist-released/
 .next/
 
 # Electron dev

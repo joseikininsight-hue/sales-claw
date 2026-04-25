@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-preview",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/preview-dashboard.cjs"],
+      "port": 3480,
+      "cwd": "C:\\bp-outreach"
+    }
+  ]
+}
