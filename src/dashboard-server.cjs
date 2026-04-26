@@ -57,6 +57,7 @@ const renderSentCardRedesignScript = require('./ui/client-scripts/sent-card-rede
 const renderCliTerminalScript = require('./ui/client-scripts/cli-terminal.cjs');
 const renderPaginationScript = require('./ui/client-scripts/pagination.cjs');
 const renderSettingsRedesignScript = require('./ui/client-scripts/settings-redesign.cjs');
+const renderProviderIconFixScript = require('./ui/client-scripts/provider-icon-fix.cjs');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const AI_STATUS_CACHE_TTL_MS = 15000;
@@ -6292,6 +6293,7 @@ ${renderColumnResizerScript()}
 ${renderCliTerminalScript()}
 ${renderPaginationScript()}
 ${renderSettingsRedesignScript()}
+${renderProviderIconFixScript()}
 </script>
 
 </body>
