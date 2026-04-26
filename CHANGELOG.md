@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.22 - 2026-04-26
+
+- **dev source override + hot reload を導入** — UI 修正のたびの再インストール (159MB / UAC) が原則不要に
+  - `electron-main.js` に `SALES_CLAW_DEV_DASHBOARD_SRC` env を追加: 絶対パスで指定すると、bundled `resources/app/src/dashboard-server.cjs` ではなくその path 配下を `require` する
+  - `dashboard-server.cjs` に `SALES_CLAW_DEV_HOT_RELOAD=1` env を追加: `buildPage()` の冒頭で `./ui/**` の require cache を捨てて、ブラウザ再読み込みごとに client-scripts をディスクから再読込
+  - `renderX(...)` を関数ラッパに変更し、cache 再構築が即時反映されるように (production では通常の cache lookup で性能影響なし)
+  - 起動ヘルパー: `scripts/run-dev-mode.bat` をダブルクリックすれば dev mode で立ち上がる
+  - 通常の起動 (env 無設定) では bundled UI / production runtime のまま
+
 ## v1.2.21 - 2026-04-26
 
 - AI 起動モーダルのプロバイダーアイコン視認性を改善

@@ -48,16 +48,32 @@ const { saveRecoverySnapshot, loadRecoverySnapshot, clearRecoverySnapshot } = re
 const batchUtils = require('./ai-runtime/batch-utils.cjs');
 const ptyLog = require('./ai-runtime/pty-log.cjs');
 // UI テンプレート分離 (Phase 1)
-const renderStyles = require('./ui/styles.cjs');
-const renderDashboardScript = require('./ui/client-scripts/dashboard.cjs');
-const renderAnalyticsScript = require('./ui/client-scripts/dashboard-analytics.cjs');
-const renderColumnResizerScript = require('./ui/client-scripts/column-resizer.cjs');
-const renderAwaitingCardRedesignScript = require('./ui/client-scripts/awaiting-card-redesign.cjs');
-const renderSentCardRedesignScript = require('./ui/client-scripts/sent-card-redesign.cjs');
-const renderCliTerminalScript = require('./ui/client-scripts/cli-terminal.cjs');
-const renderPaginationScript = require('./ui/client-scripts/pagination.cjs');
-const renderSettingsRedesignScript = require('./ui/client-scripts/settings-redesign.cjs');
-const renderProviderIconFixScript = require('./ui/client-scripts/provider-icon-fix.cjs');
+//
+// Hot reload:
+//   SALES_CLAW_DEV_HOT_RELOAD=1 のときは buildPage() の冒頭で
+//   ./ui/** の require cache を捨てる → 各 renderX(...) 呼び出しは
+//   ディスクから最新の cjs を再読込。これによりブラウザ再読み込み
+//   だけで UI 修正が反映され、再インストール不要になる。
+const _HOT_RELOAD = process.env.SALES_CLAW_DEV_HOT_RELOAD === '1';
+const _UI_DIR = path.resolve(__dirname, 'ui');
+function hotInvalidateUi() {
+  if (!_HOT_RELOAD) return;
+  Object.keys(require.cache).forEach((k) => {
+    try { if (k.startsWith(_UI_DIR)) delete require.cache[k]; } catch (_) {}
+  });
+}
+// Each render is a thin wrapper so HOT mode picks up the latest module.
+// In production (HOT off) this is just one cached require lookup per call.
+const renderStyles = (...a) => require('./ui/styles.cjs')(...a);
+const renderDashboardScript = (...a) => require('./ui/client-scripts/dashboard.cjs')(...a);
+const renderAnalyticsScript = (...a) => require('./ui/client-scripts/dashboard-analytics.cjs')(...a);
+const renderColumnResizerScript = (...a) => require('./ui/client-scripts/column-resizer.cjs')(...a);
+const renderAwaitingCardRedesignScript = (...a) => require('./ui/client-scripts/awaiting-card-redesign.cjs')(...a);
+const renderSentCardRedesignScript = (...a) => require('./ui/client-scripts/sent-card-redesign.cjs')(...a);
+const renderCliTerminalScript = (...a) => require('./ui/client-scripts/cli-terminal.cjs')(...a);
+const renderPaginationScript = (...a) => require('./ui/client-scripts/pagination.cjs')(...a);
+const renderSettingsRedesignScript = (...a) => require('./ui/client-scripts/settings-redesign.cjs')(...a);
+const renderProviderIconFixScript = (...a) => require('./ui/client-scripts/provider-icon-fix.cjs')(...a);
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const AI_STATUS_CACHE_TTL_MS = 15000;
@@ -4778,6 +4794,9 @@ function jsonResponse(res, statusCode, data, extraHeaders = {}) {
 
 // HTML テンプレート
 function buildPage() {
+  // SALES_CLAW_DEV_HOT_RELOAD=1 のとき、./ui/** を再 require して
+  // ブラウザ再読み込みごとにディスクから最新を読み直す。
+  hotInvalidateUi();
   const _lang = settings.getSection('preferences').language || 'ja';
   const _tz = settings.getSection('preferences').timezone || 'Asia/Tokyo';
   const _t = getTranslations(_lang);

@@ -117,10 +117,41 @@ function getDashboardPortLabel() {
 }
 
 // ─── ダッシュボードサーバー起動 ──────────────────────────────
+//
+// Dev source override:
+//   SALES_CLAW_DEV_DASHBOARD_SRC を絶対パスで指定すると、bundled
+//   resources/app/src/dashboard-server.cjs ではなく、その path 直下の
+//   dashboard-server.cjs を require する。
+//   これにより、インストール済み Electron を使ったまま `C:\bp-outreach\src`
+//   の編集を反映できる (UI 修正のたびに再インストールが不要になる)。
+//
+// Hot reload:
+//   SALES_CLAW_DEV_HOT_RELOAD=1 を指定すると、dashboard-server 側で
+//   render 直前に ./ui/* の require cache を捨てて、ブラウザ再読み込み
+//   ごとに最新の client-script を読む。
+function resolveDashboardModule() {
+  const devSrc = process.env.SALES_CLAW_DEV_DASHBOARD_SRC;
+  if (devSrc) {
+    try {
+      const candidate = path.join(devSrc, 'dashboard-server.cjs');
+      if (fs.existsSync(candidate)) {
+        console.log('[Electron] dev override: loading dashboard from', candidate);
+        // Force a fresh load (in case this is called twice)
+        delete require.cache[require.resolve(candidate)];
+        return require(candidate);
+      }
+      console.warn('[Electron] SALES_CLAW_DEV_DASHBOARD_SRC set but no dashboard-server.cjs at:', candidate);
+    } catch (e) {
+      console.warn('[Electron] dev override failed, falling back to bundled:', e.message);
+    }
+  }
+  return require('./src/dashboard-server.cjs');
+}
+
 async function startServer() {
   if (serverStarted && dashboardRuntime) return dashboardRuntime;
   try {
-    const { startDashboardServer } = require('./src/dashboard-server.cjs');
+    const { startDashboardServer } = resolveDashboardModule();
     dashboardRuntime = await startDashboardServer({ formSessionManager });
     serverStarted = true;
     return dashboardRuntime;
