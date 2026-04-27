@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.2.23 - 2026-04-27
+
+- 内蔵ターミナルの3つの不具合を修正
+  - **ログイン成功後も認証バナーが再表示される問題**: `Login successful` / `Logged in as` を検知したらバッファをクリアしてバナーを永続的に閉じる。エラーは新しい chunk のみで判定し、古い「Please run /login」テキストの誤再検知を防止
+  - **入力時の表示崩れ**: CLI Activity タブが表示状態に切り替わるたび `fitAddon.fit()` を 40/200/600ms で再実行し、PTY に resize を送信。隠れタブで初期化された xterm のサイズ 0 問題を解消
+  - **ヘッダの「AI を起動」で立ち上げた CLI が内蔵ターミナルに映らない問題**: WebSocket の `connected` イベントで `running:true` を受信したら、自動的に terminal host を表示し xterm を初期化して既存セッションにアタッチする
+
 ## v1.2.22 - 2026-04-26
 
 - **dev source override + hot reload を導入** — UI 修正のたびの再インストール (159MB / UAC) が原則不要に

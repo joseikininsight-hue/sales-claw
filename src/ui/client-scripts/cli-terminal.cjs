@@ -264,15 +264,42 @@ const SCRIPT = `(function(){
     { re: new RegExp('Invalid (?:API key|credentials?)', 'i'),title: '認証情報が無効です',                  desc: '保存されている認証情報が無効です。再ログインしてください。' },
     { re: new RegExp('token (?:has )?expired', 'i'),        title: 'トークン期限切れ',                      desc: 'OAuth トークンが期限切れです。再ログインで延長されます。' }
   ];
+  // Patterns that indicate successful login → clear buffer + dismiss banner.
+  var AUTH_SUCCESS_PATTERNS = [
+    new RegExp('Login successful', 'i'),
+    new RegExp('Logged in (?:as|to)', 'i'),
+    new RegExp('Authenticated successfully', 'i'),
+    new RegExp('已成功登录', 'i')
+  ];
 
   function detectAuthError(chunk) {
+    if (typeof chunk !== 'string' || !chunk) return;
+    // 1) success first — wipe stale error text from buffer & hide banner
+    for (var s = 0; s < AUTH_SUCCESS_PATTERNS.length; s++) {
+      if (AUTH_SUCCESS_PATTERNS[s].test(chunk)) {
+        streamBuffer = '';
+        helpDismissed = true;
+        hideAuthHelp();
+        return;
+      }
+    }
     if (helpDismissed) return;
-    streamBuffer += chunk;
-    if (streamBuffer.length > 16000) streamBuffer = streamBuffer.slice(-8000);
+    // 2) error: only check the new chunk to avoid re-firing on stale buffer text
     for (var i = 0; i < AUTH_PATTERNS.length; i++) {
       var p = AUTH_PATTERNS[i];
-      if (p.re.test(streamBuffer)) {
+      if (p.re.test(chunk)) {
         showAuthHelp(p.title, p.desc);
+        return;
+      }
+    }
+    // 3) fallback for multi-line patterns split across chunks: keep small tail buffer
+    streamBuffer = (streamBuffer + chunk).slice(-2000);
+    for (var j = 0; j < AUTH_PATTERNS.length; j++) {
+      if (AUTH_PATTERNS[j].re.test(streamBuffer)) {
+        // only show if pattern straddles the join boundary (not already in chunk alone)
+        if (!AUTH_PATTERNS[j].re.test(chunk)) {
+          showAuthHelp(AUTH_PATTERNS[j].title, AUTH_PATTERNS[j].desc);
+        }
         return;
       }
     }
@@ -336,9 +363,27 @@ const SCRIPT = `(function(){
           }
         } else if (payload.type === 'connected') {
           if (payload.running && payload.provider) {
+            // PTY is already running (likely launched via header "AI を起動").
+            // Reveal the terminal host and pipe further output here so the
+            // user sees the same session in this panel.
             currentProvider = payload.provider;
             setLauncherActive(payload.provider);
             showProviderBadge(payload.provider);
+            setStatus('on', payload.provider + ' running (attached)');
+            if (refs.empty) refs.empty.style.display = 'none';
+            if (refs.host) refs.host.style.display = 'block';
+            ensureTerm();
+            // Ask the server to resend buffered scrollback if it supports it.
+            try {
+              if (term && fitAddon) {
+                fitAddon.fit();
+                ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                ws.send(JSON.stringify({ type: 'request-replay' }));
+              }
+            } catch(_){}
+            if (term) {
+              term.writeln('\\r\\n\\x1b[2m[既に実行中の ' + (PROVIDER_LABELS[payload.provider] || payload.provider) + ' セッションに接続しました]\\x1b[0m\\r\\n');
+            }
           }
         } else if (payload.type === 'exit' || payload.type === 'closed') {
           setStatus('off', 'PTY exited');
@@ -467,6 +512,35 @@ const SCRIPT = `(function(){
     // Detect existing running session — server sends {type:'connected', running:true, provider} once we connect
     // Lazily connect to surface that state.
     setTimeout(connectWs, 200);
+
+    // CLI Activity タブが visible になるたびに fit + resize 送信。
+    // タブが非表示の状態で xterm.open() するとサイズが 0 で fit が
+    // 機能せず、表示後にカーソル位置が崩れる。
+    var logsTab = document.getElementById('tab-logs');
+    if (logsTab) {
+      var lastActive = logsTab.classList.contains('active');
+      var tabObs = new MutationObserver(function(){
+        var nowActive = logsTab.classList.contains('active');
+        if (nowActive && !lastActive) {
+          // Just became visible — refit several times to handle layout settle
+          [40, 200, 600].forEach(function(ms){
+            setTimeout(function(){
+              if (!term || !fitAddon) return;
+              try {
+                fitAddon.fit();
+                if (ws && ws.readyState === 1) {
+                  ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+                }
+                term.scrollToBottom();
+                term.focus();
+              } catch(_){}
+            }, ms);
+          });
+        }
+        lastActive = nowActive;
+      });
+      tabObs.observe(logsTab, { attributes: true, attributeFilter: ['class'] });
+    }
   }
 
   if (document.readyState === 'loading') {
