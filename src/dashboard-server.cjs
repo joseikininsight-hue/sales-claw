@@ -913,7 +913,11 @@ const CLI_ISSUE_PATTERNS = [
   { pattern: /\(y\/n\)|\(yes\/no\)/i, type: 'warn', label: '承認要求' },
   { pattern: /waiting for.*\bapproval\b|user.*input.*required/i, type: 'warn', label: 'ユーザー入力待ち' },
   // MCP関連
-  { pattern: /MCP.*\berror\b|MCP.*\bfail/i, type: 'error', label: 'MCP接続エラー' },
+  // 「/mcp」コマンドの一覧表示は情報出力で、その中に "1 server failed" 等の
+  // 文字列が含まれていてもダッシュボード的には致命的ではない (Playwright が
+  // 接続済みなら動作する)。listing 系の文脈フレーズで除外する。
+  { pattern: /MCP.*\berror\b|MCP.*\bfail/i, type: 'error', label: 'MCP接続エラー',
+    excludePattern: /Project MCPs|\bManage MCP servers\b|\/mcp for help|needs authentication|to navigate.*to confirm/i },
   { pattern: /MCP.*\btimeout\b/i, type: 'warn', label: 'MCPタイムアウト' },
 ];
 
@@ -924,6 +928,9 @@ function detectCliIssuesFromOutput(rawData, providerId) {
   if (text.length < 5) return;
   for (const rule of CLI_ISSUE_PATTERNS) {
     if (rule.pattern.test(text)) {
+      // Skip if the text matches the rule's exclude pattern (e.g. /mcp listing
+      // output that contains "failed" but is purely informational)
+      if (rule.excludePattern && rule.excludePattern.test(text)) continue;
       _lastCliIssueTime = now;
       const provider = getProvider(normalizeProviderId(providerId));
       const cleanText = text.replace(/[\r\n]+/g, ' ').trim().slice(0, 200);
