@@ -255,6 +255,126 @@ const SCRIPT = `(function(){
     if (refs.stop) refs.stop.disabled = !provider;
   }
 
+  // ---- Setup-needs detection (AI CLI / Playwright / Chromium not ready) ----
+  // Pattern matches the server's "未準備" / "未インストール" error responses.
+  var SETUP_PATTERNS = [
+    new RegExp('AI CLI を準備', ''),
+    new RegExp('未準備です', ''),
+    new RegExp('未インストールです', ''),
+    new RegExp('Playwright MCP / Chromium', ''),
+    new RegExp('install Chromium first', 'i'),
+    new RegExp('Cannot find module', 'i')
+  ];
+  var setupBannerShown = false;
+  var setupInstallInProgress = false;
+  function ensureSetupBanner() {
+    if (document.getElementById('cliTermSetupHelp')) return;
+    if (!refs.card) return;
+    var html = '<div id="cliTermSetupHelp" class="cli-term-setup-help" style="display:none">'
+      + '<div class="cli-term-setup-icon"><span class="material-symbols-outlined">construction</span></div>'
+      + '<div class="cli-term-setup-body">'
+      +   '<h4 id="cliTermSetupTitle">AI CLI / Playwright の準備が必要です</h4>'
+      +   '<p id="cliTermSetupDesc">Sales Claw のフォーム入力には Playwright MCP と Chromium が必要です。下のボタンで自動インストールします (~2 分)。</p>'
+      +   '<div class="cli-term-setup-actions">'
+      +     '<button type="button" class="cli-term-setup-btn primary" data-cli-action="install-cli"><span class="material-symbols-outlined">download</span><span data-setup-btn-label>AI CLI を準備</span></button>'
+      +     '<button type="button" class="cli-term-setup-btn" data-cli-action="dismiss-setup">後で</button>'
+      +   '</div>'
+      +   '<div class="cli-term-setup-status" id="cliTermSetupStatus" style="display:none"></div>'
+      + '</div>'
+      + '</div>';
+    var holder = document.createElement('div');
+    holder.innerHTML = html;
+    var head = refs.card.querySelector('.cli-term-head');
+    if (head && head.nextSibling) refs.card.insertBefore(holder.firstChild, head.nextSibling);
+    else refs.card.appendChild(holder.firstChild);
+
+    // CSS for setup banner (info-blue, like auth-help but distinct)
+    if (!document.getElementById('cli-term-setup-style')) {
+      var s = document.createElement('style');
+      s.id = 'cli-term-setup-style';
+      s.textContent = [
+        '.cli-term-setup-help{display:flex;gap:14px;padding:14px 18px;background:linear-gradient(135deg,rgba(37,99,235,.08) 0%,rgba(37,99,235,.02) 70%);border-bottom:1px solid rgba(37,99,235,.25);animation:cliFade .18s ease}',
+        '.cli-term-setup-icon{width:36px;height:36px;border-radius:10px;background:var(--primary-glow);color:var(--primary);display:flex;align-items:center;justify-content:center;flex-shrink:0}',
+        '.cli-term-setup-body{flex:1;min-width:0}',
+        '.cli-term-setup-body h4{margin:0 0 4px;font-size:.86rem;font-weight:800;color:var(--primary)}',
+        '.cli-term-setup-body p{margin:0 0 10px;font-size:.74rem;color:var(--text-2);line-height:1.6}',
+        '.cli-term-setup-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+        '.cli-term-setup-btn{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;font-size:.74rem;font-weight:700;border:1px solid var(--border-default);border-radius:var(--radius-md)!important;background:var(--bg-card);color:var(--text-1);cursor:pointer;transition:all .15s var(--ease-out-expo)}',
+        '.cli-term-setup-btn:hover{background:var(--bg-raised);border-color:var(--border-strong)}',
+        '.cli-term-setup-btn.primary{background:var(--primary);color:#fff;border-color:var(--primary);box-shadow:var(--shadow-cta)}',
+        '.cli-term-setup-btn.primary:hover{background:var(--primary-dim);border-color:var(--primary-dim)}',
+        '.cli-term-setup-btn[disabled]{opacity:.5;cursor:not-allowed!important}',
+        '.cli-term-setup-status{margin-top:10px;padding:8px 10px;font-size:.7rem;background:var(--bg-surface);border-radius:var(--radius-sm);color:var(--text-2);font-family:var(--font-mono)}'
+      ].join('\\n');
+      document.head.appendChild(s);
+    }
+  }
+  function showSetupBanner(title, desc) {
+    if (setupBannerShown) return;
+    ensureSetupBanner();
+    var box = document.getElementById('cliTermSetupHelp');
+    if (!box) return;
+    if (title) { var t = document.getElementById('cliTermSetupTitle'); if (t) t.textContent = title; }
+    if (desc) { var d = document.getElementById('cliTermSetupDesc'); if (d) d.textContent = desc; }
+    box.style.display = 'flex';
+    setupBannerShown = true;
+  }
+  function hideSetupBanner() {
+    var box = document.getElementById('cliTermSetupHelp');
+    if (box) box.style.display = 'none';
+    setupBannerShown = false;
+  }
+  function setSetupStatus(text, isError) {
+    var s = document.getElementById('cliTermSetupStatus');
+    if (!s) return;
+    s.style.display = text ? 'block' : 'none';
+    s.textContent = text || '';
+    s.style.color = isError ? 'var(--error)' : 'var(--text-2)';
+  }
+  function detectSetupNeeded(chunk) {
+    if (typeof chunk !== 'string' || !chunk) return;
+    if (setupBannerShown) return;
+    for (var i = 0; i < SETUP_PATTERNS.length; i++) {
+      if (SETUP_PATTERNS[i].test(chunk)) {
+        showSetupBanner();
+        return;
+      }
+    }
+  }
+  async function runInstallCli() {
+    if (setupInstallInProgress) return;
+    setupInstallInProgress = true;
+    var btn = document.querySelector('[data-cli-action="install-cli"]');
+    var label = btn && btn.querySelector('[data-setup-btn-label]');
+    if (btn) btn.setAttribute('disabled', 'true');
+    if (label) label.textContent = 'インストール中...';
+    setSetupStatus('Sales Claw の内蔵 npm で Playwright + Chromium を準備しています...', false);
+    try {
+      var res = await window.fetch('/api/install-ai-cli', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: currentProvider || 'claude' })
+      });
+      var json = await res.json().catch(function(){ return null; });
+      if (!res.ok || (json && json.ok === false)) {
+        var err = (json && (json.error || json.message)) || ('HTTP ' + res.status);
+        setSetupStatus('インストール失敗: ' + err, true);
+        if (label) label.textContent = '再試行';
+        if (btn) btn.removeAttribute('disabled');
+        setupInstallInProgress = false;
+        return;
+      }
+      setSetupStatus('準備完了しました。AI CLI を起動できます。', false);
+      if (label) label.textContent = '完了';
+      setTimeout(hideSetupBanner, 2500);
+    } catch (e) {
+      setSetupStatus('インストール失敗: ' + (e && e.message || e), true);
+      if (label) label.textContent = '再試行';
+      if (btn) btn.removeAttribute('disabled');
+    }
+    setupInstallInProgress = false;
+  }
+
   // ---- Auth-error detection ----
   // Pattern matches Claude Code and similar CLIs
   var AUTH_PATTERNS = [
@@ -379,6 +499,7 @@ const SCRIPT = `(function(){
               term.write(data);
               term.scrollToBottom();
               detectAuthError(data);
+              detectSetupNeeded(data);
             }
           }
         } else if (payload.type === 'connected') {
@@ -518,6 +639,12 @@ const SCRIPT = `(function(){
         } else if (action === 'dismiss-help') {
           ev.preventDefault();
           hideAuthHelp();
+        } else if (action === 'install-cli') {
+          ev.preventDefault();
+          runInstallCli();
+        } else if (action === 'dismiss-setup') {
+          ev.preventDefault();
+          hideSetupBanner();
         }
       }
     });
@@ -532,6 +659,23 @@ const SCRIPT = `(function(){
     // Detect existing running session — server sends {type:'connected', running:true, provider} once we connect
     // Lazily connect to surface that state.
     setTimeout(connectWs, 200);
+
+    // Proactive setup probe: if Playwright/Chromium isn't ready, surface
+    // the AI CLI 準備 banner before the user even tries to launch.
+    setTimeout(function(){
+      try {
+        window.fetch('/api/ai/setup-diagnostics').then(function(r){
+          if (!r || !r.ok) return null;
+          return r.json();
+        }).then(function(j){
+          if (!j) return;
+          var pkg = j.playwrightPackage || {};
+          if (!pkg.available || !pkg.browserInstalled) {
+            showSetupBanner();
+          }
+        }).catch(function(){});
+      } catch(_){}
+    }, 1500);
 
     // CLI Activity タブが visible になるたびに fit + resize 送信。
     // タブが非表示の状態で xterm.open() するとサイズが 0 で fit が
