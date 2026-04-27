@@ -3525,10 +3525,28 @@ async function runParallelAnalysisWorker(company, nodeExecutable) {
     formUrl: company.formUrl || '',
   });
 
+  // Electron では process.execPath は Sales Claw.exe (Electron) を指す。
+  // ELECTRON_RUN_AS_NODE=1 を付けると、Electron が Node.js モードで起動して
+  // .cjs を実行できる。system に node が無い環境(配布インストール先)でも
+  // batch/parallel-analysis を spawn できるようにフォールバックする。
+  let exe = nodeExecutable;
+  let extraEnv = {};
+  if (!exe || !fs.existsSync(exe)) {
+    exe = process.execPath;
+    extraEnv.ELECTRON_RUN_AS_NODE = '1';
+  } else {
+    const baseName = path.basename(exe).toLowerCase();
+    // process.execPath が Electron 自身でも node でも対応
+    if (!/^node(?:\.exe)?$/i.test(baseName)) {
+      // Electron の execPath の場合は ELECTRON_RUN_AS_NODE を付ける
+      extraEnv.ELECTRON_RUN_AS_NODE = '1';
+    }
+  }
+
   return await new Promise((resolve) => {
-    const child = spawn(nodeExecutable, ['src/parallel-analysis.cjs', payload], {
+    const child = spawn(exe, ['src/parallel-analysis.cjs', payload], {
       cwd: PROJECT_ROOT,
-      env: { ...process.env, SALES_CLAW_CLI_TOKEN: process.env.SALES_CLAW_CLI_TOKEN || CLI_LOG_SECRET },
+      env: { ...process.env, ...extraEnv, SALES_CLAW_CLI_TOKEN: process.env.SALES_CLAW_CLI_TOKEN || CLI_LOG_SECRET },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -3589,10 +3607,10 @@ async function runParallelAnalysisWorker(company, nodeExecutable) {
 
 async function executeBackendPhaseABatch(companies, providerId = getSelectedAiProvider()) {
   const normalizedProviderId = normalizeProviderId(providerId);
+  // resolveNodeExecutable may return null on machines without system Node.
+  // runParallelAnalysisWorker now falls back to Electron's embedded Node
+  // via ELECTRON_RUN_AS_NODE, so we no longer hard-fail here.
   const nodeExecutable = await resolveNodeExecutable();
-  if (!nodeExecutable || !fs.existsSync(nodeExecutable)) {
-    throw new Error('Node.js executable was not found for Phase A analysis.');
-  }
 
   const batchStartedAtMs = Date.now();
   appendDiagnosticEvent('phase_a_batch_started', {
