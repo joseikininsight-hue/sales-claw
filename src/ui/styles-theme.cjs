@@ -39,6 +39,17 @@ const THEME_CSS = `
   --glass-bg:rgba(10,14,23,.78);--glass-blur:blur(14px);--glass-border:rgba(148,163,184,.1);
 }
 [data-theme="dark"] body{background:var(--bg-base);color:var(--text-1)}
+/* Tell the browser/OS to use dark-themed native controls (<select> popup,
+   scrollbars, date pickers, autofill, focus rings). Without this the
+   <select> dropdown list pops up in the OS's light style even though the
+   surrounding page is dark. */
+[data-theme="dark"]{color-scheme:dark}
+[data-theme="light"]{color-scheme:light}
+/* style the option list itself for browsers that respect option CSS
+   (Chromium honors background/color on <option> in some recent versions) */
+[data-theme="dark"] select{background:var(--bg-surface);color:var(--text-1)}
+[data-theme="dark"] select option{background:var(--bg-card);color:var(--text-1)}
+[data-theme="dark"] select option:checked,[data-theme="dark"] select option:hover{background:var(--primary-glow);color:var(--text-1)}
 [data-theme="dark"] body.perf-mode{
   --glass-bg:#0a0e17;--glass-blur:none;--glass-border:rgba(148,163,184,.1);
   --shadow-ambient:0 1px 2px rgba(0,0,0,.45);
