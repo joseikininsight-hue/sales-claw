@@ -356,10 +356,30 @@ const SCRIPT = `(function(){
         var payload = JSON.parse(ev.data);
         var data = payload.data || payload.text || '';
         if (payload.type === 'data' || payload.type === 'pty' || (typeof data === 'string' && data)) {
-          if (term && data) {
-            term.write(data);
-            term.scrollToBottom();
-            detectAuthError(data);
+          if (data) {
+            // Lazy-attach: a PTY is producing output but our term hasn't
+            // been instantiated yet. This happens when the user clicks the
+            // header "AI を起動" while CLI Activity tab is open — the WS
+            // handshake fired connected/running:false earlier, then Claude
+            // got launched, and now data arrives. Reveal the host and
+            // create the terminal on the fly.
+            if (!term) {
+              if (refs.empty) refs.empty.style.display = 'none';
+              if (refs.host) refs.host.style.display = 'block';
+              ensureTerm();
+              setStatus('on', 'attached');
+              if (!currentProvider) currentProvider = 'claude';
+              setLauncherActive(currentProvider);
+              showProviderBadge(currentProvider);
+              if (term) {
+                term.writeln('\\r\\n\\x1b[2m[実行中の ' + (PROVIDER_LABELS[currentProvider] || currentProvider) + ' セッションに自動接続しました]\\x1b[0m\\r\\n');
+              }
+            }
+            if (term) {
+              term.write(data);
+              term.scrollToBottom();
+              detectAuthError(data);
+            }
           }
         } else if (payload.type === 'connected') {
           if (payload.running && payload.provider) {
